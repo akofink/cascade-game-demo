@@ -1,8 +1,11 @@
 //! App-side controls and bounded simulation stepping.
 
 use cascade_sim::{
-    Capacity, Command, Credits, Material, SliceMetrics, SubmitResult, World,
-    fixtures::{DisturbanceCommandStream, FixtureId, ScenarioDescriptor},
+    Capacity, Command, Credits, Material, SchedulerPolicy, SliceMetrics, SubmitResult, World,
+    fixtures::{
+        DEFAULT_DISTURBANCE_LIMIT, DisturbanceCommandStream, FixtureId, MAX_DISTURBANCES_PER_SLICE,
+        ScenarioDescriptor,
+    },
 };
 
 pub const DEMO_WIDTH: u32 = 1024;
@@ -11,6 +14,31 @@ pub const DEFAULT_CREDITS: u32 = 20_000;
 pub const MIN_CREDITS: u32 = 25;
 pub const MAX_CREDITS: u32 = 100_000;
 pub const BRUSH_CELLS_PER_FRAME: usize = 64;
+
+fn disturbance_stream() -> DisturbanceCommandStream {
+    DisturbanceCommandStream::new(
+        0x4341_5345_0001,
+        DEFAULT_DISTURBANCE_LIMIT,
+        MAX_DISTURBANCES_PER_SLICE,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyChoice {
+    Bounded,
+    Traditional,
+}
+impl PolicyChoice {
+    const fn scheduler(self) -> SchedulerPolicy {
+        match self {
+            Self::Bounded => SchedulerPolicy::Bounded,
+            Self::Traditional => SchedulerPolicy::Traditional,
+        }
+    }
+    const fn name(self) -> &'static str {
+        self.scheduler().name()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterialChoice {
@@ -64,12 +92,14 @@ pub struct DemoMetrics {
     pub destroy_held: bool,
     pub disturbance_emitted: u64,
     pub resource_bytes: usize,
+    pub ready_capacity: usize,
 }
 
 pub struct Demo {
     world: World,
     alternate_world: World,
     tiny_capacity_active: bool,
+    policy: PolicyChoice,
     paused: bool,
     selected_fixture: FixtureId,
     selected_material: MaterialChoice,
@@ -83,9 +113,20 @@ pub struct Demo {
 
 impl Demo {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_size(DEMO_WIDTH, DEMO_HEIGHT)
+    }
+
+    pub fn new_with_size(width: u32, height: u32) -> Result<Self, String> {
+        if !(32..=crate::MAX_WORLD_AXIS).contains(&width)
+            || !(32..=crate::MAX_WORLD_AXIS).contains(&height)
+            || !width.is_multiple_of(32)
+            || !height.is_multiple_of(32)
+        {
+            return Err("world dimensions must be multiples of 32 in 32..=4096".to_string());
+        }
         let world = World::new(
-            DEMO_WIDTH,
-            DEMO_HEIGHT,
+            width,
+            height,
             Credits::new(DEFAULT_CREDITS),
             Capacity::new(cascade_sim::DEFAULT_READY_CAPACITY),
             Capacity::new(cascade_sim::DEFAULT_COMMAND_CAPACITY),
@@ -94,8 +135,8 @@ impl Demo {
         let (tiny_ready, tiny_commands) =
             ScenarioDescriptor::get(FixtureId::TinyCapacity).capacities();
         let alternate_world = World::new(
-            DEMO_WIDTH,
-            DEMO_HEIGHT,
+            width,
+            height,
             Credits::new(DEFAULT_CREDITS),
             tiny_ready,
             tiny_commands,
@@ -105,13 +146,14 @@ impl Demo {
             world,
             alternate_world,
             tiny_capacity_active: false,
+            policy: PolicyChoice::Bounded,
             paused: false,
             selected_fixture: FixtureId::MixedOverload,
             selected_material: MaterialChoice::Sand,
             credits: DEFAULT_CREDITS,
             step_once: false,
             destroy_held: false,
-            disturbances: DisturbanceCommandStream::default_for(0x4341_5345_0001),
+            disturbances: disturbance_stream(),
             last_metrics: SliceMetrics::default(),
             last_disturbance: 0,
         })
@@ -154,7 +196,7 @@ impl Demo {
         DemoMetrics {
             slice: self.last_metrics,
             paused: self.paused,
-            policy: "bounded",
+            policy: self.policy.name(),
             selected_fixture: self.selected_fixture,
             fixture_progress: self.world.fixture_progress(),
             reset_in_progress: self.world.reset_in_progress(),
@@ -162,6 +204,7 @@ impl Demo {
             disturbance_emitted: self.last_disturbance,
             resource_bytes: self.world.resources().total_bytes
                 + self.alternate_world.resources().total_bytes,
+            ready_capacity: self.world.resources().ready_capacity.get(),
         }
     }
 
@@ -176,6 +219,12 @@ impl Demo {
     }
     pub fn set_destroy_held(&mut self, held: bool) {
         self.destroy_held = held;
+    }
+    pub fn set_policy(&mut self, policy: PolicyChoice) {
+        self.policy = policy;
+    }
+    pub fn policy(&self) -> PolicyChoice {
+        self.policy
     }
     pub fn select_fixture(&mut self, fixture: FixtureId) {
         self.selected_fixture = fixture;
@@ -201,9 +250,9 @@ impl Demo {
             self.tiny_capacity_active = wants_tiny;
         }
         self.world
-            .start_fixture(descriptor)
+            .start_fixture_with_policy(descriptor, self.policy.scheduler())
             .map_err(|error| format!("start fixture: {error:?}"))?;
-        self.disturbances = DisturbanceCommandStream::default_for(0x4341_5345_0001);
+        self.disturbances = disturbance_stream();
         self.last_disturbance = 0;
         Ok(())
     }
@@ -310,6 +359,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_world_size_is_validated_before_allocation() {
+        assert!(Demo::new_with_size(0, 1024).is_err());
+        assert!(Demo::new_with_size(33, 1024).is_err());
+        assert!(Demo::new_with_size(4097, 4096).is_err());
+        let demo = Demo::new_with_size(64, 96).unwrap();
+        assert_eq!(demo.dimensions(), (64, 96));
+        let full_size = Demo::new_with_size(4096, 4096).unwrap();
+        assert_eq!(full_size.dimensions(), (4096, 4096));
+        assert!(full_size.metrics().resource_bytes < 256 * 1024 * 1024);
+    }
+
+    #[test]
     fn credit_adjustment_obeys_app_and_scheduler_bounds() {
         let mut demo = Demo::new().unwrap();
         assert!(!demo.set_credits(MIN_CREDITS - 1));
@@ -327,6 +388,24 @@ mod tests {
         demo.tick();
         assert!(demo.metrics().slice.charged <= demo.credits());
         assert!(demo.metrics().slice.commands <= 1);
+    }
+
+    #[test]
+    fn policy_switch_restarts_the_same_fixture_with_the_selected_scheduler() {
+        let mut demo = Demo::new().unwrap();
+        let fixture = demo.metrics().selected_fixture;
+        demo.set_policy(PolicyChoice::Traditional);
+        demo.start_fixture().unwrap();
+        assert_eq!(demo.world().policy(), SchedulerPolicy::Traditional);
+        assert_eq!(demo.metrics().selected_fixture, fixture);
+        demo.cancel_fixture();
+        while demo.world().reset_in_progress() {
+            demo.world_mut().step();
+        }
+        demo.set_policy(PolicyChoice::Bounded);
+        demo.start_fixture().unwrap();
+        assert_eq!(demo.world().policy(), SchedulerPolicy::Bounded);
+        assert_eq!(demo.metrics().selected_fixture, fixture);
     }
 
     #[test]
