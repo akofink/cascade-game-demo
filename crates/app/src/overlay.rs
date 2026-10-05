@@ -144,7 +144,7 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
             if ui
                 .add_enabled(
                     !preparing,
-                    egui::Slider::new(&mut credits, crate::MIN_CREDITS..=crate::MAX_CREDITS)
+                    egui::Slider::new(&mut credits, crate::MIN_CREDITS..=crate::max_credits())
                         .text("credits / slice"),
                 )
                 .changed()

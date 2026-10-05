@@ -209,7 +209,7 @@ impl App {
             camera: Camera::default(),
             demo,
             deferred_overlay: false,
-            credit_draft: cascade_app::DEFAULT_CREDITS,
+            credit_draft: cascade_app::default_credits(),
             uploads: UploadScheduler::new(chunks_x, chunks_y),
             dirty_chunks: Vec::with_capacity(MAX_CHUNKS_PER_FRAME),
             history: FrameHistory::default(),

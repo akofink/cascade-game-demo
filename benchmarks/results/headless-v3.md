@@ -82,8 +82,8 @@ Reference hardware: MacBook Air (Mac14,2), Apple M2, 8 CPU cores, 16 GB RAM, int
 - The headless paired matrix is 300 measured slices per run, not 60 seconds per fixture. The 1,800-slice calibrations and burst/recovery capture also fall short of the charter's 60-second target.
 - This two-pass traditional policy clearly exceeds 4 ms on the full-size idle and active cases, and the overloaded burning-forest p99 reduction is greater than twofold. That observed comparison is specific to this defined full-scan baseline; it is not evidence about optimized conventional engines or interactive frame latency.
 - The 1,200-command burst did not resolve or reach a stable/empty state in 1,800 slices for either policy.
-- No native smoke was run after the full-frontier correction. The native M2 smoke figures retained in `docs/performance.md` are historical pre-correction evidence only; they must not be read as measurements of this new traditional behavior.
-- The app still defaults to 20,000 and caps at 100,000 credits, so it cannot use the 1,000,000-credit headless candidate without a separate integration change. This PR does not modify `crates/app`.
+- At the time this report was published, no native smoke had been run after the full-frontier correction. The subsequent full-size M2 release comparison is recorded in [`docs/performance.md`](../../docs/performance.md).
+- At capture time the app defaulted to 20,000 and capped at 100,000 credits; this headless-evidence change did not modify `crates/app`. The subsequent profile-backed app integration is recorded in [`docs/performance.md`](../../docs/performance.md).
 - Full-size interactive rendering, GPU/upload behavior, sustained frame intervals, UI feedback, and 60-second acceptance remain unmeasured.
 
 Credits cap accounted work only in bounded mode and are not elapsed-time deadlines. Results are empirical on one machine.

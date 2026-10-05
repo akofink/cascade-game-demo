@@ -1,5 +1,7 @@
 //! App-side controls and bounded simulation stepping.
 
+use std::sync::OnceLock;
+
 use cascade_sim::{
     Capacity, Command, Credits, Material, SchedulerPolicy, SliceMetrics, SubmitResult, World,
     fixtures::{
@@ -10,9 +12,51 @@ use cascade_sim::{
 
 pub const DEMO_WIDTH: u32 = 1024;
 pub const DEMO_HEIGHT: u32 = 1024;
-pub const DEFAULT_CREDITS: u32 = 20_000;
+const CREDIT_PROFILE: &str = include_str!("../../../profiles/m2-16gb-v3.toml");
 pub const MIN_CREDITS: u32 = 25;
-pub const MAX_CREDITS: u32 = 100_000;
+
+#[derive(Clone, Copy)]
+struct AppCreditProfile {
+    default: u32,
+    maximum: u32,
+}
+
+fn parse_profile_credits(contents: &str) -> AppCreditProfile {
+    let profile: toml::Value =
+        toml::from_str(contents).expect("embedded credit profile is valid TOML");
+    let credits = |key: &str| {
+        profile
+            .get(key)
+            .and_then(toml::Value::as_integer)
+            .and_then(|credits| u32::try_from(credits).ok())
+            .expect("embedded profile has a positive app credit value")
+    };
+    let default = credits("app_current_default_credits");
+    let maximum = credits("app_current_max_credits");
+    assert!(
+        default >= MIN_CREDITS,
+        "profile allowance is below app minimum"
+    );
+    assert!(default <= maximum, "profile default exceeds app maximum");
+    assert!(
+        maximum <= cascade_sim::MAX_BUDGET_CREDITS,
+        "profile allowance exceeds simulator limit"
+    );
+    AppCreditProfile { default, maximum }
+}
+
+fn profile_credits() -> AppCreditProfile {
+    static CREDITS: OnceLock<AppCreditProfile> = OnceLock::new();
+    *CREDITS.get_or_init(|| parse_profile_credits(CREDIT_PROFILE))
+}
+
+pub fn default_credits() -> u32 {
+    profile_credits().default
+}
+
+pub fn max_credits() -> u32 {
+    profile_credits().maximum
+}
 pub const BRUSH_CELLS_PER_FRAME: usize = 64;
 
 fn disturbance_stream() -> DisturbanceCommandStream {
@@ -124,10 +168,11 @@ impl Demo {
         {
             return Err("world dimensions must be multiples of 32 in 32..=4096".to_string());
         }
+        let initial_credits = default_credits();
         let world = World::new(
             width,
             height,
-            Credits::new(DEFAULT_CREDITS),
+            Credits::new(initial_credits),
             Capacity::new(cascade_sim::DEFAULT_READY_CAPACITY),
             Capacity::new(cascade_sim::DEFAULT_COMMAND_CAPACITY),
         )
@@ -137,7 +182,7 @@ impl Demo {
         let alternate_world = World::new(
             width,
             height,
-            Credits::new(DEFAULT_CREDITS),
+            Credits::new(initial_credits),
             tiny_ready,
             tiny_commands,
         )
@@ -150,7 +195,7 @@ impl Demo {
             paused: false,
             selected_fixture: FixtureId::MixedOverload,
             selected_material: MaterialChoice::Sand,
-            credits: DEFAULT_CREDITS,
+            credits: initial_credits,
             step_once: false,
             destroy_held: false,
             disturbances: disturbance_stream(),
@@ -179,7 +224,7 @@ impl Demo {
     }
 
     pub fn set_credits(&mut self, credits: u32) -> bool {
-        if !(MIN_CREDITS..=MAX_CREDITS).contains(&credits)
+        if !(MIN_CREDITS..=max_credits()).contains(&credits)
             || self.world.set_budget(Credits::new(credits)).is_err()
             || self
                 .alternate_world
@@ -371,13 +416,27 @@ mod tests {
     }
 
     #[test]
+    fn profile_supplies_the_default_and_maximum_credit_allowance() {
+        let test_profile = parse_profile_credits(
+            "app_current_default_credits = 1234\napp_current_max_credits = 2345\n",
+        );
+        assert_eq!(test_profile.default, 1234);
+        assert_eq!(test_profile.maximum, 2345);
+        let allowance = profile_credits();
+        assert_eq!(max_credits(), allowance.maximum);
+        let demo = Demo::new().unwrap();
+        assert_eq!(demo.credits(), allowance.default);
+    }
+
+    #[test]
     fn credit_adjustment_obeys_app_and_scheduler_bounds() {
         let mut demo = Demo::new().unwrap();
         assert!(!demo.set_credits(MIN_CREDITS - 1));
-        assert!(!demo.set_credits(MAX_CREDITS + 1));
+        assert!(!demo.set_credits(max_credits() + 1));
         assert!(demo.set_credits(MIN_CREDITS));
+        assert!(demo.set_credits(max_credits()));
         demo.tick();
-        assert!(demo.metrics().slice.charged <= MIN_CREDITS);
+        assert!(demo.metrics().slice.charged <= max_credits());
     }
 
     #[test]

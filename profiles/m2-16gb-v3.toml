@@ -4,8 +4,8 @@ name = "m2-16gb-headless"
 reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
 credits_per_slice = 1000000
 simulator_max_supported_credits = 10000000
-app_current_max_credits = 100000
-app_current_default_credits = 20000
+app_current_max_credits = 1000000
+app_current_default_credits = 1000000
 ready_capacity_per_lane = 32768
 command_capacity = 256
 calibration_workloads = [
@@ -27,7 +27,7 @@ worst_workload_p99_ns = 2573875
 worst_observed_slice_ns = 3776291
 slices_over_4ms = 0
 budget_target_ns = 4000000
-status = "headless candidate; app integration must raise its current 100000-credit cap to use it"
+status = "headless candidate; app default and cap are profile-backed"
 
 # Empirical only. The burning-forest sweep had adverse >4 ms outliers at 800000
 # and 1200000 credits; calibration/validation share static fixture descriptors.
