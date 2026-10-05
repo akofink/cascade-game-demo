@@ -74,7 +74,7 @@ Camera/UI feedback latency and action-to-first-visible-effect latency are CPU ti
 - A paint effect is visible when the uploaded texture contains the requested material. Ignition of wood is visible when the upload encodes burning wood as palette index 7. Detonation is visible when the uploaded material or burn state differs from the pre-action cell. A chunk upload that happens before the authoritative change does not count. Rejected or no-effect clicks are acknowledged and are not latency samples.
 - The acknowledgment ring is screen-space and is not a material. Pending rings stay up until the upload shows the effect, the command is rejected, or the click had no target.
 - Smoke admits a scripted paint, ignite, and detonate stream plus a 1 px camera nudge every 10 measured frames while DESTROY PERFORMANCE is admitting disturbances. That stream is part of the measured windows, not a separate quiet baseline.
-- Player focus is not linked in this build. `SMOKE_FEEL` reports `focus=unlinked`. The three-policy comparison will include bounded focus after the simulator API is on `main`. Until then the focus restart button stays disabled and the cyan box is the viewport the app will submit, not a claim that the scheduler is prioritizing it.
+- Player focus is linked when the simulator exports `set_focus_enabled`, `Command::FocusViewport`, action commands, and `active_focus_regions`. The overlay draws those simulator regions. FIFO restarts with focus disabled. The smoke runs a third bounded-focus window when that API is present.
 
 ## Release smoke, 2026-10-05, after game-feel changes
 
@@ -90,7 +90,21 @@ Command: `cargo run --release -p cascade-app -- --smoke --world-size 4096 --scre
 | Ignite visible p50 / p95 | 16.82 / 513.59 ms (n=4) | 86.74 / 86.74 ms (n=1) |
 | Detonate visible p50 / p95 (n=4) | 16.73 / 17.00 ms | 33.42 / 59.98 ms |
 
-Bounded frame p99 is 17.61 ms, down from the prior full-size smoke's about 18.8 to 19.6 ms, and still a little over the 16.7 ms presentation target. One ignite sample in the bounded window was about 514 ms; with n=4 that sample is the p95. Traditional frame p99 was 85.82 ms. These are one short run, not three sustained 60-second captures. The bounded-focus column is not in this run.
+Bounded frame p99 is 17.61 ms, down from the prior full-size smoke's about 18.8 to 19.6 ms, and still a little over the 16.7 ms presentation target. One ignite sample in the bounded window was about 514 ms; with n=4 that sample is the p95. Traditional frame p99 was 85.82 ms. These are one short run, not three sustained 60-second captures. The bounded-focus column is not in the run above. A later local smoke that includes the simulator focus branch is below. It is not on `main` until that simulator change merges.
+
+## Provisional three-policy smoke with focus linked
+
+Same command, same machine, load average about 10 when the run started. Traditional slices in this run reached 1891 ms of simulation CPU, far above the earlier 80 ms full-frontier samples, so that column is an adverse loaded run and not a clean comparison. Focus-mode presentation stayed near one frame.
+
+| Metric | Bounded FIFO | Bounded focus | Traditional (loaded) |
+|---|---:|---:|---:|
+| Frame interval p99 / max | 30.38 / 31.40 ms | not separated in the frame summary | 820.36 / 838.89 ms |
+| Camera/UI p50 / p95 | 16.65 / 16.96 ms | 16.69 / 17.02 ms | 66.91 / 752.47 ms |
+| Paint visible p50 / p95 | 16.63 / 16.96 ms | 16.81 / 16.93 ms | 67.44 / 81.03 ms |
+| Ignite visible p50 / p95 | 815.25 ms (n=1) | 16.13 ms (n=1) | 752.47 ms (n=1) |
+| Detonate visible p50 / p95 | 16.84 / 1016.97 ms | no samples | 66.78 / 370.79 ms |
+
+Focus paint and camera feedback were about one presented frame. Focus detonate produced no visible-effect samples in that window. Repeat this capture after the simulator focus change is on `main` and the machine is quiet before treating the traditional column as evidence.
 
 ## Remaining unmet targets
 

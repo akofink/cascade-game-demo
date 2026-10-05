@@ -487,7 +487,12 @@ impl Demo {
         let view = self.world.cell(x, y)?;
         let target = matches!(view.material, Material::Wood | Material::Explosive);
         let already = view.material == Material::Wood && view.burning > 0;
-        let admitted = target && !already && self.world.ignite(cell).is_ok();
+        let admitted = target
+            && !already
+            && matches!(
+                self.world.submit(Command::Ignite { cell }),
+                SubmitResult::Accepted | SubmitResult::Coalesced
+            );
         if admitted {
             self.remember(crate::ActionKind::Ignite, x, y, view.material);
         }
@@ -505,7 +510,10 @@ impl Demo {
     pub fn detonate_at(&mut self, x: u32, y: u32) -> Option<PlayerMark> {
         let cell = self.world.cell_id(x, y)?;
         let view = self.world.cell(x, y)?;
-        let admitted = self.world.trigger_blast(cell, 12).is_ok();
+        let admitted = matches!(
+            self.world.submit(Command::Detonate { cell, energy: 12 }),
+            SubmitResult::Accepted | SubmitResult::Coalesced
+        );
         if admitted {
             self.remember(crate::ActionKind::Detonate, x, y, Material::Explosive);
         }
@@ -567,18 +575,27 @@ impl Demo {
                 self.refresh[index] = None;
                 continue;
             };
+            let current = self.world.cell(item.x, item.y);
             match item.kind {
                 crate::ActionKind::Paint => {
-                    let _ = self.world.submit(Command::Paint {
-                        cell,
-                        material: item.material,
-                    });
+                    if current.is_none_or(|cell| cell.material != item.material) {
+                        let _ = self.world.submit(Command::Paint {
+                            cell,
+                            material: item.material,
+                        });
+                    }
                 }
                 crate::ActionKind::Ignite => {
-                    let _ = self.world.ignite(cell);
+                    if current
+                        .is_some_and(|cell| cell.material == Material::Wood && cell.burning == 0)
+                    {
+                        let _ = self.world.ignite(cell);
+                    }
                 }
                 crate::ActionKind::Detonate => {
-                    let _ = self.world.trigger_blast(cell, 12);
+                    if current.is_none_or(|cell| cell.material != Material::Explosive) {
+                        let _ = self.world.trigger_blast(cell, 12);
+                    }
                 }
             }
             item.slices_left = item.slices_left.saturating_sub(1);
@@ -675,6 +692,20 @@ mod tests {
         demo.start_fixture().unwrap();
         assert_eq!(demo.world().policy(), SchedulerPolicy::Bounded);
         assert_eq!(demo.metrics().selected_fixture, fixture);
+    }
+
+    #[test]
+    fn ignite_command_burns_wood_on_the_next_slice() {
+        let mut demo = Demo::new_with_size(64, 64).unwrap();
+        demo.paint_material_at(4, 4, Material::Wood).unwrap();
+        demo.tick();
+        demo.set_credits(80);
+        let mark = demo.ignite_at(4, 4).expect("cell exists");
+        assert!(mark.admitted);
+        demo.tick();
+        let after = demo.world().cell(4, 4).unwrap();
+        assert!(after.burning > 0 || after.material != Material::Wood);
+        assert!(demo.world().active_focus_regions().next().is_some());
     }
 
     #[test]
