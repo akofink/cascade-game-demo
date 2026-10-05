@@ -12,6 +12,7 @@ pub const RULE_VERSION: u32 = 5;
 pub const MAX_QUANTUM_COST: u32 = 24;
 pub const MAX_BUDGET_CREDITS: u32 = 10_000_000;
 pub const APPLICATION_CPU_STORAGE_LIMIT: usize = 256 * 1024 * 1024;
+const VISUALIZED_CELLS_PER_SLICE: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -154,6 +155,7 @@ pub struct ResourceTable {
     pub ready_bytes: usize,
     pub command_bytes: usize,
     pub chunk_bytes: usize,
+    pub visualization_bytes: usize,
     pub total_bytes: usize,
     pub ready_capacity: Capacity,
     pub command_capacity: Capacity,
@@ -303,6 +305,9 @@ pub struct World {
     fixture_waiting: Option<fixtures::ScenarioDescriptor>,
     fixture_status: fixtures::FixtureProgress,
     policy: SchedulerPolicy,
+    last_executed_cells: [u32; VISUALIZED_CELLS_PER_SLICE],
+    last_executed_len: usize,
+    last_executed_count: u32,
 }
 
 impl World {
@@ -312,6 +317,23 @@ impl World {
         budget: Credits,
         ready_capacity: Capacity,
         command_capacity: Capacity,
+    ) -> Result<Self, SimError> {
+        Self::new_with_policy(
+            width,
+            height,
+            budget,
+            ready_capacity,
+            command_capacity,
+            SchedulerPolicy::Bounded,
+        )
+    }
+    pub fn new_with_policy(
+        width: u32,
+        height: u32,
+        budget: Credits,
+        ready_capacity: Capacity,
+        command_capacity: Capacity,
+        policy: SchedulerPolicy,
     ) -> Result<Self, SimError> {
         if width == 0 || height == 0 {
             return Err(SimError::InvalidDimensions);
@@ -363,6 +385,11 @@ impl World {
             .and_then(|bytes| {
                 bytes.checked_add(chunk_count.checked_mul(std::mem::size_of::<bool>())?)
             })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    VISUALIZED_CELLS_PER_SLICE.checked_mul(std::mem::size_of::<u32>())?,
+                )
+            })
             .ok_or(SimError::WorldTooLarge)?;
         if resource_bytes > APPLICATION_CPU_STORAGE_LIMIT {
             return Err(SimError::ResourceLimitExceeded);
@@ -395,7 +422,10 @@ impl World {
             fixture: None,
             fixture_waiting: None,
             fixture_status: fixtures::FixtureProgress::default(),
-            policy: SchedulerPolicy::Bounded,
+            policy,
+            last_executed_cells: [u32::MAX; VISUALIZED_CELLS_PER_SLICE],
+            last_executed_len: 0,
+            last_executed_count: 0,
         })
     }
     pub fn dimensions(&self) -> (u32, u32) {
@@ -420,6 +450,28 @@ impl World {
     }
     pub fn policy(&self) -> SchedulerPolicy {
         self.policy
+    }
+    /// Bounded sample of cells executed during the most recent slice.
+    pub fn cell_executed_last(&self, id: CellId) -> bool {
+        self.last_executed_cells[..self.last_executed_len].contains(&id.0)
+    }
+    /// Number of cells recorded for the most recent-slice overlay (at most 128).
+    pub fn visualized_cell_count(&self) -> usize {
+        self.last_executed_len
+    }
+    /// Total cell quanta executed in the most recent slice, including any beyond the visualization sample.
+    pub fn executed_quantum_count(&self) -> u32 {
+        self.last_executed_count
+    }
+    fn record_executed_cell(&mut self, id: CellId) {
+        if self.last_executed_len < VISUALIZED_CELLS_PER_SLICE {
+            self.last_executed_cells[self.last_executed_len] = id.0;
+            self.last_executed_len += 1;
+        } else {
+            let slot = self.last_executed_count as usize % VISUALIZED_CELLS_PER_SLICE;
+            self.last_executed_cells[slot] = id.0;
+        }
+        self.last_executed_count = self.last_executed_count.saturating_add(1);
     }
     pub fn slice_index(&self) -> u64 {
         self.slice
@@ -495,13 +547,15 @@ impl World {
                 * std::mem::size_of::<Option<Job>>(),
             command_bytes: self.commands.slots.len() * std::mem::size_of::<Option<Command>>(),
             chunk_bytes: self.dirty_chunks.len() * std::mem::size_of::<bool>(),
+            visualization_bytes: VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
             total_bytes: self.cells.len() * std::mem::size_of::<Cell>()
                 + self.pending.len() * std::mem::size_of::<PendingCell>()
                 + self.captured_frontier.len()
                 + (self.eval_ready.slots.len() + self.blast_ready.slots.len())
                     * std::mem::size_of::<Option<Job>>()
                 + self.commands.slots.len() * std::mem::size_of::<Option<Command>>()
-                + self.dirty_chunks.len() * std::mem::size_of::<bool>(),
+                + self.dirty_chunks.len() * std::mem::size_of::<bool>()
+                + VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
             ready_capacity: Capacity(self.eval_ready.slots.len() + self.blast_ready.slots.len()),
             command_capacity: Capacity(self.commands.slots.len()),
             chunk_count: self.dirty_chunks.len(),
@@ -903,6 +957,8 @@ impl World {
     }
     /// Bounded mode charges every probe and quantum before work.
     fn step_bounded(&mut self) -> SliceMetrics {
+        self.last_executed_len = 0;
+        self.last_executed_count = 0;
         let mut m = SliceMetrics {
             allowed: self.budget.0,
             slice: self.slice + 1,
@@ -1036,17 +1092,20 @@ impl World {
                 let i = j.cell.index();
                 match j.kind {
                     JobKind::Evaluate => {
+                        self.record_executed_cell(j.cell);
                         self.pending[i].set(PendingCell::EVAL_QUEUED, false);
                         self.execute_evaluate(j.cell);
                         m.evaluations += 1;
                     }
                     JobKind::Blast => {
+                        self.record_executed_cell(j.cell);
                         self.execute_blast(j.cell);
                         m.blasts += 1;
                     }
                 }
             } else if let Some(c) = command {
                 let Command::Paint { cell, .. } = c;
+                self.record_executed_cell(cell);
                 self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
                 self.execute_command(c);
                 m.commands += 1;
@@ -1106,6 +1165,8 @@ impl World {
         self.reset_cursor.is_some()
     }
     fn step_traditional(&mut self) -> SliceMetrics {
+        self.last_executed_len = 0;
+        self.last_executed_count = 0;
         let mut metrics = SliceMetrics {
             allowed: self.budget.0,
             slice: self.slice + 1,
@@ -1148,6 +1209,7 @@ impl World {
             let captured = std::mem::take(&mut self.captured_frontier[i]);
             let id = CellId::from_index(i);
             if captured & CAPTURED_EVAL != 0 {
+                self.record_executed_cell(id);
                 metrics.charged += self.costs.selection.0 + self.costs.evaluate.0;
                 metrics.selections += 1;
                 self.execute_evaluate_captured(id);
@@ -1155,6 +1217,7 @@ impl World {
             }
             let blast = captured & CAPTURED_BLAST;
             if blast > 0 {
+                self.record_executed_cell(id);
                 metrics.charged += self.costs.selection.0 + self.costs.blast.0;
                 metrics.selections += 1;
                 self.execute_blast_captured(id, blast);
@@ -1169,6 +1232,7 @@ impl World {
             metrics.charged += self.costs.selection.0 + self.costs.command.0;
             metrics.selections += 1;
             let Command::Paint { cell, .. } = command;
+            self.record_executed_cell(cell);
             self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
             self.execute_command(command);
             metrics.commands += 1;
@@ -1517,7 +1581,7 @@ mod tests {
         assert_eq!(resources.cell_bytes, 2);
         assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
         assert_eq!(resources.captured_frontier_bytes, 4096 * 4096);
-        assert_eq!(resources.total_bytes, 101_468_160);
+        assert_eq!(resources.total_bytes, 101_468_672);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
@@ -1654,6 +1718,21 @@ mod tests {
         assert!(metrics.charged >= 32 * 32 * 10);
         assert_eq!(metrics.pending_cells, 0);
         assert!(metrics.charged > metrics.allowed);
+    }
+
+    #[test]
+    fn execution_visualization_marks_all_cells_in_the_latest_slice_and_then_clears() {
+        let mut w = world(8, 8, 128, 32, 16);
+        let id = w.cell_id(3, 4).unwrap();
+        w.mark_cell_for_evaluation(id).unwrap();
+        let metrics = w.step();
+        assert_eq!(metrics.evaluations, 1);
+        assert!(w.cell_executed_last(id));
+        assert_eq!(w.visualized_cell_count(), 1);
+        assert_eq!(w.executed_quantum_count(), 1);
+        w.step();
+        assert!(!w.cell_executed_last(id));
+        assert_eq!(w.visualized_cell_count(), 0);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "tour:screenshots": "node scripts/tour-screenshots.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.55.0"
+  }
+}

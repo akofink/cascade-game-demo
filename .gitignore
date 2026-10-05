@@ -1,5 +1,7 @@
 /target
 /book/
+/docs/tour/wasm/
+/node_modules/
 *.profraw
 /benchmarks/raw/
 .DS_Store

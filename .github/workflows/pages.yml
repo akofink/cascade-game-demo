@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.13.1 --locked
+      - name: Build simulation WebAssembly module
+        run: wasm-pack build crates/web --target web --release --out-dir ../../docs/tour/wasm --no-typescript
       - name: Install mdBook
         env:
           MDBOOK_VERSION: 0.5.4
@@ -27,8 +31,10 @@ jobs:
       - name: Build documentation in place
         run: |
           mdbook build
-          # Root sources also copy non-Markdown files. Never ship Git metadata.
-          rm -rf book/.git book/.github
+          # Root sources also copy non-Markdown files. Keep only book content and assets.
+          rm -rf book/.git book/.github book/target book/node_modules book/crates book/scenarios book/profiles book/scripts
+          rm -f book/.gitignore book/.DS_Store book/AGENTS.md book/CLAUDE.md book/Cargo.toml book/Cargo.lock book/rust-toolchain.toml book/package.json book/package-lock.json
+          rm -f book/docs/tour/wasm/.gitignore book/docs/tour/wasm/package.json
       - uses: actions/upload-pages-artifact@v3
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:

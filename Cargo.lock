@@ -301,8 +301,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-rule-shots"
+version = "0.1.0"
+dependencies = [
+ "cascade-sim",
+ "png",
+]
+
+[[package]]
 name = "cascade-sim"
 version = "0.1.0"
+
+[[package]]
+name = "cascade-web"
+version = "0.1.0"
+dependencies = [
+ "cascade-sim",
+ "wasm-bindgen",
+ "web-sys",
+]
 
 [[package]]
 name = "cc"

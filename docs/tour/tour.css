@@ -1,0 +1,4 @@
+.tour-widget,.tour-comparison{margin:1.25rem 0;padding:1rem;border:1px solid var(--theme-hover);border-radius:.5rem;background:var(--quote-bg)}
+.tour-controls{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;margin-bottom:1rem}.tour-controls label{display:flex;align-items:center;gap:.4rem}.tour-controls input[type=range]{width:9rem}
+.tour-pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem}.tour-panel{margin:.5rem 0}.tour-panel h3{margin:.25rem 0}.tour-canvas{display:block;width:min(100%,512px);image-rendering:pixelated;border:1px solid #59636d}.tour-stats{font-size:.82rem;line-height:1.45}.tour-graph{display:block;width:min(100%,640px);height:auto;margin-top:1rem;background:#18212a}.tour-placeholder{padding:1rem;border:1px dashed #8c98a4}
+@media(max-width:600px){.tour-controls{align-items:flex-start}.tour-controls label{width:100%}}
