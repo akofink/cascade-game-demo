@@ -1,0 +1,18 @@
+[package]
+name = "cascade-app"
+description = "Native window, texture renderer, and debug overlay for Cascade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+egui = "0.36.2"
+egui-wgpu = "0.36.2"
+egui-winit = "0.36.2"
+pollster = "1.0.1"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+[lints]
+workspace = true
