@@ -10,7 +10,7 @@ await mkdir(output, { recursive: true });
 const browser = await chromium.launch({ headless: true, executablePath, args: ["--no-sandbox"] });
 const page = await browser.newPage({ viewport: { width: 1280, height: 1100 }, deviceScaleFactor: 1 });
 const failures = [];
-page.on("pageerror", error => failures.push(error.message));
+page.on("pageerror", error => failures.push(error.stack || error.message));
 page.on("response", response => { if (response.status() >= 400) failures.push(`${response.status()} ${response.url()}`); });
 await page.goto(base, { waitUntil: "networkidle" });
 await page.waitForFunction(() => document.querySelectorAll(".tour-widget canvas").length === 4 && document.querySelector(".tour-comparison canvas"));
@@ -32,15 +32,29 @@ for (let i = 0; i < widgets.length; i++) {
 const comparison = page.locator(".tour-comparison");
 await comparison.locator('[data-action="budget"]').fill("64");
 await comparison.locator('[data-action="destroy"]').click();
-for (let step = 0; step < 6; step++) await comparison.locator('[data-action="step"]').click();
+for (let step = 0; step < 8; step++) await comparison.locator('[data-action="step"]').click();
+await comparison.locator('[data-action="destroy"]').click();
+for (let step = 0; step < 25; step++) await comparison.locator('[data-action="step"]').click();
 if (capture) {
+  await page.addStyleTag({ content: "#mdbook-menu-bar{visibility:hidden!important}" });
   await comparison.screenshot({ path: resolve(output, "comparison.png"), animations: "disabled" });
   await page.locator(".tour-placeholder").screenshot({ path: resolve(output, "player-focus.png") });
 }
-await page.locator("img").evaluateAll(images => Promise.all(images.map(image => { image.loading = "eager"; return image.decode(); })));
+await page.locator("img").evaluateAll(images => Promise.all(images.map(image => new Promise((resolve, reject) => {
+  if (image.complete) return image.naturalWidth ? resolve() : reject(new Error(`Failed image: ${image.src}`));
+  image.addEventListener("load", resolve, { once: true });
+  image.addEventListener("error", () => reject(new Error(`Failed image: ${image.src}`)), { once: true });
+  image.loading = "eager";
+}))));
+await page.locator("img").evaluateAll(images => Promise.all(images.map(image => image.decode())));
 const brokenImages = await page.locator("img").evaluateAll(images => images.filter(image => !image.complete || image.naturalWidth === 0).map(image => image.src));
 if (brokenImages.length) failures.push(`Broken images: ${brokenImages.join(", ")}`);
 
+await comparison.locator('[data-action="reset"]').click();
+await comparison.locator('[data-action="play"]').click();
+await page.waitForTimeout(180);
+await comparison.locator('[data-action="play"]').click();
+await comparison.locator('[data-action="reset"]').click();
 for (const widget of widgets) {
   await widget.locator('[data-action="reset"]').click();
   await widget.locator('[data-action="play"]').click();

@@ -1,13 +1,13 @@
 # Interactive feature tour
 
-These small worlds run the repository's actual `cascade-sim` compiled to WebAssembly. They are deliberately zoomed in: colors show material, amber highlights show work waiting to be evaluated, orange cells show queued blast energy, and brightened cells show work executed in the last slice (up to 128 sampled cells). Each canvas is also shown as a checked-in image first, so the explanation remains useful before the browser module starts.
+These small worlds run the repository's actual `cascade-sim` compiled to WebAssembly. Each 128 by 128 world is rendered at 4 screen pixels per cell; the controls and canvases stay horizontally scrollable on narrow screens so cells do not shrink. Material swatches, pending amber, hot orange heat/blast, pale executed-this-slice highlights, and a teal dashed player-focus marker are shown in each widget legend. Focus remains inactive until its scheduler API lands. Each canvas is also shown as a checked-in image first, so the explanation remains useful before the browser module starts.
 
 <figure>
   <img src="tour/images/cells.png" alt="A small world with sand, water, wood, and a blast">
-  <figcaption>Cells and local rules: the screenshot shows the starting materials before movement and burning settle.</figcaption>
+  <figcaption>Cells and local rules: the status reports credits charged/allowed, quanta run, pending channels plus queued commands, ready slots, and oldest-pending age in slices. Pale cells are the latest slice's bounded execution sample, not a count of every cell that ran.</figcaption>
 </figure>
 
-**Palette:** Air `#17212b`, stone `#78838d`, wood `#8d4e31`, sand `#e5b84f`, explosive `#f05832`, water `#45a9c5`. Amber highlights mark pending evaluation; hot orange shows pending blast energy or burning heat; brightened cells mark the latest slice's execution sample.
+**Palette:** Air `#17212b`, stone `#78838d`, wood `#8d4e31`, sand `#e5b84f`, explosive `#f05832`, water `#45a9c5`. Amber highlights pending channels; orange marks burning heat or pending blast energy; pale highlights the bounded sample executed in the latest slice. The focus swatch is a visual key only, not a scheduling effect.
 
 ## Cells and local rules
 
@@ -17,7 +17,7 @@ Sand and water inspect only their local neighborhood when selected for evaluatio
 
 <figure>
   <img src="tour/images/credits.png" alt="A budgeted world with pending cells highlighted">
-  <figcaption>Credit budget: pending evaluations wait when the remaining allowance cannot pay for their complete quantum.</figcaption>
+  <figcaption>Credit budget: the status line's charged value is the actual simulation-credit cost of this slice; the allowance is the cap, and whole quanta that do not fit remain pending.</figcaption>
 </figure>
 
 ## The credit budget
@@ -28,7 +28,7 @@ Every bounded slice charges scheduler probes and each whole quantum before it ru
 
 <figure>
   <img src="tour/images/deferral.png" alt="A deferred work ring around a pending blast">
-  <figcaption>Deferral: cells beyond the ready ring remain represented by pending state for incremental recovery.</figcaption>
+  <figcaption>Deferral: ready is occupied ring slots out of 128; pending is outstanding evaluation/blast channels, including work waiting for ring capacity.</figcaption>
 </figure>
 
 ## Deferral and recovery
@@ -38,19 +38,19 @@ The ready rings have fixed capacity (64 slots per lane in this small tour fixtur
 <div class="tour-widget" data-scene="2" data-label="Deferral and recovery"></div>
 
 <figure>
-  <img src="tour/images/comparison.png" alt="Bounded and traditional simulation backlogs compared">
-  <figcaption>Same small trigger, two scheduler policies. Browser step durations vary with the machine and are illustrative only.</figcaption>
+  <img src="tour/images/comparison.png" alt="Dense seeded wood and explosive scene compared across bounded and traditional scheduling, with backlog and per-slice credit charts">
+  <figcaption>Same seeded wood/explosive grid and deterministic stone/wood disturbance stream. The upper graph counts pending channels plus queued paint commands after each slice; the lower log-scale graph plots credits charged per slice, with the bounded allowance in dashed amber. In this capture the bounded allowance is 64 credits; a traditional full-world scan alone costs 163,840 credits and its loaded slice reaches about 164,000. These are simulation credits, not elapsed time.</figcaption>
 </figure>
 
 ## Bounded versus traditional
 
-Both worlds use the same real rules and the same initial trigger. Bounded mode obeys its credit allowance. Traditional mode captures and executes its full pending frontier at slice entry, including a full-world scan, and may take longer as the world grows. Compare credits, executed work, measured browser slice time, and pending backlog history below. Browser timing is illustrative, not the native benchmark: use the [performance report](performance.md) for measured benchmark methodology and results. A run completes when its pending work reaches zero.
+Both worlds use the same seeded, packed wood/explosive scene, real rules, and 64-credit bounded allowance. Traditional mode captures and executes its full pending frontier at slice entry, including a full-world scan, and may charge far more than the bounded allowance. The upper plot adds outstanding pending channels and queued paint commands after each slice; the lower plot is credits actually charged per slice on a logarithmic scale. Use the disturbance toggle to admit the same deterministic one-paint-per-slice stream to both worlds, then stop it and watch the deferred bounded backlog trend back toward its initial level. The per-canvas status gives the exact current slice charge and allowance. These counters describe simulation work, not speed or wall-clock time; use the [performance report](performance.md) for measured benchmark methodology and results.
 
 <div class="tour-comparison" data-scene="3" data-label="Paired policy comparison"></div>
 
 <figure>
-  <img src="tour/images/destroy-performance.png" alt="The miniature overload scene under repeated blasts">
-  <figcaption>DESTROY PERFORMANCE in a 128 by 128 world: repeated disturbances build visible backlog without allocating a new world.</figcaption>
+  <img src="tour/images/destroy-performance.png" alt="The miniature overload scene with repeated disturbances and visible pending work">
+  <figcaption>DESTROY PERFORMANCE in a 128 by 128 world: each cell is 4 screen pixels wide. Status quanta count work run; pale cells show the latest slice's bounded sample, while pending/queued and ready counts show remaining work.</figcaption>
 </figure>
 
 ## DESTROY PERFORMANCE, in miniature
@@ -67,8 +67,8 @@ The button admits a capped stream of repeated cell disturbances into the same fi
 <div class="tour-widget" data-scene="4" data-label="DESTROY PERFORMANCE"></div>
 
 <figure>
-  <img src="tour/images/player-focus.png" alt="A player action surrounded by cells awaiting evaluation">
-  <figcaption>Player focus is a placeholder until the simulation's focus API is merged.</figcaption>
+  <img src="tour/images/player-focus.png" alt="A note explaining that player-focus visualization is not yet available">
+  <figcaption>The teal dashed focus legend key is reserved for player-focus visualization; focus does not currently affect scheduling.</figcaption>
 </figure>
 
 ## Player focus

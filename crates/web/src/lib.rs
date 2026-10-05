@@ -94,9 +94,9 @@ impl TourWorld {
     pub fn seed_scene(&mut self, scene: u8) {
         let w = self.width;
         let floor = self.height - 12;
-        for x in 4..w - 4 {
-            for dx in 0..1 {
-                let _ = self.paint(x + dx, floor, 1);
+        if scene % 6 != 3 {
+            for x in 4..w - 4 {
+                let _ = self.paint(x, floor, 1);
             }
         }
         match scene % 6 {
@@ -131,6 +131,14 @@ impl TourWorld {
                 }
             }
             3 => {
+                for y in 36..44 {
+                    for x in 40..48 {
+                        let _ = self.paint(x, y, 2);
+                    }
+                    for x in 52..60 {
+                        let _ = self.paint(x, y, 4);
+                    }
+                }
                 for x in 32..96 {
                     let _ = self.paint(x, 78, 4);
                 }
@@ -138,7 +146,6 @@ impl TourWorld {
                     let _ = self.paint(32, y, 2);
                     let _ = self.paint(95, y, 2);
                 }
-                let _ = self.ignite(32, 78);
             }
             4 => {
                 for x in [24, 48, 72, 96] {
