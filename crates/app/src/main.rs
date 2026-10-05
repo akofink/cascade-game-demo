@@ -19,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 struct Gpu {
     window: Arc<Window>,
@@ -37,6 +37,19 @@ struct Gpu {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     egui_inited: bool,
+}
+
+#[derive(Default)]
+struct PolicySmoke {
+    frames: u32,
+    first_pending: usize,
+    last_pending: usize,
+    max_pending: usize,
+    max_ready: usize,
+    max_upload_backlog: usize,
+    max_sim_cpu_ms: f32,
+    max_frame_interval_ns: u64,
+    p99_frame_interval_ns: u64,
 }
 
 struct Smoke {
@@ -57,11 +70,12 @@ struct Smoke {
     zero_start_reconfigs: u32,
     zero_ok: bool,
     hold_frames: u32,
-    overload_frames: u32,
-    max_pending: usize,
-    max_ready: usize,
-    max_upload_backlog: usize,
-    max_frame_interval_ns: u64,
+    result_printed: bool,
+    bounded: PolicySmoke,
+    traditional: PolicySmoke,
+    traditional_started: bool,
+    bounded_armed: bool,
+    traditional_armed: bool,
     failed: Option<String>,
 }
 
@@ -70,11 +84,15 @@ struct App {
     camera: Camera,
     demo: Demo,
     deferred_overlay: bool,
+    credit_draft: u32,
     uploads: UploadScheduler,
     dirty_chunks: Vec<(u32, u32)>,
     history: FrameHistory,
     last_present: Option<Instant>,
     clock_origin: Instant,
+    sim_cpu_ms: f32,
+    pre_step_pending: usize,
+    pre_step_ready: usize,
     upload_cpu_ms: f32,
     submit_cpu_ms: f32,
     last_plan: UploadPlan,
@@ -97,8 +115,8 @@ struct App {
 }
 
 fn main() {
-    let smoke = match parse_args() {
-        Ok(smoke) => smoke,
+    let (smoke, world_size) = match parse_args() {
+        Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
@@ -112,7 +130,7 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(smoke);
+    let mut app = App::new(smoke, world_size);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("event loop stopped: {error}");
         std::process::exit(1);
@@ -132,26 +150,46 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     builder.build()
 }
 
-fn parse_args() -> Result<bool, String> {
+fn parse_args() -> Result<(bool, u32), String> {
     let mut smoke = false;
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
+    let mut world_size = DEMO_WIDTH;
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
             "--smoke" => smoke = true,
+            "--world-size" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --world-size")?;
+                world_size = value.parse().map_err(|_| "world size must be an integer")?;
+                if !(32..=cascade_app::MAX_WORLD_AXIS).contains(&world_size)
+                    || !world_size.is_multiple_of(32)
+                {
+                    return Err(format!(
+                        "world size must be a multiple of 32 in 32..={}",
+                        cascade_app::MAX_WORLD_AXIS
+                    ));
+                }
+                index += 1;
+            }
             "--help" | "-h" => {
                 println!(
-                    "cascade-app [--smoke]\n\nDrag to pan. Scroll to zoom. --smoke prepares the mixed fixture, checks a sampled pixel, exercises pan/zoom/resize, and runs a short bounded overload before exit."
+                    "cascade-app [--smoke] [--world-size N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. Drag to pan. Scroll to zoom. --smoke prepares the mixed fixture, checks a sampled pixel, exercises pan/zoom/resize, and runs paired bounded/traditional overloads before exit.",
+                    cascade_app::MAX_WORLD_AXIS
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
         }
+        index += 1;
     }
-    Ok(smoke)
+    Ok((smoke, world_size))
 }
 
 impl App {
-    fn new(smoke: bool) -> Self {
-        let mut demo = match Demo::new() {
+    fn new(smoke: bool, world_size: u32) -> Self {
+        let mut demo = match Demo::new_with_size(world_size, world_size) {
             Ok(demo) => demo,
             Err(error) => {
                 eprintln!("simulation: {error}");
@@ -170,11 +208,15 @@ impl App {
             camera: Camera::default(),
             demo,
             deferred_overlay: false,
+            credit_draft: cascade_app::DEFAULT_CREDITS,
             uploads: UploadScheduler::new(chunks_x, chunks_y),
             dirty_chunks: Vec::with_capacity(MAX_CHUNKS_PER_FRAME),
             history: FrameHistory::default(),
             last_present: None,
             clock_origin: Instant::now(),
+            sim_cpu_ms: 0.0,
+            pre_step_pending: 0,
+            pre_step_ready: 0,
             upload_cpu_ms: 0.0,
             submit_cpu_ms: 0.0,
             last_plan: UploadPlan::default(),
@@ -210,11 +252,12 @@ impl App {
                 zero_start_reconfigs: 0,
                 zero_ok: false,
                 hold_frames: 0,
-                overload_frames: 0,
-                max_pending: 0,
-                max_ready: 0,
-                max_upload_backlog: 0,
-                max_frame_interval_ns: 0,
+                result_printed: false,
+                bounded: PolicySmoke::default(),
+                traditional: PolicySmoke::default(),
+                traditional_started: false,
+                bounded_armed: false,
+                traditional_armed: false,
                 failed: None,
             }),
             exit_code: 0,
@@ -257,8 +300,22 @@ impl App {
         if let Some(material) = actions.material {
             self.demo.set_selected_material(material);
         }
-        if let Some(credits) = actions.credits {
-            let _ = self.demo.set_credits(credits);
+        if let Some(credits) = actions.credit_draft {
+            self.credit_draft = credits;
+        }
+        if actions.apply_credits
+            && self.demo.set_credits(self.credit_draft)
+            && let Err(error) = self.demo.start_fixture()
+        {
+            eprintln!("restart fixture with adjusted credits: {error}");
+        }
+        if let Some(policy) = actions.policy {
+            let previous = self.demo.policy();
+            self.demo.set_policy(policy);
+            if let Err(error) = self.demo.start_fixture() {
+                self.demo.set_policy(previous);
+                eprintln!("restart fixture for policy: {error}");
+            }
         }
         if let Some(show) = actions.deferred_overlay
             && self.deferred_overlay != show
@@ -336,7 +393,6 @@ impl App {
             self.uploads.mark_all();
             self.seeded = true;
         }
-        self.demo.tick();
         self.dirty_chunks.clear();
         self.demo
             .world_mut()
@@ -367,6 +423,80 @@ impl App {
         self.last_plan = plan;
     }
 
+    fn acquire_frame(&mut self, event_loop: &ActiveEventLoop) -> Option<wgpu::SurfaceTexture> {
+        let gpu = self.gpu.as_mut()?;
+        if gpu.configured_size.0 == 0 || gpu.configured_size.1 == 0 {
+            return None;
+        }
+        match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => {
+                self.outdated_handled = false;
+                Some(frame)
+            }
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Some(frame),
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.skip_timeout += 1;
+                self.request_frame();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.skip_occluded += 1;
+                if (self.skip_occluded == 1 || self.skip_occluded.is_multiple_of(30))
+                    && let Some(gpu) = self.gpu.as_ref()
+                {
+                    gpu.window.set_visible(true);
+                    gpu.window.focus_window();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+                self.request_frame();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    let size = gpu.window.inner_size();
+                    if size.width > 0 && size.height > 0 {
+                        gpu.config.width = size.width;
+                        gpu.config.height = size.height;
+                        gpu.surface.configure(&gpu.device, &gpu.config);
+                        gpu.configured_size = (size.width, size.height);
+                        gpu.surface_reconfigures += 1;
+                    }
+                }
+                self.skip_outdated += 1;
+                self.request_frame();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface_rebuilds += 1;
+                if self.surface_rebuilds > 3 {
+                    self.fail(event_loop, "surface lost repeatedly".to_string());
+                    return None;
+                }
+                let new_surface = self
+                    .gpu
+                    .as_ref()
+                    .and_then(|gpu| gpu.instance.create_surface(gpu.window.clone()).ok());
+                if let Some(surface) = new_surface {
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.surface = surface;
+                        let size = gpu.configured_size;
+                        gpu.configured_size = (0, 0);
+                        self.apply_size(size);
+                    }
+                } else {
+                    self.fail(event_loop, "recreate surface failed".to_string());
+                    return None;
+                }
+                self.request_frame();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.fail(event_loop, "surface validation error".to_string());
+                None
+            }
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         if self.exit_code != 0 {
             return;
@@ -385,75 +515,18 @@ impl App {
             );
             return;
         }
+        let Some(frame) = self.acquire_frame(event_loop) else {
+            return;
+        };
+        let before_step = self.demo.metrics().slice;
+        self.pre_step_pending = before_step.pending_cells;
+        self.pre_step_ready = before_step.ready_len;
+        let sim_started = Instant::now();
+        self.demo.tick();
+        self.sim_cpu_ms = sim_started.elapsed().as_secs_f32() * 1000.0;
         self.upload_dirty();
         let Some(gpu) = self.gpu.as_mut() else {
             return;
-        };
-        if gpu.configured_size.0 == 0 || gpu.configured_size.1 == 0 {
-            return;
-        }
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => {
-                self.outdated_handled = false;
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                self.skip_timeout += 1;
-                self.request_frame();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                self.skip_occluded += 1;
-                if (self.skip_occluded == 1 || self.skip_occluded.is_multiple_of(30))
-                    && let Some(gpu) = self.gpu.as_ref()
-                {
-                    gpu.window.set_visible(true);
-                    gpu.window.focus_window();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(8));
-                self.request_frame();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                let size = gpu.window.inner_size();
-                if size.width > 0 && size.height > 0 {
-                    gpu.config.width = size.width;
-                    gpu.config.height = size.height;
-                    gpu.surface.configure(&gpu.device, &gpu.config);
-                    gpu.configured_size = (size.width, size.height);
-                    gpu.surface_reconfigures += 1;
-                }
-                self.skip_outdated += 1;
-                self.request_frame();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface_rebuilds += 1;
-                if self.surface_rebuilds > 3 {
-                    self.fail(event_loop, "surface lost repeatedly".to_string());
-                    return;
-                }
-                let window = gpu.window.clone();
-                match gpu.instance.create_surface(window) {
-                    Ok(surface) => {
-                        gpu.surface = surface;
-                        let size = gpu.configured_size;
-                        gpu.configured_size = (0, 0);
-                        self.apply_size(size);
-                    }
-                    Err(error) => {
-                        self.fail(event_loop, format!("recreate surface: {error}"));
-                        return;
-                    }
-                }
-                self.request_frame();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                self.fail(event_loop, "surface validation error".to_string());
-                return;
-            }
         };
 
         let world = self.demo.dimensions();
@@ -465,6 +538,7 @@ impl App {
             world,
             summary,
             intervals_ns: &intervals[..interval_count],
+            sim_cpu_ms: self.sim_cpu_ms,
             upload_cpu_ms: self.upload_cpu_ms,
             submit_cpu_ms: self.submit_cpu_ms,
             backlog: self.last_plan.backlog,
@@ -477,6 +551,7 @@ impl App {
             sim: self.demo.metrics(),
             material: self.demo.selected_material(),
             credits: self.demo.credits(),
+            credit_draft: self.credit_draft,
             deferred_overlay: self.deferred_overlay,
         };
 
@@ -593,21 +668,71 @@ impl App {
         };
         smoke.presents += 1;
         let sim_metrics = self.demo.metrics();
-        smoke.max_pending = smoke.max_pending.max(sim_metrics.slice.pending_cells);
-        smoke.max_ready = smoke.max_ready.max(sim_metrics.slice.ready_len);
-        smoke.max_upload_backlog = smoke.max_upload_backlog.max(self.last_plan.backlog);
-        smoke.max_frame_interval_ns = smoke
-            .max_frame_interval_ns
-            .max(self.history.summary().max_ns);
-        if sim_metrics
+        let is_traditional = sim_metrics.policy == "traditional";
+        let run = if is_traditional {
+            &mut smoke.traditional
+        } else {
+            &mut smoke.bounded
+        };
+        if (1..120).contains(&run.frames) {
+            run.last_pending = sim_metrics.slice.pending_cells;
+            run.max_pending = run
+                .max_pending
+                .max(sim_metrics.slice.pending_cells)
+                .max(self.pre_step_pending);
+            run.max_ready = run
+                .max_ready
+                .max(sim_metrics.slice.ready_len)
+                .max(self.pre_step_ready);
+            run.max_upload_backlog = run.max_upload_backlog.max(self.last_plan.backlog);
+            run.max_sim_cpu_ms = run.max_sim_cpu_ms.max(self.sim_cpu_ms);
+            let summary = self.history.summary();
+            run.max_frame_interval_ns = run.max_frame_interval_ns.max(summary.max_ns);
+            run.p99_frame_interval_ns = summary.p99_ns;
+            run.frames += 1;
+            if run.frames == 120 {
+                self.demo.set_destroy_held(false);
+            }
+        }
+        let fixture_complete = sim_metrics
             .fixture_progress
-            .is_some_and(|progress| progress.complete)
-            && smoke.overload_frames < 120
-        {
+            .is_some_and(|progress| progress.complete);
+        if fixture_complete && !smoke.bounded_armed {
+            smoke.bounded_armed = true;
+            smoke.bounded.first_pending = sim_metrics.slice.pending_cells;
+            smoke.bounded.last_pending = sim_metrics.slice.pending_cells;
+            self.history = FrameHistory::default();
+            self.last_present = None;
             self.demo.set_destroy_held(true);
-            smoke.overload_frames += 1;
-        } else if smoke.overload_frames >= 120 {
+            smoke.bounded.frames = 1;
+        }
+        if smoke.bounded_armed && smoke.bounded.frames >= 120 && !smoke.traditional_started {
             self.demo.set_destroy_held(false);
+            self.demo.set_policy(cascade_app::PolicyChoice::Traditional);
+            if let Err(error) = self.demo.start_fixture() {
+                smoke.failed = Some(format!("start traditional smoke fixture: {error}"));
+            } else {
+                smoke.traditional_started = true;
+                self.history = FrameHistory::default();
+                self.last_present = None;
+            }
+        }
+        if smoke.traditional_started
+            && self
+                .demo
+                .metrics()
+                .fixture_progress
+                .is_some_and(|progress| progress.complete)
+            && !smoke.traditional_armed
+        {
+            smoke.traditional_armed = true;
+            let pending = self.demo.metrics().slice.pending_cells;
+            smoke.traditional.first_pending = pending;
+            smoke.traditional.last_pending = pending;
+            self.history = FrameHistory::default();
+            self.last_present = None;
+            self.demo.set_destroy_held(true);
+            smoke.traditional.frames = 1;
         }
         if smoke.presents >= 1
             && !smoke.readback_ok
@@ -708,7 +833,8 @@ impl App {
             && smoke.uploaded > 0
             && smoke.resize_targets_seen == 2
             && smoke.zero_ok
-            && smoke.overload_frames >= 120
+            && smoke.bounded.frames >= 120
+            && smoke.traditional.frames >= 120
             && smoke.presents >= 20;
         if ready && !smoke.settled_printed {
             smoke.settled_printed = true;
@@ -719,8 +845,12 @@ impl App {
             smoke.hold_frames += 1;
         }
         let failed = smoke.failed.clone();
-        let finish = smoke.settled_printed && smoke.hold_frames >= 45 && failed.is_none();
+        let finish = smoke.settled_printed
+            && smoke.hold_frames >= 45
+            && failed.is_none()
+            && !smoke.result_printed;
         if finish {
+            smoke.result_printed = true;
             print_smoke(&smoke, reconfigs);
             println!("SMOKE_RESULT ok");
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -738,9 +868,11 @@ impl App {
 
     fn sample_grid(&mut self) -> Result<String, String> {
         let gpu = self.gpu.as_ref().ok_or("gpu missing for sample")?;
+        let (width, height) = self.demo.dimensions();
+        let sample_cell = (width / 4, height / 4);
         let sample_camera = Camera {
-            origin_x: 220.0,
-            origin_y: 220.0,
+            origin_x: sample_cell.0 as f32,
+            origin_y: sample_cell.1 as f32,
             cells_per_pixel: 1.0,
         };
         let uniform = frame_uniform(&sample_camera, self.demo.dimensions());
@@ -842,7 +974,7 @@ impl App {
             .all(|(got, want)| got.abs_diff(want) <= 1);
         if !close {
             return Err(format!(
-                "sample pixel {pixel:?} != sand {expected:?} ({format:?}) at (220, 220)"
+                "sample pixel {pixel:?} != sand {expected:?} ({format:?}) at {sample_cell:?}"
             ));
         }
         Ok(format!("sample {pixel:?} {format:?}"))
@@ -999,7 +1131,7 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        match create_gpu(event_loop) {
+        match create_gpu(event_loop, self.demo.dimensions()) {
             Ok(gpu) => {
                 let viewport = (gpu.config.width as f32, gpu.config.height as f32);
                 self.camera.fit(self.demo.dimensions(), viewport);
@@ -1019,7 +1151,7 @@ impl ApplicationHandler for App {
     }
 }
 
-fn create_gpu(event_loop: &ActiveEventLoop) -> Result<Gpu, String> {
+fn create_gpu(event_loop: &ActiveEventLoop, world: (u32, u32)) -> Result<Gpu, String> {
     let attributes = Window::default_attributes()
         .with_title("Cascade")
         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
@@ -1129,7 +1261,6 @@ fn create_gpu(event_loop: &ActiveEventLoop) -> Result<Gpu, String> {
         cache: None,
     });
 
-    let world = (DEMO_WIDTH, DEMO_HEIGHT);
     let grid_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("materials"),
         size: wgpu::Extent3d {
@@ -1294,7 +1425,7 @@ fn elapsed_ns(previous: Instant, now: Instant) -> u64 {
 
 fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
     println!(
-        "smoke presents={} pan={} zoom={} readback={} ({}) stale={} uploaded={} resizes_seen={} resize_from={:?} resize_mid={:?} zero_ok={} reconfigures={} overload_frames={} max_pending={} max_ready={} max_upload_backlog={} max_frame_ms={:.2} hold={}",
+        "smoke presents={} pan={} zoom={} readback={} ({}) stale={} uploaded={} resizes_seen={} resize_from={:?} resize_mid={:?} zero_ok={} reconfigures={} bounded_frames={} bounded_pending_first_last={}->{} bounded_max_pending={} bounded_max_ready={} bounded_upload_backlog={} bounded_max_sim_cpu_ms={:.2} bounded_p99_ms={:.2} bounded_max_ms={:.2} traditional_frames={} traditional_pending_first_last={}->{} traditional_max_pending={} traditional_max_ready={} traditional_upload_backlog={} traditional_max_sim_cpu_ms={:.2} traditional_p99_ms={:.2} traditional_max_ms={:.2} hold={}",
         smoke.presents,
         smoke.pan_ok,
         smoke.zoom_ok,
@@ -1307,11 +1438,24 @@ fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
         smoke.resize_mid,
         smoke.zero_ok,
         surface_reconfigures,
-        smoke.overload_frames,
-        smoke.max_pending,
-        smoke.max_ready,
-        smoke.max_upload_backlog,
-        smoke.max_frame_interval_ns as f32 / 1_000_000.0,
+        smoke.bounded.frames,
+        smoke.bounded.first_pending,
+        smoke.bounded.last_pending,
+        smoke.bounded.max_pending,
+        smoke.bounded.max_ready,
+        smoke.bounded.max_upload_backlog,
+        smoke.bounded.max_sim_cpu_ms,
+        smoke.bounded.p99_frame_interval_ns as f32 / 1_000_000.0,
+        smoke.bounded.max_frame_interval_ns as f32 / 1_000_000.0,
+        smoke.traditional.frames,
+        smoke.traditional.first_pending,
+        smoke.traditional.last_pending,
+        smoke.traditional.max_pending,
+        smoke.traditional.max_ready,
+        smoke.traditional.max_upload_backlog,
+        smoke.traditional.max_sim_cpu_ms,
+        smoke.traditional.p99_frame_interval_ns as f32 / 1_000_000.0,
+        smoke.traditional.max_frame_interval_ns as f32 / 1_000_000.0,
         smoke.hold_frames,
     );
 }

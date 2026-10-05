@@ -3,7 +3,7 @@
 use cascade_sim::fixtures::FixtureId;
 
 use crate::{
-    DemoMetrics, MaterialChoice,
+    DemoMetrics, MaterialChoice, PolicyChoice,
     metrics::{FrameSummary, TARGET_FRAME_NS},
 };
 
@@ -11,6 +11,7 @@ pub struct OverlayInput<'a> {
     pub world: (u32, u32),
     pub summary: FrameSummary,
     pub intervals_ns: &'a [u64],
+    pub sim_cpu_ms: f32,
     pub upload_cpu_ms: f32,
     pub submit_cpu_ms: f32,
     pub backlog: usize,
@@ -23,6 +24,7 @@ pub struct OverlayInput<'a> {
     pub sim: DemoMetrics,
     pub material: MaterialChoice,
     pub credits: u32,
+    pub credit_draft: u32,
     pub deferred_overlay: bool,
 }
 
@@ -35,7 +37,9 @@ pub struct OverlayActions {
     pub cancel_fixture: bool,
     pub fixture: Option<FixtureId>,
     pub material: Option<MaterialChoice>,
-    pub credits: Option<u32>,
+    pub credit_draft: Option<u32>,
+    pub apply_credits: bool,
+    pub policy: Option<PolicyChoice>,
     pub deferred_overlay: Option<bool>,
     pub destroy_pressed: bool,
     pub destroy_held: bool,
@@ -112,16 +116,41 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                     actions.cancel_fixture = true;
                 }
             });
-            ui.label(format!("scheduler policy: {}", input.sim.policy));
-            let mut credits = input.credits;
+            ui.horizontal(|ui| {
+                ui.label("Restart fixture under policy:");
+                if ui
+                    .add_enabled(!preparing, egui::Button::new("Bounded"))
+                    .clicked()
+                {
+                    actions.policy = Some(PolicyChoice::Bounded);
+                }
+                if ui
+                    .add_enabled(!preparing, egui::Button::new("Traditional"))
+                    .clicked()
+                {
+                    actions.policy = Some(PolicyChoice::Traditional);
+                }
+                ui.label(format!("current: {}", input.sim.policy));
+            });
+            let mut credits = input.credit_draft;
             if ui
-                .add(
+                .add_enabled(
+                    !preparing,
                     egui::Slider::new(&mut credits, crate::MIN_CREDITS..=crate::MAX_CREDITS)
                         .text("credits / slice"),
                 )
                 .changed()
             {
-                actions.credits = Some(credits);
+                actions.credit_draft = Some(credits);
+            }
+            if ui
+                .add_enabled(
+                    !preparing && credits != input.credits,
+                    egui::Button::new("Apply credits and restart fixture"),
+                )
+                .clicked()
+            {
+                actions.apply_credits = true;
             }
             let mut show_deferred = input.deferred_overlay;
             if ui
@@ -149,8 +178,8 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                 input.summary.missed_target
             ));
             ui.label(format!(
-                "upload {:.3} ms, render submission {:.3} ms",
-                input.upload_cpu_ms, input.submit_cpu_ms
+                "CPU sim {:.3} ms, upload {:.3} ms, render submission {:.3} ms",
+                input.sim_cpu_ms, input.upload_cpu_ms, input.submit_cpu_ms
             ));
             ui.label(format!(
                 "upload backlog {} chunks, {} bytes uploaded, {} this frame",
@@ -175,20 +204,33 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                 m.evaluations, m.blasts, m.commands, m.recoveries
             ));
             ui.label(format!(
-                "ready ring: {}; pending cells: {}; oldest pending age: {} slices",
-                m.ready_len, m.pending_cells, m.oldest_pending_age
+                "ready ring: {}/{}; pending cells: {}; oldest pending age (estimate): {} slices",
+                m.ready_len, input.sim.ready_capacity, m.pending_cells, m.oldest_pending_age
             ));
             ui.label(format!(
                 "commands rejected/coalesced: {}/{}",
                 m.rejected_commands, m.coalesced_commands
             ));
+            let prep = input.sim.fixture_progress.map(|progress| {
+                (
+                    progress
+                        .descriptor
+                        .map(|descriptor| fixture_name(descriptor.id))
+                        .unwrap_or("none"),
+                    progress.prepared_cells,
+                    progress.total_cells,
+                    progress.complete,
+                    progress.cancelled,
+                )
+            });
             ui.label(format!(
                 "fixture: {}; prep: {:?}",
                 fixture_name(input.sim.selected_fixture),
-                input
-                    .sim
-                    .fixture_progress
-                    .map(|p| (p.prepared_cells, p.total_cells, p.complete))
+                prep
+            ));
+            ui.label(format!(
+                "reset cells this slice: {}; fixture cells this slice: {}",
+                m.reset_cells, m.prepared_cells
             ));
             ui.label(format!(
                 "resources: {} MiB",

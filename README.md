@@ -10,11 +10,13 @@ Read the [documentation site](https://akofink.com/cascade-game-demo/).
 
 ## Status
 
-The native app runs a 1024 x 1024 `cascade-sim` world, prepares fixtures incrementally,
-and displays the bounded scheduler and upload backlog. The 4096 x 4096 charter world remains
-available to the headless core; the demo starts smaller for interactive responsiveness.
+The native app starts with a 1024 x 1024 `cascade-sim` world for interactive responsiveness.
+Choose a larger validated square world at startup with `--world-size 4096`. At that size the app
+preallocates both the normal and tiny-capacity simulation profiles (about 161.5 MiB of sim-owned
+CPU arrays combined) and a 16 MiB material texture. Fixture preparation remains incremental.
 The headless core includes complete rules, seeded fixtures, bounded and traditional policies,
-and a benchmark runner.
+and a benchmark runner. See the [native performance smoke report](docs/performance.md) for measured
+M2 results and limitations.
 
 ## Prior art
 
@@ -38,20 +40,22 @@ Closest references:
 
 ```sh
 cargo run -p cascade-app
+# Full charter-size world (fixed size for this run)
+cargo run -p cascade-app -- --world-size 4096
 ```
 
 Drag with the left mouse button to pan; scroll to zoom. Arrow keys and WASD also pan.
 Select a material in the overlay, then Shift-drag to paint (Air erases); each presentation
 iteration admits at most 64 brush descriptors. Right-click ignites wood or explosives; Shift-right-click
 detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
-The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000),
-and toggles deferred-cell highlighting. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
+The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000) with an explicit apply-and-restart action, switches between bounded and traditional scheduling by restarting the same fixture, and toggles deferred-cell highlighting. Traditional mode processes the ready frontier captured at update start without the slice credit cap. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
 admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.
 The overlay graphs actual frame intervals and reports scheduler credits, quanta, pending work,
 command coalescing/rejection, and upload staleness.
 
 A native smoke check opens a window, incrementally prepares the mixed fixture, uploads the world,
-checks a sampled pixel, pans, zooms, resizes/minimizes, then runs a capped 120-frame disturbance burst:
+checks a sampled pixel, pans, zooms, resizes/minimizes, then runs matched 120-frame bounded and
+traditional disturbance bursts and reports per-policy frame/backlog measurements:
 
 ```sh
 cargo run -p cascade-app -- --smoke
