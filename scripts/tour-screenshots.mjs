@@ -13,10 +13,10 @@ const failures = [];
 page.on("pageerror", error => failures.push(error.stack || error.message));
 page.on("response", response => { if (response.status() >= 400) failures.push(`${response.status()} ${response.url()}`); });
 await page.goto(base, { waitUntil: "networkidle" });
-await page.waitForFunction(() => document.querySelectorAll(".tour-widget canvas").length === 4 && document.querySelector(".tour-comparison canvas"));
+await page.waitForFunction(() => document.querySelectorAll(".tour-widget canvas").length === 5 && document.querySelector(".tour-comparison canvas"));
 
 const widgets = await page.locator(".tour-widget").all();
-const names = ["cells", "credits", "deferral", "destroy-performance"];
+const names = ["cells", "credits", "deferral", "destroy-performance", "player-focus"];
 for (let i = 0; i < widgets.length; i++) {
   const widget = widgets[i];
   const start = await widget.locator(".tour-stats").textContent();
@@ -24,6 +24,11 @@ for (let i = 0; i < widgets.length; i++) {
   await widget.locator('[data-action="material"]').selectOption("3");
   await widget.locator("canvas").click({ position: { x: 256, y: 256 }, modifiers: ["Shift"] });
   for (let step = 0; step < 5; step++) await widget.locator('[data-action="step"]').click();
+  if (i === 0 || i === 4) {
+    await widget.locator("canvas").click({ position: { x: 256, y: 256 } });
+    await widget.locator('[data-action="step"]').click();
+    if (!/[1-9]\d* focus regions/.test(await widget.locator(".tour-stats").textContent())) throw new Error(`Widget ${i} did not activate focus visualization`);
+  }
   const end = await widget.locator(".tour-stats").textContent();
   if (start === end || !end.includes("slice")) throw new Error(`Widget ${i} did not advance`);
   if (i === 3) await widget.locator('[data-action="destroy"]').click();
@@ -38,17 +43,26 @@ for (let step = 0; step < 25; step++) await comparison.locator('[data-action="st
 if (capture) {
   await page.addStyleTag({ content: "#mdbook-menu-bar{visibility:hidden!important}" });
   await comparison.screenshot({ path: resolve(output, "comparison.png"), animations: "disabled" });
-  await page.locator(".tour-placeholder").screenshot({ path: resolve(output, "player-focus.png") });
 }
-await page.locator("img").evaluateAll(images => Promise.all(images.map(image => new Promise((resolve, reject) => {
-  if (image.complete) return image.naturalWidth ? resolve() : reject(new Error(`Failed image: ${image.src}`));
-  image.addEventListener("load", resolve, { once: true });
-  image.addEventListener("error", () => reject(new Error(`Failed image: ${image.src}`)), { once: true });
-  image.loading = "eager";
-}))));
-await page.locator("img").evaluateAll(images => Promise.all(images.map(image => image.decode())));
-const brokenImages = await page.locator("img").evaluateAll(images => images.filter(image => !image.complete || image.naturalWidth === 0).map(image => image.src));
-if (brokenImages.length) failures.push(`Broken images: ${brokenImages.join(", ")}`);
+const images = await page.locator("img").all();
+for (const image of images) {
+  await image.evaluate(element => new Promise((resolve, reject) => {
+    if (element.complete && element.naturalWidth > 0) return resolve();
+    const timeout = setTimeout(() => reject(new Error("image load timed out")), 10_000);
+    element.addEventListener("load", () => { clearTimeout(timeout); resolve(); }, { once: true });
+    element.addEventListener("error", () => { clearTimeout(timeout); reject(new Error("image load failed")); }, { once: true });
+    const source = element.src;
+    element.removeAttribute("src");
+    element.loading = "eager";
+    element.src = source;
+  }));
+  await image.scrollIntoViewIfNeeded();
+  try {
+    await image.evaluate(element => element.decode());
+  } catch (error) {
+    throw new Error(`Failed image ${await image.getAttribute("src")}: ${error.message}`);
+  }
+}
 
 await comparison.locator('[data-action="reset"]').click();
 await comparison.locator('[data-action="play"]').click();
@@ -63,4 +77,4 @@ for (const widget of widgets) {
 }
 if (failures.length) throw new Error(`Browser errors:\n${failures.join("\n")}`);
 await browser.close();
-console.log(`${capture ? `Captured ${names.length + 2} feature screenshots from` : "Verified widgets on"} ${base}`);
+console.log(`${capture ? `Captured ${names.length + 1} feature screenshots from` : "Verified widgets on"} ${base}`);

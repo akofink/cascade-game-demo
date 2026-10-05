@@ -1,13 +1,13 @@
 # Interactive feature tour
 
-These small worlds run the repository's actual `cascade-sim` compiled to WebAssembly. Each 128 by 128 world is rendered at 4 screen pixels per cell; the controls and canvases stay horizontally scrollable on narrow screens so cells do not shrink. Material swatches, pending amber, hot orange heat/blast, pale executed-this-slice highlights, and a teal dashed player-focus marker are shown in each widget legend. Focus remains inactive until its scheduler API lands. Each canvas is also shown as a checked-in image first, so the explanation remains useful before the browser module starts.
+These small worlds run the repository's actual `cascade-sim` compiled to WebAssembly. Each 128 by 128 world is rendered at 4 screen pixels per cell; the controls and canvases stay horizontally scrollable on narrow screens so cells do not shrink. Material swatches, pending amber, hot orange heat/blast, pale executed-this-slice highlights, and teal dashed outlines for active player-focus chunks are shown in each widget legend. Each canvas is also shown as a checked-in image first, so the explanation remains useful before the browser module starts.
 
 <figure>
   <img src="tour/images/cells.png" alt="A small world with sand, water, wood, and a blast">
   <figcaption>Cells and local rules: the status reports credits charged/allowed, quanta run, pending channels plus queued commands, ready slots, and oldest-pending age in slices. Pale cells are the latest slice's bounded execution sample, not a count of every cell that ran.</figcaption>
 </figure>
 
-**Palette:** Air `#17212b`, stone `#78838d`, wood `#8d4e31`, sand `#e5b84f`, explosive `#f05832`, water `#45a9c5`. Amber highlights pending channels; orange marks burning heat or pending blast energy; pale highlights the bounded sample executed in the latest slice. The focus swatch is a visual key only, not a scheduling effect.
+**Palette:** Air `#17212b`, stone `#78838d`, wood `#8d4e31`, sand `#e5b84f`, explosive `#f05832`, water `#45a9c5`. Amber highlights pending channels; orange marks burning heat or pending blast energy; pale highlights the bounded sample executed in the latest slice. Teal outlines mark chunks currently receiving focus priority after an admitted ignition action; they do not claim that every highlighted cell executed.
 
 ## Cells and local rules
 
@@ -67,15 +67,15 @@ The button admits a capped stream of repeated cell disturbances into the same fi
 <div class="tour-widget" data-scene="4" data-label="DESTROY PERFORMANCE"></div>
 
 <figure>
-  <img src="tour/images/player-focus.png" alt="A note explaining that player-focus visualization is not yet available">
-  <figcaption>The teal dashed focus legend key is reserved for player-focus visualization; focus does not currently affect scheduling.</figcaption>
+  <img src="tour/images/player-focus.png" alt="The live tour widget showing teal dashed focus-region boundaries around an admitted ignition target">
+  <figcaption>An admitted ignition focuses the target's neighboring chunk region for eight slices. Teal outlines show active priority regions; pale cell highlights separately mark the bounded sample that executed in the latest slice.</figcaption>
 </figure>
 
 ## Player focus
 
-The simulation's player-focus API is still in development. Until that API lands on `main`, this page intentionally makes no claim about preferential scheduling or focus regions.
+An admitted click-to-ignite command activates a bounded priority region around its target for eight simulation slices. This is scheduler focus, not proof that every cell in the outlined region has run. The dashed teal chunk borders show active focus; pale cell highlights show the separate bounded execution sample. Shift-click painting does not create a focus region.
 
-<div class="tour-placeholder" role="note">Player focus visualization will appear here after the focus API is available.</div>
+<div class="tour-widget" data-scene="0" data-label="Player focus"></div>
 
 <script type="module" src="tour/tour.js"></script>
 <link rel="stylesheet" href="tour/tour.css">

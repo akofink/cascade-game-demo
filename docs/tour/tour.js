@@ -13,7 +13,7 @@ function makeLegend(root) {
     ["pending", "#ffcd4b", "overlay"],
     ["heat / blast", "#ff5c1c", "overlay"],
     ["executed this slice", "#e6eef3", "overlay"],
-    ["focus (not active)", "#5bc0be", "focus"],
+    ["player-focus chunk (8 slices)", "#5bc0be", "focus"],
   ];
   for (const [name, color, kind] of entries) {
     const item = document.createElement("li");
@@ -61,19 +61,32 @@ function draw(view, world, history) {
   const { canvas, context, status } = view;
   const pixels = world.cells();
   const image = context.createImageData(world.width(), world.height());
-  for (let i = 0, p = 0; i < pixels.length; i += 4, p += 4) {
+  const focusedChunks = new Set();
+  for (let i = 0, p = 0; i < pixels.length; i += 5, p += 4) {
     const rgb = colors[pixels[i]] || colors[0];
     image.data[p] = rgb[0]; image.data[p + 1] = rgb[1]; image.data[p + 2] = rgb[2]; image.data[p + 3] = 255;
     if (pixels[i + 2]) { image.data[p] = Math.min(255, image.data[p] + 42); image.data[p + 1] = Math.min(255, image.data[p + 1] + 24); }
     if (pixels[i + 1]) { image.data[p] = 255; image.data[p + 1] = Math.max(72, image.data[p + 1] - pixels[i + 1] * 9); image.data[p + 2] = 22; }
     if (pixels[i + 3]) { image.data[p] = Math.min(255, image.data[p] + 90); image.data[p + 1] = Math.min(255, image.data[p + 1] + 90); image.data[p + 2] = Math.min(255, image.data[p + 2] + 90); }
+    if (pixels[i + 4]) {
+      const cell = p / 4;
+      const chunkX = Math.floor((cell % world.width()) / 32);
+      const chunkY = Math.floor(Math.floor(cell / world.width()) / 32);
+      focusedChunks.add(`${chunkX}:${chunkY}`);
+    }
   }
   view.rasterContext.putImageData(image, 0, 0);
   context.imageSmoothingEnabled = false;
   context.drawImage(view.raster, 0, 0, canvas.width, canvas.height);
+  context.save(); context.strokeStyle = "#5bc0be"; context.lineWidth = 2; context.setLineDash([6, 4]);
+  for (const chunk of focusedChunks) {
+    const [x, y] = chunk.split(":").map(Number);
+    context.strokeRect(x * 128 + 1, y * 128 + 1, 126, 126);
+  }
+  context.restore();
   history.push(world.pending() + world.queued_commands()); if (history.length > 100) history.shift();
   const complete = world.pending() === 0 && world.queued_commands() === 0;
-  status.textContent = `Slice ${world.slice()} · charged ${world.charged()} / ${world.allowed()} credits · ${world.executed_cells()} quanta ran (${world.evaluations()} eval + ${world.blasts()} blast) · ${world.pending()} pending channels + ${world.queued_commands()} queued commands · ready ${world.ready()}/${RING_CAPACITY} · oldest pending ${world.oldest_age()} slices · ${complete ? "settled" : "resolving"}`;
+  status.textContent = `Slice ${world.slice()} · charged ${world.charged()} / ${world.allowed()} credits · ${world.executed_cells()} quanta ran (${world.evaluations()} eval + ${world.blasts()} blast) · ${world.pending()} pending channels + ${world.queued_commands()} queued commands · ready ${world.ready()}/${RING_CAPACITY} · ${world.focus_regions()} focus regions · oldest pending ${world.oldest_age()} slices · ${complete ? "settled" : "resolving"}`;
 }
 
 function holdButton(button, burst) {
