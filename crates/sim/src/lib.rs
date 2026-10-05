@@ -956,6 +956,7 @@ impl World {
             m.coalesced_commands = self.coalesced_commands;
             return m;
         }
+        let mut empty_lanes = 0u8;
         while remaining >= self.costs.selection.0 {
             remaining -= self.costs.selection.0;
             m.charged += self.costs.selection.0;
@@ -971,7 +972,8 @@ impl World {
                     Some(j) => (Some(self.costs.blast.0), Some(j), None),
                     None => (None, None, None),
                 },
-                2 => (Some(self.costs.recovery.0), None, None),
+                2 if self.pending_count > 0 => (Some(self.costs.recovery.0), None, None),
+                2 => (None, None, None),
                 _ => {
                     let c = self.deferred_command.take().or_else(|| self.commands.pop());
                     match c {
@@ -980,7 +982,14 @@ impl World {
                     }
                 }
             };
-            let Some(cost) = cost else { continue };
+            let Some(cost) = cost else {
+                empty_lanes += 1;
+                if empty_lanes >= 4 {
+                    break;
+                }
+                continue;
+            };
+            empty_lanes = 0;
             if cost > remaining {
                 if let Some(j) = job {
                     let ring = match j.kind {
@@ -1205,6 +1214,27 @@ mod tests {
         assert_eq!(w.resources().cells, 1122);
         assert_eq!(w.resources().ready_capacity, Capacity(8));
     }
+    #[test]
+    fn quiet_bounded_world_does_not_scan_recovery_without_pending_work() {
+        let mut w = world(64, 64, 4_096, 64, 16);
+        w.start_fixture(fixtures::ScenarioDescriptor::get(
+            fixtures::FixtureId::QuietWorld,
+        ))
+        .unwrap();
+        while w
+            .fixture_progress()
+            .is_some_and(|progress| !progress.complete)
+        {
+            w.step();
+        }
+        let metrics = w.step();
+        assert_eq!(metrics.pending_cells, 0);
+        assert_eq!(metrics.evaluations, 0);
+        assert_eq!(metrics.blasts, 0);
+        assert_eq!(metrics.recoveries, 0);
+        assert_eq!(metrics.commands, 0);
+    }
+
     #[test]
     fn budget_adjustment_preserves_the_minimum_quantum_contract() {
         let mut w = world(4, 4, 64, 2, 2);
