@@ -1,43 +1,29 @@
 # Performance evidence
 
-## Headless simulation evidence
+## Current headless profile and status
 
-### Scope and status
+See [full-size headless results v2](../benchmarks/results/headless-v2.md) and [reference profile v2](../profiles/m2-16gb-v2.toml). The selected headless credit allowance is 1,000,000 credits/slice. It was calibrated upward on full-size saturated workloads: p99 was 2.590917 ms on burning forest and 1.113125 ms on mixed overload, with 120 warm-up slices excluded and a fresh fixture prepared before measurement. Across those two calibration sets, one of 10,800 samples exceeded 4 ms; the maximum was 4.107667 ms. The profile is an empirical candidate with p99 headroom, not a hard deadline guarantee.
 
-These are release-build measurements of the headless simulation step, not interactive frame-latency results. The charter's full milestone 5 acceptance suite is **not met**: the captures below are 300 slices per run, not at least 60 seconds per fixture, and do not measure preparation wall time, renderer/frame intervals, UI latency, or a post-burst recovery duration. The reference profile is provisional. No result here supports a general no-lag or deadline guarantee.
+The simulator supports up to 10,000,000 credits, but the app still caps credits at 100,000 and defaults to 20,000. The app cannot use this profile until its control cap/default is updated. This work did not modify `crates/app`.
 
-### Method
+All eight section-12 descriptors were measured headlessly at 4096 x 4096, 1,000,000 credits, three paired runs per policy, alternating order. The bounded burning-forest p99 was 2.883167 ms, while traditional was 2.862917 ms; only 2 of 900 traditional samples exceeded 4 ms. Thus the charter's twofold p99 comparison and clearly overloaded traditional baseline are **inconclusive/unmet**, despite isolated traditional peaks. The full-size finite burst did not reach stable state within 1,800 measured slices.
 
-`cascade-bench` was built with `cargo build --release -p cascade-bench`. Each run created a fresh world, prepared its descriptor incrementally before measurement, then measured exactly 300 `World::step` calls with a monotonic wall clock around each call. Fixture preparation is excluded from slice durations. Three repetitions were performed per policy and fixture. Policy order alternated by run, bounded then traditional, for each repetition. The quiet-world baseline and all eight section-12 fixture descriptors were included as held-out workloads; mixed-overload alone was used as the calibration pilot. Raw CSV captures remain outside git.
+## Headless method and machine disclosure
 
-World dimensions were 256 x 256, budget 4096 credits, and descriptor-defined capacities. These small dimensions were chosen to complete the full fixture matrix economically; they are not the charter 4096 x 4096 reference world. No warm-up slices were excluded: the current runner has no warm-up option. Samples include OS scheduling effects and use wall time, not thread CPU time. The interval summaries pool 900 samples per fixture and policy from three runs. `p50`, `p95`, and `p99` use the nearest lower indexed sample after sorting; max is the maximum observed. `>4 ms` is an exact count. Completion is the runner's pending-work and command completion flag at the end of the 300-slice run, not evidence of stable state after sustained load.
+Release build: `cargo build --release -p cascade-bench`. The runner times preparation separately, supports `--warmup-slices`, re-prepares the same fixture after warm-up, then records measured slice times, per-slice and cumulative scheduler quanta, cumulative wall elapsed, run-level preparation/warm-up time, measured wall time and first completion slice/time. Preparation wall duration includes both fixture passes when warm-up is enabled; world allocation is excluded. Warm-up wall duration covers only warm-up scheduler steps. Slice duration is monotonic wall time around `World::step`, including OS preemption, not thread CPU time.
 
-Machine: MacBook Air (Mac14,2), Apple M2, 8 CPU cores, 16 GB RAM, integrated Apple M2 GPU; macOS 27.0.1, built-in 2560 x 1664 display. Rust 1.89.0, aarch64-apple-darwin, Cargo 1.89.0. Repository revision: `fe3c0c2f0cb0891eb31e755a21817d1dab913c84`. Display refresh target, power mode, thermal state, and background load were not controlled or recorded. The benchmark is headless and does not exercise a GPU backend.
+Reference hardware: MacBook Air (Mac14,2), Apple M2 with 8 CPU cores, 16 GB RAM, integrated Apple M2 GPU; macOS 27.0.1; built-in 2560 x 1664 display. Rust 1.99.0 (`b940084d7`, aarch64-apple-darwin), Cargo 1.99.0. Headless source revision: `5825d77eae4c9b866dd8251c47fcc3e93403a9db`; `Cargo.lock` SHA-256 `c4084ec2080b2c4da29d605573b159b02504f86af481d13c5807e565d419afe7`. Power mode, thermal state, background load, and display refresh/presentation mode were not controlled.
 
-### Results
+Calibration used full-size burning-forest and mixed-overload descriptors, each with a deterministic 64-command-per-slice disturbance stream, 120 warm-up slices, fresh re-preparation, and three repetitions of 1,800 measured slices at 1,000,000 credits. The selected point admitted 115,200 commands per run with no rejection/coalescing; backlog high-water was 12,672,372 for burning forest and 8,374,984 for mixed overload. The upward sweeps, p50/p95/p99/max, completed work, and tuning points are in the v2 summary.
 
-See [curated per-fixture summary](../benchmarks/results/headless-v1.md) for sample counts and the p50/p95/p99/max, over-budget count, backlog high-water, and completion status for bounded and traditional modes across all fixtures. In this run set, bounded slice durations remained below 4 ms for every sample, but this is only a 256 x 256 headless observation. Traditional mode's long or zero-work slices demonstrate its captured-frontier semantics; it is not a universal conventional-engine baseline.
+The held-out matrix uses the eight section-12 descriptors with no external disturbance stream. Calibration and validation therefore use distinct command-stream inputs, but the static `burning-forest-v1` and `mixed-overload-v1` descriptors appear in both sets. Descriptor-level separation is incomplete and disclosed; the report does not claim a fully independent fixture holdout.
 
-The order-insensitive cross-mode plumbing test compares independent inert paint commands in a quiet fixture. It is a correctness check, not evidence that general bounded and traditional trajectories must match. Per-mode repeated final hashes were deterministic in the runner's tests.
+## Native M2 smoke evidence
 
-### Credit calibration
-
-`profiles/m2-16gb-v1.toml` records a provisional allowance of 4096 credits. The pilot used mixed-overload v1 at 256 x 256 with 1800 measured slices and a finite disturbance stream of 14,400 attempts at up to eight per slice. The single pilot run observed p99 0.004375 ms and max 0.005625 ms, with zero slices above 4 ms. Additional tested allowances were 2048, 1024, 512, and 256 credits. Their respective p99/max slice times were 0.006708/0.032291 ms, 0.002042/0.005583 ms, 0.002375/0.054000 ms, and 0.001292/0.022458 ms. Lower budgets reduced p99 in this pilot, but the experiment did not calculate completed-work throughput to quantify that trade-off; 256 credits also rejected 5,093 disturbance requests and coalesced 55. The 4096-credit setting was retained as a provisional candidate, not shown optimal. Calibration inputs are distinct from the held-out section-12 matrix.
-
-This is not adequate calibration with expensive saturated workloads and headroom at representative/full world scale: it is one pilot repetition on a small world, without warm-up or control of machine state. The selected value is a provisional working profile, not certification. Although its observed pilot p99 is far below 4 ms, the desired acceptance claim remains unverified at the required conditions.
-
-## Native M2 smoke
-
-- Host: MacBook Air (M2, 8-core, 16 GB), macOS 27.0.1.
-- Toolchain: Rust 1.99.0, aarch64-apple-darwin.
-- Command: `cargo run -p cascade-app -- --smoke` (development profile).
-- World: 1024 x 1024, mixed-overload fixture, 20,000 scheduler credits, default queue capacities.
-- The smoke prepared the fixture under each policy, replayed 120 held-disturbance frames per policy (64 capped attempts per presented frame), checked a GPU readback, exercised pan/zoom/resize, and waited for upload settlement.
-
-Latest completed paired run:
+The app-side integration on current `main` ran `cargo run -p cascade-app -- --smoke` in development mode on the same M2. This short paired run used a 1024 x 1024 mixed-overload world, 20,000 credits and 120 held-disturbance frames per policy, with 64 capped attempts per presented frame. It checked GPU readback, pan/zoom/resize, and upload settlement. The run reported:
 
 | Metric | Bounded | Traditional |
-| --- | ---: | ---: |
+|---|---:|---:|
 | Measured frames | 120 | 120 |
 | Pending channels, first to last | 525,394 -> 452,287 | 525,394 -> 492,723 |
 | Maximum pending channels | 525,394 | 525,394 |
@@ -47,21 +33,20 @@ Latest completed paired run:
 | Frame interval p99 | 19.64 ms | 18.36 ms |
 | Maximum frame interval | 23.48 ms | 18.87 ms |
 
-The smoke passed its functional checks: 2,172 presents, pan and zoom input, GPU readback, stale-texture observation during fixture preparation, resize handling, zero-size handling, and three surface reconfigurations. It reported 20,174 uploaded chunks over the full run.
-
-This is one short development-profile run, not sustained performance acceptance. The measured traditional slice used substantially more simulation CPU time, but that did not produce a consistently slower frame interval in this run: bounded p99 was higher, and one bounded frame reached 23.48 ms. Other paired smokes varied, so the native frame-time comparison does not yet establish a visible traditional stall or a 2x improvement. Pending work remained high in both runs and declined over the measured windows; the smoke does not claim that pending count grew during those exact windows. Upload backlog was zero during the measured intervals. Repeat in release mode over sustained runs, and tune/retake the comparison before making a stronger performance claim.
+The functional smoke passed and reported 2,172 presents, 20,174 total uploaded chunks, stale-texture observation during preparation, and three surface reconfigurations. This is one short development-profile run, not sustained acceptance. Traditional used substantially more simulation CPU on its slowest slice but did not produce a slower p99 frame interval; bounded p99 was higher, and its maximum frame interval was 23.48 ms. Other short paired smokes varied, so these measurements do not establish a visible traditional stall or a twofold frame-latency improvement. Pending work declined during the measured windows; no claim that it grew in those exact windows is made. The smoke does not validate the 1,000,000-credit headless profile.
 
 ## World-size bounds
 
-The app defaults to 1024 x 1024. `--world-size 4096` selects the charter-size square world at startup; dimensions are validated before allocation and remain fixed for that run. At 4096 x 4096, the normal and tiny-capacity profiles together account for about 161.5 MiB of simulation-owned CPU arrays, and the material texture is 16 MiB. This fits the current per-app CPU storage limit, but startup allocation and full-size fixture-preparation latency were not included in the M2 smoke above.
+The app defaults to a 1024 x 1024 world. `--world-size 4096` selects the charter-size square world at startup; dimensions are validated before allocation and remain fixed for the run. At 4096 x 4096, the normal and tiny-capacity simulation profiles together account for about 161.5 MiB of simulation-owned CPU arrays, and the material texture is 16 MiB. This fits the current per-app CPU storage limit, but startup allocation and full-size fixture-preparation latency are separate from steady-state measurements.
 
-## Remaining measurements
+## Remaining unmet targets
 
-- Run each fixture at least 60 seconds, three times, with explicit warm-up exclusion and alternating mode order, at fixed 1920 x 1080 interactive render settings. The headless suite and the short native smoke do not satisfy the duration or rendering conditions.
-- Calibrate with multiple expensive, saturated workloads and headroom on the reference world size, while retaining distinct held-out validation inputs.
-- Report per-run preparation duration separately and completion/stable-state slices and wall time. The runner reports 290 preparation scheduler slices for the 256 x 256 runs, but does not time preparation separately.
-- A finite burst/recovery probe used 1,200 disturbances followed by 1,650 no-new-input slices (1,800 total) across three repetitions. Both modes accepted all 1,200 with no rejection/coalescing. Bounded backlog high-water/end were 32,754/195; traditional were 12,260/194. Neither became empty/stable in the window. The probe order was not alternated, so it is supporting, not paired comparative evidence.
-- Measure interactive frame interval p50/p95/p99/max and intervals over 33.3 ms over sustained release-profile windows, plus camera/UI feedback, uploads, and GPU timing. The native smoke is one short development-profile sample and does not establish a consistent traditional frame stall.
-- Verify full-size interactive GPU and workload behavior at 4,096 x 4,096. The app test allocates both CPU-side profiles under the storage limit, but no full-size render or preparation run is claimed.
+- Headless paired fixture comparisons are 300 slices/run, not at least 60 seconds per fixture. Selected calibration repetitions were 1,800 slices and approximately 1.47 to 2.17 seconds measured wall time, also below 60 seconds.
+- The traditional p99 is not clearly overloaded in the paired full-size held-out matrix, and the paired slice-p99 reduction is not twofold. Comparison is inconclusive.
+- A 1,200-command full-size finite burst followed by no new input was measured for 1,800 slices; neither policy reached an empty/stable state. Completion time is right-censored beyond the capture.
+- The native smoke is one short development-profile run, not three sustained 60-second release captures at fixed render settings. Frame interval, >33.3 ms, camera/UI feedback, upload, and GPU distributions still need sustained paired capture.
+- App maximum/default remain 100,000/20,000 credits. The selected 1,000,000-credit profile needs an integration-owned app-control update before interactive use.
+- Calibration command streams differ from held-out inputs, but static fixture descriptors overlap as stated above.
+- Full-size app rendering and preparation with the calibrated profile were not measured.
 
-These gaps are reported rather than inferred from the headless slice measurements.
+These results are empirical on one machine, not portable guarantees. Credits bound accounted algorithmic work, not elapsed-time deadlines.

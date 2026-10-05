@@ -41,6 +41,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--slices" => config.slices = value.parse()?,
+            "--warmup-slices" => config.warmup_slices = value.parse()?,
             "--width" => config.width = value.parse()?,
             "--height" => config.height = value.parse()?,
             "--budget" => config.budget = value.parse()?,
@@ -55,11 +56,18 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     let summary = run(config, format, &mut output)?;
     if format == OutputFormat::Csv {
         eprintln!(
-            "final_hash={:016x} complete={} preparation_slices={} measured_slices={}",
+            "final_hash={:016x} complete={} preparation_slices={} preparation_wall_ns={} warmup_slices={} warmup_wall_ns={} measured_slices={} measured_wall_ns={} completed_work_quanta={} first_completion_slice={:?} completion_wall_ns={:?}",
             summary.final_hash,
             summary.complete,
             summary.preparation_slices,
-            summary.measured_slices
+            summary.preparation_wall_ns,
+            summary.warmup_slices,
+            summary.warmup_wall_ns,
+            summary.measured_slices,
+            summary.measured_wall_ns,
+            summary.completed_work_quanta,
+            summary.first_completion_slice,
+            summary.completion_wall_ns
         );
     }
     Ok(())
@@ -81,7 +89,9 @@ fn parse_fixture(value: &str) -> Result<FixtureId, String> {
 
 fn print_help() {
     println!(
-        "cascade-bench [--fixture NAME] [--policy bounded|traditional] [--slices N] [--format csv|json] [--width N] [--height N] [--budget CREDITS] [--disturbances N] [--disturbances-per-slice N]"
+        "cascade-bench [--fixture NAME] [--policy bounded|traditional] [--slices N] [--warmup-slices N] [--format csv|json] [--width N] [--height N] [--budget CREDITS] [--disturbances N] [--disturbances-per-slice N]"
     );
-    println!("Fixture preparation is incremental and excluded from slice CPU time.");
+    println!(
+        "Fixture preparation and optional warm-up are timed separately and excluded from measured slice durations."
+    );
 }
