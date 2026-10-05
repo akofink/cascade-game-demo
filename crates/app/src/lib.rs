@@ -13,7 +13,7 @@ mod upload;
 pub use camera::{Camera, UNIFORM_BYTES, ViewCommand, apply_command, frame_uniform, zoom_factor};
 pub use demo::{
     BRUSH_CELLS_PER_FRAME, DEFAULT_CREDITS, DEMO_HEIGHT, DEMO_WIDTH, Demo, DemoMetrics,
-    MAX_CREDITS, MIN_CREDITS, MaterialChoice, Policy,
+    MAX_CREDITS, MIN_CREDITS, MaterialChoice,
 };
 pub use grid::{
     CHUNK_CELLS, CHUNK_SIZE, ChunkCoord, GridError, MAX_DIRTY_PER_TICK, MaterialGrid, PALETTE,

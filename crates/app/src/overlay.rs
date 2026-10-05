@@ -3,7 +3,7 @@
 use cascade_sim::fixtures::FixtureId;
 
 use crate::{
-    DemoMetrics, MaterialChoice, Policy,
+    DemoMetrics, MaterialChoice,
     metrics::{FrameSummary, TARGET_FRAME_NS},
 };
 
@@ -36,7 +36,6 @@ pub struct OverlayActions {
     pub fixture: Option<FixtureId>,
     pub material: Option<MaterialChoice>,
     pub credits: Option<u32>,
-    pub policy: Option<Policy>,
     pub deferred_overlay: Option<bool>,
     pub destroy_pressed: bool,
     pub destroy_held: bool,
@@ -113,21 +112,7 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                     actions.cancel_fixture = true;
                 }
             });
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!preparing, egui::Button::new("Bounded"))
-                    .clicked()
-                {
-                    actions.policy = Some(Policy::Bounded);
-                }
-                if ui
-                    .add_enabled(!preparing, egui::Button::new("Traditional"))
-                    .clicked()
-                {
-                    actions.policy = Some(Policy::Traditional);
-                }
-                ui.label(format!("current: {:?}", input.sim.policy));
-            });
+            ui.label(format!("scheduler policy: {}", input.sim.policy));
             let mut credits = input.credits;
             if ui
                 .add(

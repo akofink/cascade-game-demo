@@ -13,12 +13,6 @@ pub const MAX_CREDITS: u32 = 100_000;
 pub const BRUSH_CELLS_PER_FRAME: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Policy {
-    Bounded,
-    Traditional,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterialChoice {
     Air,
     Stone,
@@ -63,7 +57,7 @@ impl MaterialChoice {
 pub struct DemoMetrics {
     pub slice: SliceMetrics,
     pub paused: bool,
-    pub policy: Policy,
+    pub policy: &'static str,
     pub selected_fixture: FixtureId,
     pub fixture_progress: Option<cascade_sim::fixtures::FixtureProgress>,
     pub reset_in_progress: bool,
@@ -77,7 +71,6 @@ pub struct Demo {
     alternate_world: World,
     tiny_capacity_active: bool,
     paused: bool,
-    policy: Policy,
     selected_fixture: FixtureId,
     selected_material: MaterialChoice,
     credits: u32,
@@ -113,7 +106,6 @@ impl Demo {
             alternate_world,
             tiny_capacity_active: false,
             paused: false,
-            policy: Policy::Bounded,
             selected_fixture: FixtureId::MixedOverload,
             selected_material: MaterialChoice::Sand,
             credits: DEFAULT_CREDITS,
@@ -162,7 +154,7 @@ impl Demo {
         DemoMetrics {
             slice: self.last_metrics,
             paused: self.paused,
-            policy: self.policy,
+            policy: "bounded",
             selected_fixture: self.selected_fixture,
             fixture_progress: self.world.fixture_progress(),
             reset_in_progress: self.world.reset_in_progress(),
@@ -184,12 +176,6 @@ impl Demo {
     }
     pub fn set_destroy_held(&mut self, held: bool) {
         self.destroy_held = held;
-    }
-    pub fn set_policy(&mut self, policy: Policy) {
-        self.policy = policy;
-    }
-    pub fn policy(&self) -> Policy {
-        self.policy
     }
     pub fn select_fixture(&mut self, fixture: FixtureId) {
         self.selected_fixture = fixture;

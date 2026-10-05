@@ -43,13 +43,13 @@ Select a material in the overlay, then Shift-drag to paint (Air erases); each pr
 iteration admits at most 64 brush descriptors. Right-click ignites wood or explosives; Shift-right-click
 detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
 The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000),
-toggles deferred-cell highlighting, and restarts the selected fixture when switching between
-bounded and traditional scheduling. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
+and toggles deferred-cell highlighting. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
 admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.
 The overlay graphs actual frame intervals and reports scheduler credits, quanta, pending work,
 command coalescing/rejection, and upload staleness.
 
-A native smoke check opens a window, pans, zooms, resizes, and exits:
+A native smoke check opens a window, incrementally prepares the mixed fixture, uploads the world,
+checks a sampled pixel, pans, zooms, resizes/minimizes, then runs a capped 120-frame disturbance burst:
 
 ```sh
 cargo run -p cascade-app -- --smoke

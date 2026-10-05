@@ -139,7 +139,7 @@ fn parse_args() -> Result<bool, String> {
             "--smoke" => smoke = true,
             "--help" | "-h" => {
                 println!(
-                    "cascade-app [--smoke]\n\nDrag to pan. Scroll to zoom. --smoke opens a window, exercises pan, zoom, and resize, then exits."
+                    "cascade-app [--smoke]\n\nDrag to pan. Scroll to zoom. --smoke prepares the mixed fixture, checks a sampled pixel, exercises pan/zoom/resize, and runs a short bounded overload before exit."
                 );
                 std::process::exit(0);
             }
@@ -259,12 +259,6 @@ impl App {
         }
         if let Some(credits) = actions.credits {
             let _ = self.demo.set_credits(credits);
-        }
-        if let Some(policy) = actions.policy {
-            self.demo.set_policy(policy);
-            if let Err(error) = self.demo.start_fixture() {
-                eprintln!("restart fixture for policy: {error}");
-            }
         }
         if let Some(show) = actions.deferred_overlay
             && self.deferred_overlay != show
