@@ -8,7 +8,9 @@ use std::hash::{Hash, Hasher};
 pub const CHUNK_SIDE: u32 = 32;
 pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
-pub const RULE_VERSION: u32 = 5;
+pub const FOCUS_REGION_CAPACITY: usize = 8;
+pub const ACTION_RECORD_CAPACITY: usize = 256;
+pub const RULE_VERSION: u32 = 6;
 pub const MAX_QUANTUM_COST: u32 = 24;
 pub const MAX_BUDGET_CREDITS: u32 = 10_000_000;
 pub const APPLICATION_CPU_STORAGE_LIMIT: usize = 256 * 1024 * 1024;
@@ -134,6 +136,8 @@ impl PendingCell {
     const EVAL_QUEUED: u8 = 2;
     const BLAST_QUEUED: u8 = 4;
     const PAINT_QUEUED: u8 = 8;
+    const EVAL_FOCUS_QUEUED: u8 = 16;
+    const BLAST_FOCUS_QUEUED: u8 = 32;
     fn has(self, flag: u8) -> bool {
         self.flags & flag != 0
     }
@@ -153,11 +157,14 @@ pub struct ResourceTable {
     pub pending_bytes: usize,
     pub captured_frontier_bytes: usize,
     pub ready_bytes: usize,
+    pub focus_ready_bytes: usize,
+    pub action_record_bytes: usize,
     pub command_bytes: usize,
     pub chunk_bytes: usize,
     pub visualization_bytes: usize,
     pub total_bytes: usize,
     pub ready_capacity: Capacity,
+    pub focus_ready_capacity: Capacity,
     pub command_capacity: Capacity,
     pub chunk_count: usize,
 }
@@ -190,6 +197,57 @@ impl Default for CostContract {
 enum JobKind {
     Evaluate,
     Blast,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+struct FocusRegion {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+    expires_after: u64,
+}
+impl FocusRegion {
+    fn contains(self, x: u32, y: u32, slice: u64) -> bool {
+        self.expires_after > slice
+            && x >= self.min_x
+            && x < self.max_x
+            && y >= self.min_y
+            && y < self.max_y
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct ActionRecord {
+    pub sequence: u64,
+    pub admitted_slice: u64,
+    pub action_applied_slice: Option<u64>,
+    pub first_effect_slice: Option<u64>,
+    pub local_settle_slice: Option<u64>,
+    pub target: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FocusRegionView {
+    pub min_chunk_x: u32,
+    pub min_chunk_y: u32,
+    pub max_chunk_x: u32,
+    pub max_chunk_y: u32,
+    pub remaining_slices: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ServiceShares {
+    pub focus_percent: u8,
+    pub background_min_percent: u8,
+}
+impl Default for ServiceShares {
+    fn default() -> Self {
+        Self {
+            focus_percent: 50,
+            background_min_percent: 20,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct Job {
@@ -243,7 +301,24 @@ impl<T: Copy> Ring<T> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Command {
-    Paint { cell: CellId, material: Material },
+    Paint {
+        cell: CellId,
+        material: Material,
+    },
+    Ignite {
+        cell: CellId,
+    },
+    Detonate {
+        cell: CellId,
+        energy: u8,
+    },
+    FocusViewport {
+        min_chunk_x: u32,
+        min_chunk_y: u32,
+        max_chunk_x: u32,
+        max_chunk_y: u32,
+        lifetime_slices: u16,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmitResult {
@@ -263,6 +338,10 @@ pub struct SliceMetrics {
     pub blasts: u32,
     pub recoveries: u32,
     pub commands: u32,
+    pub focus_evaluations: u32,
+    pub focus_blasts: u32,
+    pub background_evaluations: u32,
+    pub background_blasts: u32,
     pub rejected_commands: u64,
     pub coalesced_commands: u64,
     pub ready_len: usize,
@@ -288,6 +367,14 @@ pub struct World {
     oldest_pending_since: u64,
     eval_ready: Ring<Job>,
     blast_ready: Ring<Job>,
+    focus_eval_ready: Ring<Job>,
+    focus_blast_ready: Ring<Job>,
+    focus_regions: [FocusRegion; FOCUS_REGION_CAPACITY],
+    focus_enabled: bool,
+    shares: ServiceShares,
+    action_records: Vec<Option<ActionRecord>>,
+    action_cursor: usize,
+    action_sequence: u64,
     commands: Ring<Command>,
     generation: Generation,
     budget: Credits,
@@ -372,7 +459,13 @@ impl World {
             )
             .and_then(|bytes| {
                 bytes.checked_add(
-                    (ready_capacity.0 * 2).checked_mul(std::mem::size_of::<Option<Job>>())?,
+                    (ready_capacity.0 * 4).checked_mul(std::mem::size_of::<Option<Job>>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    ACTION_RECORD_CAPACITY
+                        .checked_mul(std::mem::size_of::<Option<ActionRecord>>())?,
                 )
             })
             .and_then(|bytes| {
@@ -406,6 +499,14 @@ impl World {
             oldest_pending_since: 0,
             eval_ready: Ring::new(ready_capacity.0),
             blast_ready: Ring::new(ready_capacity.0),
+            focus_eval_ready: Ring::new(ready_capacity.0),
+            focus_blast_ready: Ring::new(ready_capacity.0),
+            focus_regions: [FocusRegion::default(); FOCUS_REGION_CAPACITY],
+            focus_enabled: true,
+            shares: ServiceShares::default(),
+            action_records: vec![None; ACTION_RECORD_CAPACITY],
+            action_cursor: 0,
+            action_sequence: 0,
             commands: Ring::new(command_capacity.0),
             generation: Generation(1),
             budget,
@@ -472,6 +573,87 @@ impl World {
             self.last_executed_cells[slot] = id.0;
         }
         self.last_executed_count = self.last_executed_count.saturating_add(1);
+    }
+    pub fn set_focus_enabled(&mut self, enabled: bool) {
+        self.focus_enabled = enabled;
+    }
+    pub fn set_service_shares(&mut self, shares: ServiceShares) -> Result<(), SimError> {
+        if shares.focus_percent == 0
+            || shares.focus_percent >= 100
+            || shares.background_min_percent == 0
+            || shares.focus_percent as u16 + shares.background_min_percent as u16 > 100
+        {
+            return Err(SimError::BudgetTooSmall);
+        }
+        self.shares = shares;
+        Ok(())
+    }
+    pub fn service_shares(&self) -> ServiceShares {
+        self.shares
+    }
+    pub fn active_focus_regions(&self) -> impl Iterator<Item = FocusRegionView> + '_ {
+        self.focus_regions.iter().filter_map(|region| {
+            (self.focus_enabled && region.expires_after > self.slice).then_some(FocusRegionView {
+                min_chunk_x: region.min_x,
+                min_chunk_y: region.min_y,
+                max_chunk_x: region.max_x,
+                max_chunk_y: region.max_y,
+                remaining_slices: region.expires_after.saturating_sub(self.slice),
+            })
+        })
+    }
+    pub fn action_records(&self) -> impl Iterator<Item = ActionRecord> + '_ {
+        self.action_records.iter().flatten().copied()
+    }
+    pub fn latest_action_sequence(&self) -> Option<u64> {
+        (self.action_sequence > 0).then_some(self.action_sequence)
+    }
+    pub fn action_record(&self, sequence: u64) -> Option<ActionRecord> {
+        self.action_records
+            .iter()
+            .flatten()
+            .find(|record| record.sequence == sequence)
+            .copied()
+    }
+    fn chunk_xy(&self, id: CellId) -> (u32, u32) {
+        let x = id.0 % self.width;
+        let y = id.0 / self.width;
+        (x / CHUNK_SIDE, y / CHUNK_SIDE)
+    }
+    fn is_focused(&self, id: CellId) -> bool {
+        if !self.focus_enabled {
+            return false;
+        }
+        let (x, y) = self.chunk_xy(id);
+        self.focus_regions
+            .iter()
+            .any(|r| r.contains(x, y, self.slice))
+    }
+    fn focus_cell(&mut self, id: CellId, lifetime: u16) {
+        if !self.focus_enabled {
+            return;
+        }
+        let (x, y) = self.chunk_xy(id);
+        let region = FocusRegion {
+            min_x: x.saturating_sub(1),
+            min_y: y.saturating_sub(1),
+            max_x: (x + 2).min(self.chunks_x),
+            max_y: (y + 2).min(self.chunks_y),
+            expires_after: self.slice.saturating_add(lifetime.max(1) as u64 + 1),
+        };
+        let slot = self
+            .focus_regions
+            .iter()
+            .position(|r| r.expires_after <= self.slice)
+            .unwrap_or_else(|| {
+                self.focus_regions
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.expires_after)
+                    .map_or(0, |(i, _)| i)
+            });
+        self.focus_regions[slot] = region;
+        // Recovery promotes deferred channels incrementally; no chunk/world scan occurs here.
     }
     pub fn slice_index(&self) -> u64 {
         self.slice
@@ -545,18 +727,30 @@ impl World {
             captured_frontier_bytes: self.captured_frontier.len(),
             ready_bytes: (self.eval_ready.slots.len() + self.blast_ready.slots.len())
                 * std::mem::size_of::<Option<Job>>(),
+            focus_ready_bytes: (self.focus_eval_ready.slots.len()
+                + self.focus_blast_ready.slots.len())
+                * std::mem::size_of::<Option<Job>>(),
+            action_record_bytes: self.action_records.len()
+                * std::mem::size_of::<Option<ActionRecord>>(),
             command_bytes: self.commands.slots.len() * std::mem::size_of::<Option<Command>>(),
             chunk_bytes: self.dirty_chunks.len() * std::mem::size_of::<bool>(),
             visualization_bytes: VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
             total_bytes: self.cells.len() * std::mem::size_of::<Cell>()
                 + self.pending.len() * std::mem::size_of::<PendingCell>()
                 + self.captured_frontier.len()
-                + (self.eval_ready.slots.len() + self.blast_ready.slots.len())
+                + (self.eval_ready.slots.len()
+                    + self.blast_ready.slots.len()
+                    + self.focus_eval_ready.slots.len()
+                    + self.focus_blast_ready.slots.len())
                     * std::mem::size_of::<Option<Job>>()
+                + self.action_records.len() * std::mem::size_of::<Option<ActionRecord>>()
                 + self.commands.slots.len() * std::mem::size_of::<Option<Command>>()
                 + self.dirty_chunks.len() * std::mem::size_of::<bool>()
                 + VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
             ready_capacity: Capacity(self.eval_ready.slots.len() + self.blast_ready.slots.len()),
+            focus_ready_capacity: Capacity(
+                self.focus_eval_ready.slots.len() + self.focus_blast_ready.slots.len(),
+            ),
             command_capacity: Capacity(self.commands.slots.len()),
             chunk_count: self.dirty_chunks.len(),
         }
@@ -608,13 +802,38 @@ impl World {
         if self.fixture.is_some() || self.fixture_waiting.is_some() {
             return SubmitResult::FixtureInProgress;
         }
-        let Command::Paint { cell, .. } = command;
-        let index = cell.index();
-        if index >= self.cells.len() {
+        if let Command::FocusViewport {
+            min_chunk_x,
+            min_chunk_y,
+            max_chunk_x,
+            max_chunk_y,
+            ..
+        } = command
+            && (min_chunk_x >= max_chunk_x
+                || min_chunk_y >= max_chunk_y
+                || min_chunk_x >= self.chunks_x
+                || min_chunk_y >= self.chunks_y)
+        {
             self.rejected_commands += 1;
             return SubmitResult::RejectedFull;
         }
-        if self.pending[index].has(PendingCell::PAINT_QUEUED) {
+        let target = match command {
+            Command::Paint { cell, .. }
+            | Command::Ignite { cell }
+            | Command::Detonate { cell, .. } => Some(cell),
+            Command::FocusViewport { .. } => None,
+        };
+        if let Some(cell) = target
+            && cell.index() >= self.cells.len()
+        {
+            self.rejected_commands += 1;
+            return SubmitResult::RejectedFull;
+        }
+        let index = target.map_or(0, CellId::index);
+        if matches!(command, Command::Paint { .. })
+            && self.pending[index].has(PendingCell::PAINT_QUEUED)
+        {
+            let cell = target.expect("paint command has target");
             let slot = self.pending[index].paint_slot as usize;
             if self
                 .commands
@@ -631,12 +850,18 @@ impl World {
                 return SubmitResult::RejectedFull;
             }
             self.coalesced_commands += 1;
+            self.register_action(cell);
             return SubmitResult::Coalesced;
         }
         match self.commands.push_index(command) {
             Ok(slot) => {
-                self.pending[index].paint_slot = slot as u8;
-                self.pending[index].set(PendingCell::PAINT_QUEUED, true);
+                if let Some(cell) = target {
+                    if matches!(command, Command::Paint { .. }) {
+                        self.pending[index].paint_slot = slot as u8;
+                        self.pending[index].set(PendingCell::PAINT_QUEUED, true);
+                    }
+                    self.register_action(cell);
+                }
                 SubmitResult::Accepted
             }
             Err(_) => {
@@ -730,26 +955,45 @@ impl World {
     }
     fn try_queue(&mut self, id: CellId, kind: JobKind) {
         let i = id.index();
-        let queued_flag = match kind {
-            JobKind::Evaluate => PendingCell::EVAL_QUEUED,
-            JobKind::Blast => PendingCell::BLAST_QUEUED,
+        let focused = self.is_focused(id);
+        let queued_flag = match (kind, focused) {
+            (JobKind::Evaluate, true) => PendingCell::EVAL_FOCUS_QUEUED,
+            (JobKind::Blast, true) => PendingCell::BLAST_FOCUS_QUEUED,
+            (JobKind::Evaluate, false) => PendingCell::EVAL_QUEUED,
+            (JobKind::Blast, false) => PendingCell::BLAST_QUEUED,
         };
         if self.pending[i].has(queued_flag) {
             return;
         }
-        let ring = match kind {
-            JobKind::Evaluate => &mut self.eval_ready,
-            JobKind::Blast => &mut self.blast_ready,
+        let job = Job {
+            cell: id,
+            kind,
+            generation: self.generation,
         };
-        if ring
-            .push(Job {
-                cell: id,
-                kind,
-                generation: self.generation,
-            })
-            .is_ok()
-        {
-            self.pending[i].set(queued_flag, true);
+        if focused {
+            let admitted_focus = match kind {
+                JobKind::Evaluate => self.focus_eval_ready.push(job),
+                JobKind::Blast => self.focus_blast_ready.push(job),
+            }
+            .is_ok();
+            if admitted_focus {
+                self.pending[i].set(queued_flag, true);
+                return;
+            }
+        }
+        let admitted_background = match kind {
+            JobKind::Evaluate => self.eval_ready.push(job),
+            JobKind::Blast => self.blast_ready.push(job),
+        }
+        .is_ok();
+        if admitted_background {
+            self.pending[i].set(
+                match kind {
+                    JobKind::Evaluate => PendingCell::EVAL_QUEUED,
+                    JobKind::Blast => PendingCell::BLAST_QUEUED,
+                },
+                true,
+            );
         }
     }
     fn wake_neighbors(&mut self, id: CellId) {
@@ -925,22 +1169,161 @@ impl World {
         let i = self.recovery_cursor;
         self.recovery_cursor = (i + 1) % self.cells.len();
         let id = CellId(i as u32);
-        if self.pending[i].has(PendingCell::EVAL_PENDING)
-            && !self.pending[i].has(PendingCell::EVAL_QUEUED)
-        {
-            self.try_queue(id, JobKind::Evaluate);
+        if self.pending[i].has(PendingCell::EVAL_PENDING) {
+            if self.is_focused(id) && !self.pending[i].has(PendingCell::EVAL_FOCUS_QUEUED) {
+                let job = Job {
+                    cell: id,
+                    kind: JobKind::Evaluate,
+                    generation: self.generation,
+                };
+                if self.focus_eval_ready.push(job).is_ok() {
+                    self.pending[i].set(PendingCell::EVAL_FOCUS_QUEUED, true);
+                }
+            } else if !self.pending[i].has(PendingCell::EVAL_QUEUED)
+                && !self.pending[i].has(PendingCell::EVAL_FOCUS_QUEUED)
+            {
+                self.try_queue(id, JobKind::Evaluate);
+            }
         }
-        if self.pending[i].blast > 0 && !self.pending[i].has(PendingCell::BLAST_QUEUED) {
-            self.try_queue(id, JobKind::Blast);
+        if self.pending[i].blast > 0 {
+            if self.is_focused(id) && !self.pending[i].has(PendingCell::BLAST_FOCUS_QUEUED) {
+                let job = Job {
+                    cell: id,
+                    kind: JobKind::Blast,
+                    generation: self.generation,
+                };
+                if self.focus_blast_ready.push(job).is_ok() {
+                    self.pending[i].set(PendingCell::BLAST_FOCUS_QUEUED, true);
+                }
+            } else if !self.pending[i].has(PendingCell::BLAST_QUEUED)
+                && !self.pending[i].has(PendingCell::BLAST_FOCUS_QUEUED)
+            {
+                self.try_queue(id, JobKind::Blast);
+            }
         }
+    }
+    fn register_action(&mut self, cell: CellId) {
+        self.action_sequence = self.action_sequence.wrapping_add(1).max(1);
+        self.action_records[self.action_cursor] = Some(ActionRecord {
+            sequence: self.action_sequence,
+            admitted_slice: self.slice.saturating_add(1),
+            action_applied_slice: None,
+            first_effect_slice: None,
+            local_settle_slice: None,
+            target: cell.0,
+        });
+        self.action_cursor = (self.action_cursor + 1) % self.action_records.len();
+    }
+    fn note_action_effect(&mut self, cell: CellId) {
+        let slice = self.slice.saturating_add(1);
+        for record in self.action_records.iter_mut().flatten() {
+            let target = record.target;
+            let (tx, ty) = (target % self.width, target / self.width);
+            let (x, y) = (cell.0 % self.width, cell.0 / self.width);
+            if tx.abs_diff(x) <= 1
+                && ty.abs_diff(y) <= 1
+                && record.action_applied_slice.is_some()
+                && record.first_effect_slice.is_none()
+            {
+                record.first_effect_slice = Some(slice);
+            }
+        }
+    }
+    fn update_action_settle(&mut self) {
+        let slice = self.slice;
+        for index in 0..self.action_records.len() {
+            let Some(record) = self.action_records[index] else {
+                continue;
+            };
+            if record.first_effect_slice.is_none() || record.local_settle_slice.is_some() {
+                continue;
+            }
+            let x = record.target % self.width;
+            let y = record.target / self.width;
+            let mut active = false;
+            for ny in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
+                for nx in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
+                    let p = self.pending[(ny * self.width + nx) as usize];
+                    active |= p.has(PendingCell::EVAL_PENDING) || p.blast > 0;
+                }
+            }
+            if !active {
+                self.action_records[index]
+                    .as_mut()
+                    .unwrap()
+                    .local_settle_slice = Some(slice);
+            }
+        }
+    }
+    fn note_action_applied(&mut self, cell: CellId) {
+        let slice = self.slice.saturating_add(1);
+        for record in self.action_records.iter_mut().flatten() {
+            if record.target == cell.0 && record.action_applied_slice.is_none() {
+                record.action_applied_slice = Some(slice);
+            }
+        }
+    }
+    fn set_focus_region(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32, lifetime: u16) {
+        if !self.focus_enabled {
+            return;
+        }
+        let region = FocusRegion {
+            min_x: min_x.min(self.chunks_x),
+            min_y: min_y.min(self.chunks_y),
+            max_x: max_x.min(self.chunks_x),
+            max_y: max_y.min(self.chunks_y),
+            expires_after: self.slice.saturating_add(lifetime.max(1) as u64 + 1),
+        };
+        if region.min_x >= region.max_x || region.min_y >= region.max_y {
+            return;
+        }
+        let slot = self
+            .focus_regions
+            .iter()
+            .position(|r| r.expires_after <= self.slice)
+            .unwrap_or_else(|| {
+                self.focus_regions
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.expires_after)
+                    .map_or(0, |(i, _)| i)
+            });
+        self.focus_regions[slot] = region;
     }
     fn execute_command(&mut self, command: Command) {
         match command {
             Command::Paint { cell, material } => {
+                self.note_action_applied(cell);
+                self.focus_cell(cell, 8);
                 self.set_material(cell, material);
                 self.mark_pending(cell, true);
                 self.try_queue(cell, JobKind::Evaluate);
                 self.wake_neighbors(cell);
+            }
+            Command::Ignite { cell } => {
+                self.note_action_applied(cell);
+                self.focus_cell(cell, 8);
+                let _ = self.ignite(cell);
+            }
+            Command::Detonate { cell, energy } => {
+                self.note_action_applied(cell);
+                self.focus_cell(cell, 8);
+                let _ = self.trigger_blast(cell, energy);
+            }
+            Command::FocusViewport {
+                min_chunk_x,
+                min_chunk_y,
+                max_chunk_x,
+                max_chunk_y,
+                lifetime_slices,
+            } => {
+                self.set_focus_region(
+                    min_chunk_x,
+                    min_chunk_y,
+                    max_chunk_x,
+                    max_chunk_y,
+                    lifetime_slices,
+                );
             }
         }
     }
@@ -1041,25 +1424,102 @@ impl World {
             remaining -= self.costs.selection.0;
             m.charged += self.costs.selection.0;
             m.selections += 1;
-            let lane = self.lane_cursor % 4;
-            self.lane_cursor = (self.lane_cursor + 1) % 4;
+            let phase = self.lane_cursor;
+            self.lane_cursor = (self.lane_cursor + 1) % 100;
+            let focus_eval = self.focus_enabled && self.focus_eval_ready.len() > 0;
+            let focus_blast = self.focus_enabled && self.focus_blast_ready.len() > 0;
+            let focus_demand = focus_eval || focus_blast;
+            let background_eval = self.eval_ready.len() > 0
+                || (!self.focus_enabled && self.focus_eval_ready.len() > 0);
+            let background_blast = self.blast_ready.len() > 0
+                || (!self.focus_enabled && self.focus_blast_ready.len() > 0);
+            let background_demand = background_eval
+                || background_blast
+                || self.pending_count > 0
+                || self.command_len() > 0;
+            let minimum_background_turn = (background_eval || background_blast)
+                && phase >= self.shares.focus_percent
+                && (phase as u16)
+                    < self.shares.focus_percent as u16 + self.shares.background_min_percent as u16;
+            let focus_turn = focus_demand
+                && !minimum_background_turn
+                && (phase < self.shares.focus_percent || !background_demand);
+            let lane = if focus_turn {
+                if focus_eval && focus_blast {
+                    if phase & 1 == 0 { 0 } else { 1 }
+                } else if focus_eval {
+                    0
+                } else {
+                    1
+                }
+            } else if minimum_background_turn {
+                if background_eval && background_blast {
+                    if phase & 1 == 0 { 2 } else { 3 }
+                } else if background_eval {
+                    2
+                } else {
+                    3
+                }
+            } else {
+                let demanded = [
+                    background_eval,
+                    background_blast,
+                    self.pending_count > 0,
+                    self.command_len() > 0,
+                ];
+                (0..4)
+                    .map(|offset| (phase as usize % 4 + offset) % 4)
+                    .find(|index| demanded[*index])
+                    .map_or(6, |index| index as u8 + 2)
+            };
+            let pick_focus = lane == 0 || lane == 1;
             let (cost, job, command) = match lane {
-                0 => match self.eval_ready.pop() {
-                    Some(j) => (Some(self.costs.evaluate.0), Some(j), None),
-                    None => (None, None, None),
-                },
-                1 => match self.blast_ready.pop() {
-                    Some(j) => (Some(self.costs.blast.0), Some(j), None),
-                    None => (None, None, None),
-                },
-                2 if self.pending_count > 0 => (Some(self.costs.recovery.0), None, None),
-                2 => (None, None, None),
+                0 => self.focus_eval_ready.pop().map_or((None, None, None), |j| {
+                    (Some(self.costs.evaluate.0), Some(j), None)
+                }),
+                1 => self
+                    .focus_blast_ready
+                    .pop()
+                    .map_or((None, None, None), |j| {
+                        (Some(self.costs.blast.0), Some(j), None)
+                    }),
+                2 => {
+                    let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
+                    let job = if background_first {
+                        self.eval_ready
+                            .pop()
+                            .or_else(|| self.focus_eval_ready.pop())
+                    } else {
+                        self.focus_eval_ready
+                            .pop()
+                            .or_else(|| self.eval_ready.pop())
+                    };
+                    job.map_or((None, None, None), |j| {
+                        (Some(self.costs.evaluate.0), Some(j), None)
+                    })
+                }
+                3 => {
+                    let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
+                    let job = if background_first {
+                        self.blast_ready
+                            .pop()
+                            .or_else(|| self.focus_blast_ready.pop())
+                    } else {
+                        self.focus_blast_ready
+                            .pop()
+                            .or_else(|| self.blast_ready.pop())
+                    };
+                    job.map_or((None, None, None), |j| {
+                        (Some(self.costs.blast.0), Some(j), None)
+                    })
+                }
+                4 if self.pending_count > 0 => (Some(self.costs.recovery.0), None, None),
+                4 => (None, None, None),
                 _ => {
                     let c = self.deferred_command.take().or_else(|| self.commands.pop());
-                    match c {
-                        Some(c) => (Some(self.costs.command.0), None, Some(c)),
-                        None => (None, None, None),
-                    }
+                    c.map_or((None, None, None), |c| {
+                        (Some(self.costs.command.0), None, Some(c))
+                    })
                 }
             };
             let Some(cost) = cost else {
@@ -1072,9 +1532,11 @@ impl World {
             empty_lanes = 0;
             if cost > remaining {
                 if let Some(j) = job {
-                    let ring = match j.kind {
-                        JobKind::Evaluate => &mut self.eval_ready,
-                        JobKind::Blast => &mut self.blast_ready,
+                    let ring = match (j.kind, pick_focus) {
+                        (JobKind::Evaluate, true) => &mut self.focus_eval_ready,
+                        (JobKind::Blast, true) => &mut self.focus_blast_ready,
+                        (JobKind::Evaluate, false) => &mut self.eval_ready,
+                        (JobKind::Blast, false) => &mut self.blast_ready,
                     };
                     let _ = ring.push(j);
                 }
@@ -1093,20 +1555,62 @@ impl World {
                 match j.kind {
                     JobKind::Evaluate => {
                         self.record_executed_cell(j.cell);
-                        self.pending[i].set(PendingCell::EVAL_QUEUED, false);
-                        self.execute_evaluate(j.cell);
-                        m.evaluations += 1;
+                        let focused_job = pick_focus;
+                        self.pending[i].set(
+                            if focused_job {
+                                PendingCell::EVAL_FOCUS_QUEUED
+                            } else {
+                                PendingCell::EVAL_QUEUED
+                            },
+                            false,
+                        );
+                        if !self.focus_enabled {
+                            self.pending[i].set(PendingCell::EVAL_FOCUS_QUEUED, false);
+                            self.pending[i].set(PendingCell::EVAL_QUEUED, false);
+                        }
+                        if self.pending[i].has(PendingCell::EVAL_PENDING) {
+                            self.note_action_effect(j.cell);
+                            self.execute_evaluate(j.cell);
+                            m.evaluations += 1;
+                            if focused_job {
+                                m.focus_evaluations += 1;
+                            } else {
+                                m.background_evaluations += 1;
+                            }
+                        }
                     }
                     JobKind::Blast => {
                         self.record_executed_cell(j.cell);
-                        self.execute_blast(j.cell);
-                        m.blasts += 1;
+                        let focused_job = pick_focus;
+                        self.pending[i].set(
+                            if focused_job {
+                                PendingCell::BLAST_FOCUS_QUEUED
+                            } else {
+                                PendingCell::BLAST_QUEUED
+                            },
+                            false,
+                        );
+                        if !self.focus_enabled {
+                            self.pending[i].set(PendingCell::BLAST_FOCUS_QUEUED, false);
+                            self.pending[i].set(PendingCell::BLAST_QUEUED, false);
+                        }
+                        if self.pending[i].blast > 0 {
+                            self.note_action_effect(j.cell);
+                            self.execute_blast(j.cell);
+                            m.blasts += 1;
+                            if focused_job {
+                                m.focus_blasts += 1;
+                            } else {
+                                m.background_blasts += 1;
+                            }
+                        }
                     }
                 }
             } else if let Some(c) = command {
-                let Command::Paint { cell, .. } = c;
-                self.record_executed_cell(cell);
-                self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
+                if let Command::Paint { cell, .. } = c {
+                    self.record_executed_cell(cell);
+                    self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
+                }
                 self.execute_command(c);
                 m.commands += 1;
             } else {
@@ -1115,6 +1619,7 @@ impl World {
             }
         }
         self.slice = self.slice.saturating_add(1);
+        self.update_action_settle();
         m.ready_len = self.ready_len();
         m.pending_cells = self.pending_count;
         m.oldest_pending_age = if self.oldest_pending_since == 0 {
@@ -1139,6 +1644,9 @@ impl World {
             .ok_or(SimError::GenerationExhausted)?;
         self.eval_ready.clear();
         self.blast_ready.clear();
+        self.focus_eval_ready.clear();
+        self.focus_blast_ready.clear();
+        self.focus_regions = [FocusRegion::default(); FOCUS_REGION_CAPACITY];
         self.commands.clear();
         self.pending_count = 0;
         self.oldest_pending_since = 0;
@@ -1178,6 +1686,8 @@ impl World {
         // This captures demand beyond both ready rings and keeps generated work for next slice.
         self.eval_ready.clear();
         self.blast_ready.clear();
+        self.focus_eval_ready.clear();
+        self.focus_blast_ready.clear();
         for i in 0..self.pending.len() {
             let pending = self.pending[i];
             let mut captured = 0;
@@ -1194,6 +1704,8 @@ impl World {
             self.pending[i].blast = 0;
             self.pending[i].set(PendingCell::EVAL_QUEUED, false);
             self.pending[i].set(PendingCell::BLAST_QUEUED, false);
+            self.pending[i].set(PendingCell::EVAL_FOCUS_QUEUED, false);
+            self.pending[i].set(PendingCell::BLAST_FOCUS_QUEUED, false);
             metrics.charged += self.costs.selection.0 + self.costs.recovery.0;
             metrics.selections += 1;
             metrics.recoveries += 1;
@@ -1212,16 +1724,20 @@ impl World {
                 self.record_executed_cell(id);
                 metrics.charged += self.costs.selection.0 + self.costs.evaluate.0;
                 metrics.selections += 1;
+                self.note_action_effect(id);
                 self.execute_evaluate_captured(id);
                 metrics.evaluations += 1;
+                metrics.background_evaluations += 1;
             }
             let blast = captured & CAPTURED_BLAST;
             if blast > 0 {
                 self.record_executed_cell(id);
                 metrics.charged += self.costs.selection.0 + self.costs.blast.0;
                 metrics.selections += 1;
+                self.note_action_effect(id);
                 self.execute_blast_captured(id, blast);
                 metrics.blasts += 1;
+                metrics.background_blasts += 1;
             }
         }
 
@@ -1231,14 +1747,16 @@ impl World {
             };
             metrics.charged += self.costs.selection.0 + self.costs.command.0;
             metrics.selections += 1;
-            let Command::Paint { cell, .. } = command;
-            self.record_executed_cell(cell);
-            self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
+            if let Command::Paint { cell, .. } = command {
+                self.record_executed_cell(cell);
+                self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
+            }
             self.execute_command(command);
             metrics.commands += 1;
         }
 
         self.slice = self.slice.saturating_add(1);
+        self.update_action_settle();
         metrics.ready_len = self.ready_len();
         metrics.pending_cells = self.pending_count;
         metrics.oldest_pending_age = if self.oldest_pending_since == 0 {
@@ -1266,6 +1784,18 @@ impl World {
         self.eval_ready.head.hash(&mut h);
         self.eval_ready.len.hash(&mut h);
         self.eval_ready.slots.hash(&mut h);
+        self.focus_eval_ready.head.hash(&mut h);
+        self.focus_eval_ready.len.hash(&mut h);
+        self.focus_eval_ready.slots.hash(&mut h);
+        self.focus_blast_ready.head.hash(&mut h);
+        self.focus_blast_ready.len.hash(&mut h);
+        self.focus_blast_ready.slots.hash(&mut h);
+        self.focus_regions.hash(&mut h);
+        self.focus_enabled.hash(&mut h);
+        self.shares.hash(&mut h);
+        self.action_records.hash(&mut h);
+        self.action_cursor.hash(&mut h);
+        self.action_sequence.hash(&mut h);
         self.blast_ready.head.hash(&mut h);
         self.blast_ready.len.hash(&mut h);
         self.blast_ready.slots.hash(&mut h);
@@ -1284,7 +1814,10 @@ impl World {
         h.finish()
     }
     pub fn ready_len(&self) -> usize {
-        self.eval_ready.len() + self.blast_ready.len()
+        self.eval_ready.len()
+            + self.blast_ready.len()
+            + self.focus_eval_ready.len()
+            + self.focus_blast_ready.len()
     }
     pub fn command_len(&self) -> usize {
         self.commands.len() + usize::from(self.deferred_command.is_some())
@@ -1308,6 +1841,7 @@ mod tests {
         assert!(w.cell(33, 0).is_none());
         assert_eq!(w.resources().cells, 1122);
         assert_eq!(w.resources().ready_capacity, Capacity(8));
+        assert_eq!(w.resources().focus_ready_capacity, Capacity(8));
     }
     #[test]
     fn quiet_bounded_world_does_not_scan_recovery_without_pending_work() {
@@ -1428,7 +1962,7 @@ mod tests {
         for _ in 0..1000 {
             let m = w.step();
             assert!(m.charged <= m.allowed);
-            assert!(w.ready_len() <= 4);
+            assert!(w.ready_len() <= 8);
             assert!(w.command_len() <= 2);
             assert!(w.pending_channels() <= 1800);
         }
@@ -1459,6 +1993,113 @@ mod tests {
         assert!(totals.recoveries > 0);
         assert!(totals.commands > 0);
     }
+    #[test]
+    fn focus_retains_credit_bound_and_background_minimum_service() {
+        let mut w = world(64, 64, 26, 64, 64);
+        let background_cell = CellId(0);
+        let target = CellId(40 * 64 + 40);
+        w.set_focus_region(1, 1, 2, 2, 1000);
+        let mut background = 0;
+        let mut focus = 0;
+        for _ in 0..100 {
+            w.mark_cell_for_evaluation(background_cell).unwrap();
+            w.mark_cell_for_evaluation(target).unwrap();
+            let metrics = w.step();
+            background += metrics.background_evaluations + metrics.background_blasts;
+            focus += metrics.focus_evaluations + metrics.focus_blasts;
+            assert!(metrics.charged <= metrics.allowed);
+        }
+        assert!(focus > 0);
+        assert!(
+            background > 0,
+            "background work must progress under sustained focus demand"
+        );
+        assert!(
+            background * 100 >= (background + focus) * 20,
+            "background share must meet its configured minimum: background={background}, focus={focus}"
+        );
+    }
+
+    #[test]
+    fn focus_expiry_and_replay_are_deterministic() {
+        fn run() -> u64 {
+            let mut w = world(64, 64, 128, 16, 8);
+            let cmd = Command::FocusViewport {
+                min_chunk_x: 0,
+                min_chunk_y: 0,
+                max_chunk_x: 1,
+                max_chunk_y: 1,
+                lifetime_slices: 2,
+            };
+            assert_eq!(w.submit(cmd), SubmitResult::Accepted);
+            for _ in 0..20 {
+                w.step();
+            }
+            w.state_hash()
+        }
+        assert_eq!(run(), run());
+        let mut w = world(64, 64, 128, 16, 8);
+        w.set_focus_region(0, 0, 1, 1, 2);
+        let view = w.active_focus_regions().next().unwrap();
+        assert_eq!(
+            (
+                view.min_chunk_x,
+                view.min_chunk_y,
+                view.max_chunk_x,
+                view.max_chunk_y
+            ),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(view.remaining_slices, 3);
+        assert!(w.is_focused(CellId(0)));
+        w.step();
+        assert!(w.is_focused(CellId(0)));
+        w.step();
+        assert!(w.is_focused(CellId(0)));
+        w.step();
+        assert!(!w.is_focused(CellId(0)));
+    }
+
+    #[test]
+    fn recovery_promotes_without_double_execution() {
+        let mut w = world(64, 64, 256, 64, 8);
+        let id = CellId(10 * 64 + 10);
+        w.mark_cell_for_evaluation(id).unwrap();
+        assert!(w.pending[id.index()].has(PendingCell::EVAL_QUEUED));
+        w.set_focus_region(0, 0, 1, 1, 10);
+        w.recovery_cursor = id.index();
+        w.recover_one();
+        assert!(w.pending[id.index()].has(PendingCell::EVAL_FOCUS_QUEUED));
+        for _ in 0..20 {
+            w.step();
+        }
+        assert_eq!(w.pending_channels(), 0);
+        assert_eq!(w.focus_eval_ready.len(), 0);
+        assert_eq!(w.eval_ready.len(), 0);
+    }
+
+    #[test]
+    fn action_latency_records_are_fixed_and_observable() {
+        let mut w = world(8, 8, 256, 16, 8);
+        let id = w.cell_id(4, 4).unwrap();
+        assert_eq!(
+            w.submit(Command::Paint {
+                cell: id,
+                material: Material::Stone
+            }),
+            SubmitResult::Accepted
+        );
+        let admitted = w.action_records().next().unwrap().admitted_slice;
+        for _ in 0..20 {
+            w.step();
+        }
+        let record = w.action_records().next().unwrap();
+        assert_eq!(record.admitted_slice, admitted);
+        assert!(record.action_applied_slice.is_some());
+        assert!(record.first_effect_slice.is_some());
+        assert!(record.local_settle_slice.is_some());
+    }
+
     #[test]
     fn recovery_admits_saturated_demand() {
         let mut w = world(12, 12, 32, 1, 2);
@@ -1581,9 +2222,24 @@ mod tests {
         assert_eq!(resources.cell_bytes, 2);
         assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
         assert_eq!(resources.captured_frontier_bytes, 4096 * 4096);
-        assert_eq!(resources.total_bytes, 101_468_672);
+        assert_eq!(resources.total_bytes, 102_276_608);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
+    #[test]
+    fn execution_visualization_marks_latest_slice_and_then_clears() {
+        let mut w = world(8, 8, 128, 32, 16);
+        let id = w.cell_id(3, 4).unwrap();
+        w.mark_cell_for_evaluation(id).unwrap();
+        let metrics = w.step();
+        assert_eq!(metrics.evaluations, 1);
+        assert!(w.cell_executed_last(id));
+        assert_eq!(w.visualized_cell_count(), 1);
+        assert_eq!(w.executed_quantum_count(), 1);
+        w.step();
+        assert!(!w.cell_executed_last(id));
+        assert_eq!(w.visualized_cell_count(), 0);
+    }
+
     #[test]
     fn water_gravity_and_spreading_conserve_cells() {
         let mut w = world(7, 5, 64, 32, 4);
@@ -1718,21 +2374,6 @@ mod tests {
         assert!(metrics.charged >= 32 * 32 * 10);
         assert_eq!(metrics.pending_cells, 0);
         assert!(metrics.charged > metrics.allowed);
-    }
-
-    #[test]
-    fn execution_visualization_marks_all_cells_in_the_latest_slice_and_then_clears() {
-        let mut w = world(8, 8, 128, 32, 16);
-        let id = w.cell_id(3, 4).unwrap();
-        w.mark_cell_for_evaluation(id).unwrap();
-        let metrics = w.step();
-        assert_eq!(metrics.evaluations, 1);
-        assert!(w.cell_executed_last(id));
-        assert_eq!(w.visualized_cell_count(), 1);
-        assert_eq!(w.executed_quantum_count(), 1);
-        w.step();
-        assert!(!w.cell_executed_last(id));
-        assert_eq!(w.visualized_cell_count(), 0);
     }
 
     #[test]
