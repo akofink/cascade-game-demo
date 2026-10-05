@@ -22,8 +22,8 @@ Fire, blast, and edit activity wake only fixed cardinal neighborhoods. All timer
 
 ## Coalescing and reset
 
-Duplicate reevaluation requests coalesce to one per-cell pending bit. Blast requests coalesce by maximum energy. Pending state remains authoritative when a ready ring is full and is admitted by the charged recovery cursor. Paint commands to the same cell coalesce to the latest material; a full command ring rejects a new distinct command.
+Duplicate reevaluation requests coalesce to one per-cell pending bit. Blast requests coalesce by maximum energy. Pending state remains authoritative when a ready ring is full and is admitted by the charged recovery cursor. Paint commands to the same cell coalesce to the latest material by a direct per-cell queue-slot index in O(1); a full command ring rejects a new distinct command. The command ring is capped at 256 descriptors. Fixture preparation blocks external mutations until its charged cursor completes or is cancelled.
 
-Reset increments a checked world generation immediately, discards queued command/job frontiers, and blocks new edits while a cursor clears one cell per charged reset quantum. Every old job is generation-tagged and cannot mutate the new generation. Reset progress is observable; cancellation is deliberately not offered for world reset, while fixture preparation has independent cancellation. Reset marks renderer chunks dirty as cells are cleared.
+Reset increments a checked world generation immediately, discards queued command/job frontiers, and blocks new edits while a cursor clears one cell per charged reset quantum. Every old job is generation-tagged and cannot mutate the new generation. Reset progress is observable; cancellation is deliberately not offered for world reset. Starting a fixture schedules reset and then a versioned fixture cursor, both advanced only by `World::step`; fixture progress and cancellation are observable. Reset marks renderer chunks dirty as cells are cleared.
 
-The rules version is `RULE_VERSION = 2`. Determinism is guaranteed only for the same executable/rules, world dimensions, admitted operation order, capacities, policy, and slice budget.
+The rules version is `RULE_VERSION = 3`. Determinism is guaranteed only for the same executable/rules, world dimensions, admitted operation order, capacities, policy, and slice budget.
