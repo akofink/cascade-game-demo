@@ -103,10 +103,9 @@ Fixtures: `quiet-world`, `explosive-lattice`, `sand-release`, `reservoir-breach`
 
 Install [mdBook 0.5.4](https://github.com/rust-lang/mdBook/releases/tag/v0.5.4), then
 run `mdbook build` or `mdbook serve`. The book reads the Markdown files in place.
-Add a Markdown page to `SUMMARY.md` to publish it, including future performance
-reports and curated benchmark summaries. Use relative links between listed pages;
+Add a Markdown page to `SUMMARY.md` to publish it, including the [interactive feature tour](docs/tour.md), future performance reports, and curated benchmark summaries. Build the WASM module with `wasm-pack build crates/web --target web --release --out-dir ../../docs/tour/wasm --no-typescript` before a standalone book build. Use relative links between listed pages;
 link source files to `https://github.com/akofink/cascade-game-demo/blob/main/…`.
-Pull requests build the book; pushes to `main` deploy it to GitHub Pages.
+Pull requests build the book; pushes to `main` deploy it to GitHub Pages. For rule illustrations and browser screenshot regeneration commands, see the relevant docs pages. To capture the live widgets locally, install Node dependencies with `npm ci`, serve the built book, then run `npm run tour:screenshots` with `TOUR_URL` and optionally `CHROME_PATH` set for the local browser.
 
 ## License
 
