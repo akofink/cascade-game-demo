@@ -1,0 +1,12 @@
+[package]
+name = "cascade-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cascade-sim = { path = "../sim" }
+
+[lints]
+workspace = true

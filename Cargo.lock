@@ -292,6 +292,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-bench"
+version = "0.1.0"
+dependencies = [
+ "cascade-sim",
+]
+
+[[package]]
 name = "cascade-sim"
 version = "0.1.0"
 

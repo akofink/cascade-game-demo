@@ -13,6 +13,8 @@ Read the [documentation site](https://akofink.com/cascade-game-demo/).
 The native app runs a 1024 x 1024 `cascade-sim` world, prepares fixtures incrementally,
 and displays the bounded scheduler and upload backlog. The 4096 x 4096 charter world remains
 available to the headless core; the demo starts smaller for interactive responsiveness.
+The headless core includes complete rules, seeded fixtures, bounded and traditional policies,
+and a benchmark runner.
 
 ## Prior art
 
@@ -30,7 +32,7 @@ Closest references:
   Animation," Computer Graphics Forum 19(3), 2000. [doi:10.1111/1467-8659.00416](https://doi.org/10.1111/1467-8659.00416)
 - S. Chenney, "Simulation Level-Of-Detail," Game Developers Conference, 2001.
 - Unity [Maximum Allowed Timestep](https://docs.unity3d.com/Manual/class-TimeManager.html) and
-  Unreal [Significance Manager](https://dev.epicgames.com/documentation/en-us/unreal-engine/significance-manager-in-unreal-engine).
+  Unreal [Significance Manager](https://dev.epicgames.com/documentation/en-us/unreal-engine/significance-manager).
 
 ## Run
 
@@ -70,6 +72,16 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+Run the headless benchmark under either policy. Fixture preparation is charged and incremental but excluded from measured slice time. Paired runs use the same versioned fixture, seed, dimensions, capacities, and budget.
+
+```sh
+cargo run --release -p cascade-bench -- --fixture mixed-overload --policy bounded --slices 600 --format csv
+cargo run --release -p cascade-bench -- --fixture mixed-overload --policy traditional --slices 600 --format json
+cargo run --release -p cascade-bench -- --fixture mixed-overload --policy bounded --slices 3600 --disturbances 28800 --disturbances-per-slice 8
+```
+
+Fixtures: `quiet-world`, `explosive-lattice`, `sand-release`, `reservoir-breach`, `burning-forest`, `dirty-world-sweep`, `tiny-capacity`, and `mixed-overload`. Options include `--width`, `--height`, and `--budget`. CSV/JSON records include per-slice credits, selection probes, executed quanta, backlog, elapsed nanoseconds, completion, and disturbance admission counters. Traditional runs intentionally exceed the configured credit allowance when their captured ready frontier requires it.
 
 ### Documentation site
 

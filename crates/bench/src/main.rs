@@ -1,0 +1,87 @@
+use cascade_bench::{BenchConfig, OutputFormat, run};
+use cascade_sim::SchedulerPolicy;
+use cascade_sim::fixtures::{FixtureId, ScenarioDescriptor};
+use std::io;
+
+fn main() {
+    if let Err(error) = execute() {
+        eprintln!("cascade-bench: {error}");
+        std::process::exit(2);
+    }
+}
+
+fn execute() -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = BenchConfig::default();
+    let mut format = OutputFormat::Csv;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if option == "--help" || option == "-h" {
+            print_help();
+            return Ok(());
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for {option}"))?;
+        match option {
+            "--fixture" => config.fixture = ScenarioDescriptor::get(parse_fixture(value)?),
+            "--policy" => {
+                config.policy = match value.as_str() {
+                    "bounded" => SchedulerPolicy::Bounded,
+                    "traditional" => SchedulerPolicy::Traditional,
+                    _ => return Err(format!("invalid policy: {value}").into()),
+                }
+            }
+            "--format" => {
+                format = match value.as_str() {
+                    "csv" => OutputFormat::Csv,
+                    "json" => OutputFormat::Json,
+                    _ => return Err(format!("invalid format: {value}").into()),
+                }
+            }
+            "--slices" => config.slices = value.parse()?,
+            "--width" => config.width = value.parse()?,
+            "--height" => config.height = value.parse()?,
+            "--budget" => config.budget = value.parse()?,
+            "--disturbances" => config.disturbances = value.parse()?,
+            "--disturbances-per-slice" => config.disturbances_per_slice = value.parse()?,
+            _ => return Err(format!("unknown option: {option}").into()),
+        }
+        index += 2;
+    }
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let summary = run(config, format, &mut output)?;
+    if format == OutputFormat::Csv {
+        eprintln!(
+            "final_hash={:016x} complete={} preparation_slices={} measured_slices={}",
+            summary.final_hash,
+            summary.complete,
+            summary.preparation_slices,
+            summary.measured_slices
+        );
+    }
+    Ok(())
+}
+
+fn parse_fixture(value: &str) -> Result<FixtureId, String> {
+    match value {
+        "quiet-world" => Ok(FixtureId::QuietWorld),
+        "explosive-lattice" => Ok(FixtureId::ExplosiveLattice),
+        "sand-release" => Ok(FixtureId::SandRelease),
+        "reservoir-breach" => Ok(FixtureId::ReservoirBreach),
+        "burning-forest" => Ok(FixtureId::BurningForest),
+        "dirty-world-sweep" => Ok(FixtureId::DirtyWorldSweep),
+        "tiny-capacity" => Ok(FixtureId::TinyCapacity),
+        "mixed-overload" => Ok(FixtureId::MixedOverload),
+        _ => Err(format!("unknown fixture: {value}")),
+    }
+}
+
+fn print_help() {
+    println!(
+        "cascade-bench [--fixture NAME] [--policy bounded|traditional] [--slices N] [--format csv|json] [--width N] [--height N] [--budget CREDITS] [--disturbances N] [--disturbances-per-slice N]"
+    );
+    println!("Fixture preparation is incremental and excluded from slice CPU time.");
+}
