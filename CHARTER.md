@@ -12,7 +12,7 @@ The engine technology is the product. Implement the simulation and its scheduler
 
 ## 2. Core hypothesis and invariant
 
-**Hypothesis:** a useful and entertaining cellular world can preserve responsive presentation under adversarial player input by bounding work and memory, accepting slower effect resolution as a visible game rule.
+**Hypothesis:** a useful and entertaining cellular world can preserve responsive presentation under adversarial player input by bounding work and memory, accepting slower effect resolution as a visible game rule. Precisely: player actions may grow outstanding demand `Q_s` without limit (up to fixed storage, beyond which it is coalesced, recovered, or rejected), but cannot raise executed work `W_s` above the slice allowance.
 
 **Required invariant in bounded mode:** for every scheduler slice `s`,
 
@@ -20,7 +20,7 @@ The engine technology is the product. Implement the simulation and its scheduler
 sum(charged_cost of every executed quantum in s) <= B_sim
 ```
 
-Every quantum has a fixed upper bound on inspected cells, writes, queue operations, and emitted work. Selection, stale-job handling, admission, and bookkeeping also consume credits. No workload-dependent operation is hidden outside the accounting.
+This holds only together with a second invariant: every indivisible quantum `w` has a worst-case cost `C(w) <= C_max` that its charge conservatively covers. A quantum that hides a search, scan, or graph walk makes the accounting fiction. Every quantum has a fixed upper bound on inspected cells, writes, queue operations, and emitted work. Selection, stale-job handling, admission, and bookkeeping also consume credits. No workload-dependent operation is hidden outside the accounting.
 
 At most one simulation slice runs per presentation iteration. Input processing, world preparation, render uploads, UI generation, and diagnostics have separate finite caps. Maintain a resource table for all engine-owned queues, buffers, pools, and resident world storage. Player actions may increase demand but cannot increase these limits.
 
@@ -31,6 +31,8 @@ The research question is whether the resulting delay, staleness, and scheduling 
 ### Positioning and prior art
 
 The individual mechanisms are established: sleeping bodies, simulation level of detail, significance-driven tick rates, capped physics catch-up, time-critical collision detection with progressive refinement, multi-rate simulation, and hard real-time budgeting. Do not claim any of them as new. The project explores **bounded-work simulation**: making the per-slice work bound a first-class engine invariant, so that every player-triggerable workload is resumable bounded work under one common budget, rather than a per-subsystem optimization.
+
+Prior work maps onto three overload responses: **defer** the same computation (Unity's capped catch-up), **refine** a coarse answer as budget allows (Hubbard; Dingliana and O'Sullivan, who also carry bounded work into collision response), and **substitute** a cheaper model (Chenney's proxy simulation). Unreal's Significance Manager supplies priority information but no global admission control. Those techniques bound one subsystem or advise game code; none of these sources makes a bounded-work contract mandatory for all player-caused simulation. v0.1 implements **defer** with documented coalescing. Refine and substitute are post-v0.1 experiments. Do not claim the composition has never been built; a broader literature search would be required first.
 
 Cite prior art in `README.md`, including Hubbard's time-critical collision detection (ACM TOG 1996), Dingliana and O'Sullivan's graceful degradation of collision handling (CGF 2000), Chenney's simulation level of detail (GDC 2001), Unity's Maximum Allowed Timestep, and Unreal's Significance Manager. Verify each citation against its primary source before publishing.
 
@@ -99,13 +101,14 @@ Dormant cells receive no recurring evaluation. Mutations wake a fixed neighborho
 ## 7. Architecture principles
 
 1. Keep the simulation crate independent of windows, graphics, wall clocks, and UI.
-2. Separate world state, pending demand, scheduler policy, and presentation state.
-3. Represent long work as explicit cursors or finite state machines that yield after one bounded quantum.
-4. Preallocate hot-path storage. No runtime growth, blocking file I/O, recursive propagation, or synchronous logging in the interactive hot path.
-5. Treat overload as part of the model: defer, coalesce with documented semantics, or reject before admission.
-6. Keep a single owner of authoritative simulation state. Rendering may show an older texture but must report that staleness.
-7. Make scheduling decisions inspectable and reproducible. A feature is incomplete until its worst-case work, capacity, overflow behavior, and tests are defined.
-8. Prefer the simplest correct implementation. Optimize from profiles after the bounds are demonstrable.
+2. Make unbounded synchronous simulation structurally hard: no public `sim` API performs workload-dependent work inline. Operations that can scale with world content (detonate, paint region, reset, fixture preparation, flood or connectivity queries) admit a bounded descriptor or return a job/cursor that advances only under the scheduler. The traditional comparison policy changes only how many quanta run per slice, never the quantum contracts.
+3. Separate world state, pending demand, scheduler policy, and presentation state.
+4. Represent long work as explicit cursors or finite state machines that yield after one bounded quantum.
+5. Preallocate hot-path storage. No runtime growth, blocking file I/O, recursive propagation, or synchronous logging in the interactive hot path.
+6. Treat overload as part of the model: defer, coalesce with documented semantics, or reject before admission.
+7. Keep a single owner of authoritative simulation state. Rendering may show an older texture but must report that staleness.
+8. Make scheduling decisions inspectable and reproducible. A feature is incomplete until its worst-case work, capacity, overflow behavior, and tests are defined.
+9. Prefer the simplest correct implementation. Optimize from profiles after the bounds are demonstrable.
 
 ## 8. Bounded scheduler design
 
@@ -349,7 +352,7 @@ Never publish illustrative FPS values as measured evidence. Keep raw captures ou
 - GPU/OS behavior remains outside the structural proof. Maintain a clear boundary between invariants, performance observations, and unsupported claims.
 - A naive traditional baseline can exaggerate the benefit. Use the same rules/resources and report throughput and completion time alongside responsiveness.
 
-Open experiments after v0.1: incremental progress reports carrying an error or completeness estimate so the scheduler can spend work where it most reduces visible error, value-driven selection over pending work, camera-aware priority with fairness, better logical-time semantics, aggregated dormant structures, adaptive credits with recorded schedules, worker threads, GPU compute, and eventually 3D. None are authorization to expand v0.1.
+Open experiments after v0.1: **refine** and **substitute** overload responses, such as aggregated or proxy models for dormant or distant regions with lazy re-materialization (noting Chenney's caveat that per-object proxy upkeep still scales with object count), incremental progress reports carrying an error or completeness estimate so the scheduler can spend work where it most reduces visible error, value-driven selection over pending work, camera-aware priority with fairness, better logical-time semantics, aggregated dormant structures, adaptive credits with recorded schedules, worker threads, GPU compute, and eventually 3D. None are authorization to expand v0.1.
 
 ## 20. First tasks for the coding agent
 
