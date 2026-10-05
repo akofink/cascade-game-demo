@@ -27,8 +27,9 @@ for corrected headless results and limitations.
    cargo run --release -p cascade-app -- --world-size 4096
    ```
 
-2. Hold **DESTROY PERFORMANCE** to prepare the mixed-overload fixture and admit the seeded disturbance stream. Watch the policy label and the side-by-side frame-interval and pending-work graphs.
-3. Click **Same trigger: restart traditional** (or the bounded option if traditional is active). The app restarts the same fixture and disturbance stream under the other policy. Traditional mode intentionally processes the complete captured frontier and may visibly stall.
+2. Click **DESTROY PERFORMANCE** once the mixed fixture is visible (or hold `F`). The click latches the disturbance stream so the pointer stays free; a long hold still admits only while the button is down, and releasing a long hold stops new descriptors. A cyan ring is an acknowledgment, not a resolved effect. Gold cells, if deferred highlighting is on, are world work still waiting.
+3. Left-drag to paint. The ring appears on the next presented frame. Right-drag pans; a right-click without a drag ignites, and Shift-right-click detonates.
+4. Under **Same trigger**, restart FIFO, Focus, or Traditional. Focus stays unavailable until the simulator focus API is linked. Traditional mode intentionally processes the complete captured frontier and may visibly stall.
 
 ![Cascade's traditional scheduler during the full-size overload comparison](docs/cascade-overload.png)
 
@@ -58,19 +59,15 @@ cargo run --release -p cascade-app
 cargo run --release -p cascade-app -- --world-size 4096
 ```
 
-Drag with the left mouse button to pan; scroll to zoom. Arrow keys and WASD also pan.
-Select a material in the overlay, then Shift-drag to paint (Air erases); each presentation
-iteration admits at most 64 brush descriptors. Right-click ignites wood or explosives; Shift-right-click
-detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
-The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to the selected profile allowance, currently 1,000,000) with an explicit apply-and-restart action, switches between bounded and traditional scheduling by restarting the same fixture, and toggles deferred-cell highlighting. The default bounded allowance and app credit cap are read from `profiles/m2-16gb-v3.toml`. Traditional mode snapshots every per-cell pending evaluation/blast channel at update start and processes that uncapped frontier; the ready rings are not its authority, two full-world scans are charged each slice, and work generated during the slice waits for the next one. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
-admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.
-The overlay prominently labels the active scheduler, plots frame intervals beside pending-work
-history, and offers a one-click same-fixture restart under the other policy. It also reports
-scheduler credits, quanta, pending work, command coalescing/rejection, and upload staleness.
+Left-drag paints the selected material (Air erases). Right-drag pans. Scroll zooms toward the cursor, with each wheel event clamped so one tick cannot skip several zoom levels. Hold WASD or the arrow keys to pan smoothly; each presented frame moves a fixed 12 pixels while the key is down. A right-click without a drag ignites wood or explosives; Shift-right-click detonates. Each presentation iteration admits at most 64 brush cells, stamped on press and along the stroke. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset. Hold `F` to admit disturbances without using the pointer.
+The overlay stays short: policy, the player-action line, **DESTROY PERFORMANCE**, and latency percentiles are visible without scrolling. A short click latches DESTROY PERFORMANCE; a press longer than 280 ms admits only while held and does not latch on release. If the live fixture is already completed mixed overload, DESTROY PERFORMANCE does not prepare it again. Details (fixtures, credits, raw counters) are behind a closed section. Credits still run from 25 to the selected profile allowance, currently 1,000,000, with an explicit apply-and-restart action. The default allowance and cap are read from `profiles/m2-16gb-v3.toml`. Same-trigger buttons restart FIFO, focus, or traditional scheduling. Focus is disabled until `cascade-sim` exports player focus; the cyan viewport box is the region the app will submit. Traditional mode snapshots every per-cell pending evaluation/blast channel at update start and processes that uncapped frontier; the ready rings are not its authority, two full-world scans are charged each slice, and work generated during the slice waits for the next one. Admitted disturbances are left in place when DESTROY PERFORMANCE stops.
+The overlay reports camera/UI feedback latency and paint, ignite, and detonate action-to-first-visible-effect latency as nearest-rank p50/p95. It also plots frame intervals beside pending-work history. Burning wood is drawn as a distinct flame color so ignition is visible before the cell becomes air. Player target cells are exempt from the deferred-work tint so a mark stays readable while neighboring work stays gold.
 
 A native smoke check opens a window, incrementally prepares the mixed fixture, uploads the world,
 checks a sampled pixel, pans, zooms, resizes/minimizes, then runs matched 120-frame bounded and
-traditional disturbance bursts and reports per-policy frame/backlog measurements:
+traditional disturbance bursts. During those bursts it also admits a scripted paint/ignite/detonate
+stream and a 1 px camera nudge, and prints `SMOKE_FEEL` p50/p95 latencies. Focus is reported
+`unlinked` until the simulator API lands:
 
 ```sh
 cargo run --release -p cascade-app -- --smoke --world-size 4096 --screenshot docs/cascade-overload.png
