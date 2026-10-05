@@ -1,19 +1,29 @@
-# Milestone 1 rules
+# Simulation rules
 
-## World and materials
+## World and boundaries
 
-The row-major world has a closed boundary. Materials are Air, Stone, Wood, Sand, and Explosive. Stone and Wood are inert in this milestone. Cell IDs are zero-based validated indices. The compact cell record contains a material byte. The read-only cell view reports pending blast energy as its state byte; energy is held in fixed per-cell pending storage until its job is serviced.
+The row-major world has a closed boundary. Out-of-range neighbors do not exist. Cell IDs are zero-based validated indices. Rule order and neighbor order are stable: up, left, right, down. Local updates are asynchronous scheduler quanta, not global ticks. A dormant cell receives no recurring evaluation; movement, ignition, blasts, and accepted edits wake a fixed cardinal neighborhood.
 
-## Sand
+Materials are Air, Stone, Wood, Sand, Explosive, and Water. Stone is fixed until changed by an explicit edit. Burning is a cell-state countdown on wood, not an additional material. Cell reads preserve the existing `state` byte for pending blast energy and add `burning` as an additive state field.
 
-A sand evaluation examines only the cell directly below. If it is inside the world and Air, the two materials swap atomically. At the bottom boundary or above an occupied cell, sand remains in place. A move wakes only the four cardinal neighbors of the source and destination. Thus each successful move conserves sand and performs fixed fan-out work.
+## Granular and water movement
 
-## Explosives
+Sand and water inspect the cell directly below. If it is Air, the material moves there atomically. Sand otherwise remains dormant. Water otherwise tries one horizontal neighbor; initial direction is selected by `(x + y) mod 2`, and it tries the opposite direction if blocked. The closed boundary prevents escape. This intentionally simple local spreading rule may oscillate and is not a pressure-fluid model.
 
-A blast request sets the target to Explosive and merges its energy by `max(existing, min(requested, 15))`, not addition. A serviced blast turns its own cell to Air. If energy is greater than one, each cardinal in-bounds Explosive neighbor receives `max(existing, energy - 1)`. Energy therefore attenuates by one per serviced edge and cannot propagate beyond its finite starting energy. Other materials are not destroyed by the blast in milestone 1. Blast jobs wake cardinal neighbors after processing.
+A successful move clears the source, fills the destination, and wakes cardinal neighbors of both cells. Sand and water counts are conserved by simulation movement. Explicit paint/reset can change counts. Each evaluation inspects a fixed bounded neighborhood, and no rule searches an unbounded column or region.
 
-Rule order, cardinal-neighbor order, queue insertion order, and tie-breaking are fixed. Duplicate local reevaluations coalesce to one pending flag. Blast energy coalesces by maximum. These semantics model bounded local work, not a physically additive shock wave or globally synchronized tick.
+## Fire and explosives
 
-## Commands and overload
+Wood ignition sets a 12-service burn countdown. On each serviced burning-wood evaluation, its cardinal neighbors are inspected: adjacent wood is ignited and adjacent explosives receive a blast request with energy 8. The current wood countdown decreases by one; at zero, wood converts to Air. The cell remains wood while burning. Evaluation is rescheduled only while burn time remains. Ignition is idempotent while already burning.
 
-Paint is a single-cell command. Pending paints for the same cell coalesce to the most recently submitted material; accepted commands are not evicted. A full queue rejects a new distinct paint and increments the rejection counter. Paint changes material when serviced, then requests reevaluation and wakes cardinal neighbors. If the ready ring is full, pending state remains authoritative until the recovery cursor reaches that cell and admits it.
+A blast request changes its target to Explosive and merges energy by `max(existing, min(requested, 15))`, not addition. A serviced blast converts the explosive cell to Air. Each cardinal adjacent explosive receives `max(existing, energy - 1)` when energy exceeds one. Adjacent wood is ignited by the blast regardless of remaining propagation energy. Blast energy is finite, saturating, and attenuates by one edge; this is not an additive physical shock wave. Stone, sand, and water are not destroyed by blast in this rules version.
+
+Fire, blast, and edit activity wake only fixed cardinal neighborhoods. All timers advance on service, not wall time. Under overload, different regions progress at different rates; this is not uniform time dilation.
+
+## Coalescing and reset
+
+Duplicate reevaluation requests coalesce to one per-cell pending bit. Blast requests coalesce by maximum energy. Pending state remains authoritative when a ready ring is full and is admitted by the charged recovery cursor. Paint commands to the same cell coalesce to the latest material; a full command ring rejects a new distinct command.
+
+Reset increments a checked world generation immediately, discards queued command/job frontiers, and blocks new edits while a cursor clears one cell per charged reset quantum. Every old job is generation-tagged and cannot mutate the new generation. Reset progress is observable; cancellation is deliberately not offered for world reset, while fixture preparation has independent cancellation. Reset marks renderer chunks dirty as cells are cleared.
+
+The rules version is `RULE_VERSION = 2`. Determinism is guaranteed only for the same executable/rules, world dimensions, admitted operation order, capacities, policy, and slice budget.
