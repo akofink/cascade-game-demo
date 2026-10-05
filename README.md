@@ -78,10 +78,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Run the headless benchmark under either policy. Fixture preparation is charged and incremental but excluded from measured slice time. Paired runs use the same versioned fixture, seed, dimensions, capacities, and budget.
+Run the headless benchmark under either policy. Fixture preparation is charged and incremental but excluded from measured slice time; its wall time is reported separately. Optional `--warmup-slices` are also timed separately, then the fixture is re-prepared so measurement starts from its descriptor state. Paired runs use the same versioned fixture, seed, dimensions, capacities, and budget. CSV/JSON include completed quanta per slice and cumulative work/wall time.
 
 ```sh
-cargo run --release -p cascade-bench -- --fixture mixed-overload --policy bounded --slices 600 --format csv
+cargo run --release -p cascade-bench -- --fixture mixed-overload --policy bounded --slices 600 --warmup-slices 120 --format csv
 cargo run --release -p cascade-bench -- --fixture mixed-overload --policy traditional --slices 600 --format json
 cargo run --release -p cascade-bench -- --fixture mixed-overload --policy bounded --slices 3600 --disturbances 28800 --disturbances-per-slice 8
 ```

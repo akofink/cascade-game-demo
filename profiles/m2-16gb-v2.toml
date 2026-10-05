@@ -1,0 +1,31 @@
+# Reference machine bounded-work profile calibrated 2026-10-05 on full-size headless workloads.
+version = 2
+name = "m2-16gb-headless"
+reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
+credits_per_slice = 1000000
+simulator_max_supported_credits = 10000000
+app_current_max_credits = 100000
+app_current_default_credits = 20000
+ready_capacity_per_lane = 32768
+command_capacity = 256
+calibration_workloads = [
+  "burning-forest-v1 + 64 seeded disturbance commands/slice",
+  "mixed-overload-v1 + 64 seeded disturbance commands/slice",
+]
+calibration_dimensions = [4096, 4096]
+calibration_slices_per_workload_run = 1800
+calibration_repetitions_per_workload = 3
+warmup_slices = 120
+calibration_disturbances_per_run = 115200
+calibration_disturbances_per_slice = 64
+worst_workload_p50_ns = 1106625
+worst_workload_p95_ns = 1629417
+worst_workload_p99_ns = 2590917
+worst_observed_slice_ns = 4107667
+slices_over_4ms = 1
+budget_target_ns = 4000000
+status = "headless selected candidate; app integration must raise its current 100000-credit cap to use it"
+
+# Results are empirical. Full 60-second and interactive validation remain outstanding.
+# Calibration command streams are separate from validation command streams, but the
+# static fixture descriptors overlap and this limitation is disclosed in the report.

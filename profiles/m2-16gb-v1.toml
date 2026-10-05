@@ -1,5 +1,5 @@
-# Provisional reference-machine headless profile; calibrated 2026-10-05.
-# This is not an interactive frame-latency or full-size fixture certification.
+# Superseded 256 x 256 pilot profile retained for historical traceability.
+# See m2-16gb-v2.toml for the full-size upper-cap-limited reference profile.
 version = 1
 name = "m2-16gb-headless"
 reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
@@ -21,4 +21,4 @@ warmup_slices = 0
 # section-12 fixture suite is held out and is not used to select the credit count.
 # Tiny calibration dimensions and one repetition are a pilot only; profile status
 # remains provisional pending 60 s captures and full-size workload testing.
-status = "provisional"
+status = "superseded; not calibrated for the 4096 x 4096 reference world"

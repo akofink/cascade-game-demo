@@ -1,4 +1,6 @@
-# Headless benchmark summary v1
+# Headless benchmark summary v1 (superseded)
+
+**Historical pilot only.** Superseded by [full-size headless results v2](headless-v2.md). The earlier performance page misstated the compiler as Rust 1.89.0; these release runs were executed under the repository-pinned Rust 1.99.0. The 256 x 256 data below is not the calibrated reference profile.
 
 Release `cascade-bench`; 256 x 256, 4096 credits, 300 measured slices/run, three repetitions per policy/fixture. Mode order alternated B/T, T/B, B/T. Each table row pools 900 per-slice samples. Fixture preparation is excluded and consumed 290 scheduler slices in each run; its wall duration was not captured. Raw CSVs are not committed. Times are milliseconds, computed from nanoseconds; percentile is nearest lower indexed sample after sorting.
 
