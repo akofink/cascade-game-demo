@@ -1,0 +1,1120 @@
+//! Window loop, wgpu renderer, and native smoke check.
+//!
+//! GPU objects for the cell texture and pipeline are created once. The swapchain
+//! is reconfigured only when the physical size changes to a non-zero value.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use cascade_app::{
+    CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord, FrameHistory, MaterialGrid, OverlayInput, PALETTE,
+    PLACEHOLDER_SIZE, PlaceholderSource, SMOKE_SAMPLE_CELL, SurfaceChange, UploadBudget,
+    UploadPlan, UploadScheduler, ViewCommand, apply_command, bytes_per_chunk, frame_uniform,
+    show_overlay, surface_change, zoom_factor,
+};
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+
+const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+struct Gpu {
+    window: Arc<Window>,
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    configured_size: (u32, u32),
+    surface_reconfigures: u32,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
+    grid_texture: wgpu::Texture,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    egui_inited: bool,
+}
+
+struct Smoke {
+    started: Instant,
+    ready_printed: bool,
+    settled_printed: bool,
+    presents: u32,
+    saw_stale: bool,
+    uploaded: u32,
+    pan_ok: bool,
+    zoom_ok: bool,
+    readback_ok: bool,
+    readback_note: String,
+    resize_targets_seen: u8,
+    resize_from: (u32, u32),
+    resize_mid: (u32, u32),
+    zero_frames: u32,
+    zero_start_reconfigs: u32,
+    zero_ok: bool,
+    hold_frames: u32,
+    failed: Option<String>,
+}
+
+struct App {
+    gpu: Option<Gpu>,
+    camera: Camera,
+    source: PlaceholderSource,
+    uploads: UploadScheduler,
+    history: FrameHistory,
+    last_present: Option<Instant>,
+    clock_origin: Instant,
+    upload_cpu_ms: f32,
+    submit_cpu_ms: f32,
+    last_plan: UploadPlan,
+    destroy_presses: u64,
+    occluded: bool,
+    seeded: bool,
+    dragging: bool,
+    last_cursor: Option<(f32, f32)>,
+    outdated_handled: bool,
+    surface_rebuilds: u32,
+    skip_timeout: u32,
+    skip_occluded: u32,
+    skip_outdated: u32,
+    smoke: Option<Smoke>,
+    exit_code: i32,
+}
+
+fn main() {
+    let smoke = match parse_args() {
+        Ok(smoke) => smoke,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let event_loop = match build_event_loop() {
+        Ok(loop_) => loop_,
+        Err(error) => {
+            eprintln!("event loop: {error}");
+            std::process::exit(1);
+        }
+    };
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let mut app = App::new(smoke);
+    if let Err(error) = event_loop.run_app(&mut app) {
+        eprintln!("event loop stopped: {error}");
+        std::process::exit(1);
+    }
+    if app.exit_code != 0 {
+        std::process::exit(app.exit_code);
+    }
+}
+
+fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder.with_activation_policy(ActivationPolicy::Regular);
+    }
+    builder.build()
+}
+
+fn parse_args() -> Result<bool, String> {
+    let mut smoke = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--smoke" => smoke = true,
+            "--help" | "-h" => {
+                println!(
+                    "cascade-app [--smoke]\n\nDrag to pan. Scroll to zoom. --smoke opens a window, exercises pan, zoom, and resize, then exits."
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(smoke)
+}
+
+impl App {
+    fn new(smoke: bool) -> Self {
+        let source = match PlaceholderSource::new() {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("placeholder grid: {error}");
+                std::process::exit(1);
+            }
+        };
+        let (chunks_x, chunks_y) = source.grid().chunk_extent();
+        Self {
+            gpu: None,
+            camera: Camera::default(),
+            source,
+            uploads: UploadScheduler::new(chunks_x, chunks_y),
+            history: FrameHistory::default(),
+            last_present: None,
+            clock_origin: Instant::now(),
+            upload_cpu_ms: 0.0,
+            submit_cpu_ms: 0.0,
+            last_plan: UploadPlan::default(),
+            destroy_presses: 0,
+            occluded: false,
+            seeded: false,
+            dragging: false,
+            last_cursor: None,
+            outdated_handled: false,
+            surface_rebuilds: 0,
+            skip_timeout: 0,
+            skip_occluded: 0,
+            skip_outdated: 0,
+            smoke: smoke.then(|| Smoke {
+                started: Instant::now(),
+                ready_printed: false,
+                settled_printed: false,
+                presents: 0,
+                saw_stale: false,
+                uploaded: 0,
+                pan_ok: false,
+                zoom_ok: false,
+                readback_ok: false,
+                readback_note: String::new(),
+                resize_targets_seen: 0,
+                resize_from: (0, 0),
+                resize_mid: (0, 0),
+                zero_frames: 0,
+                zero_start_reconfigs: 0,
+                zero_ok: false,
+                hold_frames: 0,
+                failed: None,
+            }),
+            exit_code: 0,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.clock_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn viewport(&self) -> Option<(f32, f32)> {
+        self.gpu
+            .as_ref()
+            .map(|gpu| (gpu.config.width as f32, gpu.config.height as f32))
+    }
+
+    fn apply_size(&mut self, requested: (u32, u32)) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        match surface_change(gpu.configured_size, requested) {
+            SurfaceChange::Unchanged | SurfaceChange::SkipEmpty => {}
+            SurfaceChange::Reconfigure { width, height } => {
+                gpu.config.width = width;
+                gpu.config.height = height;
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                gpu.configured_size = (width, height);
+                gpu.surface_reconfigures += 1;
+            }
+        }
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, message: String) {
+        eprintln!("{message}");
+        if let Some(smoke) = self.smoke.as_mut() {
+            smoke.failed = Some(message);
+            print_smoke(
+                smoke,
+                self.gpu
+                    .as_ref()
+                    .map(|gpu| gpu.surface_reconfigures)
+                    .unwrap_or(0),
+            );
+        }
+        self.exit_code = 1;
+        event_loop.exit();
+    }
+
+    fn upload_dirty(&mut self) {
+        self.uploads.set_clock(self.now_ms());
+        if !self.seeded {
+            self.uploads.mark_all();
+            self.seeded = true;
+        }
+        let batch = self.source.tick();
+        for chunk in &batch.chunks[..batch.count] {
+            let _ = self.uploads.mark_dirty(*chunk);
+        }
+        let started = Instant::now();
+        let plan = self
+            .uploads
+            .plan(bytes_per_chunk(1), UploadBudget::default());
+        if let Some(gpu) = self.gpu.as_ref() {
+            for chunk in &plan.chunks[..plan.count] {
+                write_chunk(&gpu.queue, &gpu.grid_texture, self.source.grid(), *chunk);
+            }
+        }
+        self.upload_cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
+        if let Some(smoke) = self.smoke.as_mut() {
+            smoke.uploaded += plan.count as u32;
+            smoke.saw_stale |= plan.stale;
+        }
+        self.last_plan = plan;
+    }
+
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_code != 0 {
+            return;
+        }
+        if self
+            .smoke
+            .as_ref()
+            .is_some_and(|smoke| smoke.started.elapsed() > SMOKE_TIMEOUT)
+        {
+            self.fail(
+                event_loop,
+                format!(
+                    "smoke timed out (timeout={} occluded={} outdated={})",
+                    self.skip_timeout, self.skip_occluded, self.skip_outdated
+                ),
+            );
+            return;
+        }
+        self.upload_dirty();
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        if gpu.configured_size.0 == 0 || gpu.configured_size.1 == 0 {
+            return;
+        }
+        let frame = match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => {
+                self.outdated_handled = false;
+                frame
+            }
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.skip_timeout += 1;
+                self.request_frame();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.skip_occluded += 1;
+                if (self.skip_occluded == 1 || self.skip_occluded.is_multiple_of(30))
+                    && let Some(gpu) = self.gpu.as_ref()
+                {
+                    gpu.window.set_visible(true);
+                    gpu.window.focus_window();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+                self.request_frame();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let size = gpu.window.inner_size();
+                if size.width > 0 && size.height > 0 {
+                    gpu.config.width = size.width;
+                    gpu.config.height = size.height;
+                    gpu.surface.configure(&gpu.device, &gpu.config);
+                    gpu.configured_size = (size.width, size.height);
+                    gpu.surface_reconfigures += 1;
+                }
+                self.skip_outdated += 1;
+                self.request_frame();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface_rebuilds += 1;
+                if self.surface_rebuilds > 3 {
+                    self.fail(event_loop, "surface lost repeatedly".to_string());
+                    return;
+                }
+                let window = gpu.window.clone();
+                match gpu.instance.create_surface(window) {
+                    Ok(surface) => {
+                        gpu.surface = surface;
+                        let size = gpu.configured_size;
+                        gpu.configured_size = (0, 0);
+                        self.apply_size(size);
+                    }
+                    Err(error) => {
+                        self.fail(event_loop, format!("recreate surface: {error}"));
+                        return;
+                    }
+                }
+                self.request_frame();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.fail(event_loop, "surface validation error".to_string());
+                return;
+            }
+        };
+
+        let world = self.source.grid().size();
+        let uniform = frame_uniform(&self.camera, world);
+        let mut intervals = [0_u64; 240];
+        let interval_count = self.history.copy_intervals_ns(&mut intervals);
+        let summary = self.history.summary();
+        let overlay = OverlayInput {
+            world,
+            summary,
+            intervals_ns: &intervals[..interval_count],
+            upload_cpu_ms: self.upload_cpu_ms,
+            submit_cpu_ms: self.submit_cpu_ms,
+            backlog: self.last_plan.backlog,
+            oldest_dirty_ticks: self.last_plan.oldest_dirty_ticks,
+            stale: self.last_plan.stale,
+            uploaded_chunks: self.last_plan.count,
+            payload_bytes: self.last_plan.payload_bytes,
+            surface_reconfigures: gpu.surface_reconfigures,
+            destroy_presses: self.destroy_presses,
+        };
+
+        let egui_ctx = gpu.egui_state.egui_ctx().clone();
+        egui_winit::update_viewport_info(
+            gpu.egui_state
+                .egui_input_mut()
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default(),
+            &egui_ctx,
+            &gpu.window,
+            !gpu.egui_inited,
+        );
+        gpu.egui_inited = true;
+        let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
+        let mut destroy_clicked = false;
+        let mut full_output = egui_ctx.run_ui(raw_input, |_| {
+            show_overlay(&egui_ctx, &overlay, &mut destroy_clicked);
+        });
+        if destroy_clicked {
+            self.destroy_presses += 1;
+        }
+        let gpu = self.gpu.as_mut().expect("gpu still present");
+        gpu.egui_state
+            .handle_platform_output(&gpu.window, full_output.platform_output);
+        let pixels_per_point = gpu.window.scale_factor() as f32 * egui_ctx.zoom_factor();
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [gpu.config.width, gpu.config.height],
+            pixels_per_point,
+        };
+        for (id, deltas) in &full_output.textures_delta.set {
+            for delta in deltas {
+                gpu.egui_renderer
+                    .update_texture(&gpu.device, &gpu.queue, *id, delta);
+            }
+        }
+        gpu.queue.write_buffer(&gpu.uniform_buf, 0, &uniform);
+
+        let submit_started = Instant::now();
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
+        let user_cmds = gpu.egui_renderer.update_buffers(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen,
+        );
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("grid"),
+                color_attachments: &[Some(color_attachment(
+                    &view,
+                    wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.04,
+                        g: 0.045,
+                        b: 0.06,
+                        a: 1.0,
+                    }),
+                ))],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&gpu.pipeline);
+            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(color_attachment(&view, wgpu::LoadOp::Load))],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            gpu.egui_renderer
+                .render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
+        }
+        gpu.queue.submit(
+            user_cmds
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        self.submit_cpu_ms = submit_started.elapsed().as_secs_f32() * 1000.0;
+        gpu.window.pre_present_notify();
+        gpu.queue.present(frame);
+        for id in &full_output.textures_delta.free {
+            gpu.egui_renderer.free_texture(id);
+        }
+        // egui debug-asserts that a dropped delta was applied. Clearing records that.
+        full_output.textures_delta.clear();
+
+        let now = Instant::now();
+        if let Some(previous) = self.last_present {
+            self.history.record_interval(elapsed_ns(previous, now));
+        }
+        self.last_present = Some(now);
+        self.after_present(event_loop);
+        self.request_frame();
+    }
+
+    fn after_present(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(mut smoke) = self.smoke.take() else {
+            return;
+        };
+        smoke.presents += 1;
+        if smoke.presents >= 1 && !smoke.readback_ok && smoke.readback_note.is_empty() {
+            match self.sample_grid() {
+                Ok(note) => {
+                    smoke.readback_ok = true;
+                    smoke.readback_note = note;
+                }
+                Err(error) => {
+                    smoke.readback_note = error.clone();
+                    smoke.failed = Some(error);
+                }
+            }
+        }
+        if !smoke.ready_printed {
+            smoke.ready_printed = true;
+            println!("SMOKE_READY");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        let configured = self.gpu.as_ref().map(|gpu| gpu.configured_size);
+        let reconfigs = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.surface_reconfigures)
+            .unwrap_or(0);
+        if !smoke.pan_ok {
+            let before = self.camera.cells_per_pixel;
+            let origin = self.camera.origin_x;
+            let viewport = self.viewport().unwrap_or((1.0, 1.0));
+            let world = self.source.grid().size();
+            apply_command(
+                &mut self.camera,
+                ViewCommand::PanPixels {
+                    dx: 80.0,
+                    dy: -30.0,
+                },
+                viewport,
+                world,
+            );
+            apply_command(
+                &mut self.camera,
+                ViewCommand::ZoomAt {
+                    cursor_x: viewport.0 * 0.5,
+                    cursor_y: viewport.1 * 0.5,
+                    factor: zoom_factor(1.0),
+                },
+                viewport,
+                world,
+            );
+            smoke.pan_ok = (self.camera.origin_x - origin).abs() > f32::EPSILON;
+            smoke.zoom_ok = self.camera.cells_per_pixel < before;
+            smoke.resize_from = configured.unwrap_or((0, 0));
+            if let Some(gpu) = self.gpu.as_ref() {
+                let _ = gpu.window.request_inner_size(PhysicalSize::new(960, 640));
+            }
+        } else if smoke.resize_targets_seen == 0
+            && configured.is_some_and(|size| size != smoke.resize_from && size.0 > 0 && size.1 > 0)
+        {
+            smoke.resize_targets_seen = 1;
+            smoke.resize_mid = configured.unwrap_or((0, 0));
+            if let Some(gpu) = self.gpu.as_ref() {
+                let _ = gpu.window.request_inner_size(PhysicalSize::new(800, 600));
+            }
+        } else if smoke.resize_targets_seen == 1
+            && configured.is_some_and(|size| size != smoke.resize_mid && size.0 > 0 && size.1 > 0)
+        {
+            smoke.resize_targets_seen = 2;
+            smoke.zero_start_reconfigs = reconfigs;
+        }
+        if smoke.resize_targets_seen == 2 && !smoke.zero_ok {
+            self.apply_size((0, 0));
+            let after = self
+                .gpu
+                .as_ref()
+                .map(|gpu| gpu.surface_reconfigures)
+                .unwrap_or(0);
+            smoke.zero_frames += 1;
+            if after != reconfigs {
+                smoke.failed = Some("zero-size resize reconfigured the surface".to_string());
+            }
+            if smoke.zero_frames >= 10 && smoke.failed.is_none() {
+                smoke.zero_ok = after == smoke.zero_start_reconfigs;
+            }
+        }
+        let ready = smoke.pan_ok
+            && smoke.zoom_ok
+            && smoke.readback_ok
+            && smoke.saw_stale
+            && smoke.uploaded > 0
+            && smoke.resize_targets_seen == 2
+            && smoke.zero_ok
+            && smoke.presents >= 20;
+        if ready && !smoke.settled_printed {
+            smoke.settled_printed = true;
+            println!("SMOKE_SETTLED");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if smoke.settled_printed {
+            smoke.hold_frames += 1;
+        }
+        let failed = smoke.failed.clone();
+        let finish = smoke.settled_printed && smoke.hold_frames >= 45 && failed.is_none();
+        if finish {
+            print_smoke(&smoke, reconfigs);
+            println!("SMOKE_RESULT ok");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        self.smoke = Some(smoke);
+        if let Some(message) = failed {
+            self.fail(event_loop, message);
+            return;
+        }
+        if finish {
+            self.exit_code = 0;
+            event_loop.exit();
+        }
+    }
+
+    fn sample_grid(&mut self) -> Result<String, String> {
+        let gpu = self.gpu.as_ref().ok_or("gpu missing for sample")?;
+        let sample_camera = Camera {
+            origin_x: SMOKE_SAMPLE_CELL.0 as f32,
+            origin_y: SMOKE_SAMPLE_CELL.1 as f32,
+            cells_per_pixel: 1.0,
+        };
+        let uniform = frame_uniform(&sample_camera, self.source.grid().size());
+        gpu.queue.write_buffer(&gpu.uniform_buf, 0, &uniform);
+        let format = gpu.config.format;
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("smoke-sample"),
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let sample_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bytes_per_row = 256_u32;
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("smoke-readback"),
+            size: u64::from(bytes_per_row) * 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("smoke-sample"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("smoke-sample"),
+                color_attachments: &[Some(color_attachment(
+                    &sample_view,
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                ))],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&gpu.pipeline);
+            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(8),
+                },
+            },
+            wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| format!("sample poll: {error}"))?;
+        receiver
+            .recv()
+            .map_err(|error| format!("sample map channel: {error}"))?
+            .map_err(|error| format!("sample map: {error}"))?;
+        let data = slice
+            .get_mapped_range()
+            .map_err(|error| format!("sample view: {error}"))?;
+        let offset = 2 * bytes_per_row as usize + 8;
+        let pixel = [
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ];
+        drop(data);
+        readback.unmap();
+        let expected = stored_pixel(format, PALETTE[3]);
+        let close = pixel
+            .iter()
+            .zip(expected)
+            .all(|(got, want)| got.abs_diff(want) <= 1);
+        if !close {
+            return Err(format!(
+                "sample pixel {pixel:?} != sand {expected:?} ({format:?}) at {SMOKE_SAMPLE_CELL:?}"
+            ));
+        }
+        Ok(format!("sample {pixel:?} {format:?}"))
+    }
+
+    fn request_frame(&self) {
+        let animate = self.smoke.is_some() || !self.occluded;
+        if animate && let Some(gpu) = &self.gpu {
+            gpu.window.request_redraw();
+        }
+    }
+
+    fn on_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        let consumed = self
+            .gpu
+            .as_mut()
+            .is_some_and(|gpu| gpu.egui_state.on_window_event(&gpu.window, &event).consumed);
+        if !consumed {
+            self.apply_view_event(&event);
+        }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => self.apply_size((size.width, size.height)),
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    self.request_frame();
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
+            _ => {}
+        }
+    }
+
+    fn apply_view_event(&mut self, event: &WindowEvent) {
+        let Some(viewport) = self.viewport() else {
+            return;
+        };
+        let world = self.source.grid().size();
+        match event {
+            WindowEvent::MouseInput { state, button, .. } => {
+                if *button == MouseButton::Left {
+                    self.dragging = *state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let cursor = (position.x as f32, position.y as f32);
+                if self.dragging
+                    && let Some(previous) = self.last_cursor
+                {
+                    apply_command(
+                        &mut self.camera,
+                        ViewCommand::PanPixels {
+                            dx: cursor.0 - previous.0,
+                            dy: cursor.1 - previous.1,
+                        },
+                        viewport,
+                        world,
+                    );
+                }
+                self.last_cursor = Some(cursor);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    MouseScrollDelta::PixelDelta(offset) => offset.y as f32 / 40.0,
+                };
+                let cursor = self
+                    .last_cursor
+                    .unwrap_or((viewport.0 * 0.5, viewport.1 * 0.5));
+                apply_command(
+                    &mut self.camera,
+                    ViewCommand::ZoomAt {
+                        cursor_x: cursor.0,
+                        cursor_y: cursor.1,
+                        factor: zoom_factor(lines),
+                    },
+                    viewport,
+                    world,
+                );
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                let pan = match &event.logical_key {
+                    Key::Named(NamedKey::ArrowLeft) => Some((-32.0, 0.0)),
+                    Key::Named(NamedKey::ArrowRight) => Some((32.0, 0.0)),
+                    Key::Named(NamedKey::ArrowUp) => Some((0.0, -32.0)),
+                    Key::Named(NamedKey::ArrowDown) => Some((0.0, 32.0)),
+                    Key::Character(text) if text.eq_ignore_ascii_case("a") => Some((-32.0, 0.0)),
+                    Key::Character(text) if text.eq_ignore_ascii_case("d") => Some((32.0, 0.0)),
+                    Key::Character(text) if text.eq_ignore_ascii_case("w") => Some((0.0, -32.0)),
+                    Key::Character(text) if text.eq_ignore_ascii_case("s") => Some((0.0, 32.0)),
+                    _ => None,
+                };
+                if let Some((dx, dy)) = pan {
+                    apply_command(
+                        &mut self.camera,
+                        ViewCommand::PanPixels { dx, dy },
+                        viewport,
+                        world,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gpu.is_some() {
+            return;
+        }
+        match create_gpu(event_loop) {
+            Ok(gpu) => {
+                let viewport = (gpu.config.width as f32, gpu.config.height as f32);
+                self.camera.fit(self.source.grid().size(), viewport);
+                gpu.window.request_redraw();
+                self.gpu = Some(gpu);
+            }
+            Err(error) => self.fail(event_loop, error),
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.on_window_event(event_loop, event);
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.request_frame();
+    }
+}
+
+fn create_gpu(event_loop: &ActiveEventLoop) -> Result<Gpu, String> {
+    let attributes = Window::default_attributes()
+        .with_title("Cascade")
+        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+    let window = Arc::new(
+        event_loop
+            .create_window(attributes)
+            .map_err(|error| format!("create window: {error}"))?,
+    );
+    let display_handle = event_loop.owned_display_handle();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
+        Box::new(display_handle),
+    ));
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|error| format!("create surface: {error}"))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .map_err(|error| format!("request adapter: {error}"))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cascade"),
+        required_features: wgpu::Features::empty(),
+        required_limits: adapter.limits(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        trace: wgpu::Trace::Off,
+    }))
+    .map_err(|error| format!("request device: {error}"))?;
+
+    let mut size = window.inner_size();
+    size.width = size.width.max(1);
+    size.height = size.height.max(1);
+    let capabilities = surface.get_capabilities(&adapter);
+    let mut config = surface
+        .get_default_config(&adapter, size.width, size.height)
+        .ok_or("surface has no default configuration")?;
+    config.format = preferred_format(&capabilities.formats).unwrap_or(config.format);
+    if capabilities
+        .present_modes
+        .contains(&wgpu::PresentMode::Fifo)
+    {
+        config.present_mode = wgpu::PresentMode::Fifo;
+    }
+    config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    surface.configure(&device, &config);
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("grid"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("grid.wgsl").into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("grid"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("grid"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("grid"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let world = (PLACEHOLDER_SIZE, PLACEHOLDER_SIZE);
+    let grid_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("materials"),
+        size: wgpu::Extent3d {
+            width: world.0,
+            height: world.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let grid_view = grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("frame"),
+        size: cascade_app::UNIFORM_BYTES as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("grid"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&grid_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: uniform_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let egui_ctx = egui::Context::default();
+    let max_texture_side =
+        usize::try_from(device.limits().max_texture_dimension_2d).unwrap_or(2048);
+    let egui_state = egui_winit::State::new(
+        egui_ctx,
+        egui::ViewportId::ROOT,
+        window.as_ref(),
+        Some(window.scale_factor() as f32),
+        window.theme(),
+        Some(max_texture_side),
+    );
+    let egui_renderer = egui_wgpu::Renderer::new(
+        &device,
+        config.format,
+        egui_wgpu::RendererOptions::default(),
+    );
+    window.set_visible(true);
+    window.focus_window();
+
+    Ok(Gpu {
+        window,
+        instance,
+        surface,
+        device,
+        queue,
+        configured_size: (config.width, config.height),
+        surface_reconfigures: 1,
+        config,
+        pipeline,
+        bind_group,
+        uniform_buf,
+        grid_texture,
+        egui_state,
+        egui_renderer,
+        egui_inited: false,
+    })
+}
+
+fn write_chunk(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    grid: &MaterialGrid,
+    chunk: ChunkCoord,
+) {
+    let mut bytes = [0_u8; CHUNK_CELLS];
+    if !grid.copy_chunk(chunk, &mut bytes) {
+        return;
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: chunk.x * CHUNK_SIZE,
+                y: chunk.y * CHUNK_SIZE,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(CHUNK_SIZE),
+            rows_per_image: Some(CHUNK_SIZE),
+        },
+        wgpu::Extent3d {
+            width: CHUNK_SIZE,
+            height: CHUNK_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+fn color_attachment<'a>(
+    view: &'a wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPassColorAttachment<'a> {
+    wgpu::RenderPassColorAttachment {
+        view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: wgpu::Operations {
+            load,
+            store: wgpu::StoreOp::Store,
+        },
+    }
+}
+
+fn stored_pixel(format: wgpu::TextureFormat, rgba: [u8; 4]) -> [u8; 4] {
+    match format {
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            [rgba[2], rgba[1], rgba[0], rgba[3]]
+        }
+        _ => rgba,
+    }
+}
+
+fn preferred_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ]
+    .into_iter()
+    .find(|format| formats.contains(format))
+}
+
+fn elapsed_ns(previous: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(previous).as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
+    println!(
+        "smoke presents={} pan={} zoom={} readback={} ({}) stale={} uploaded={} resizes_seen={} resize_from={:?} resize_mid={:?} zero_ok={} reconfigures={} hold={}",
+        smoke.presents,
+        smoke.pan_ok,
+        smoke.zoom_ok,
+        smoke.readback_ok,
+        smoke.readback_note,
+        smoke.saw_stale,
+        smoke.uploaded,
+        smoke.resize_targets_seen,
+        smoke.resize_from,
+        smoke.resize_mid,
+        smoke.zero_ok,
+        surface_reconfigures,
+        smoke.hold_frames,
+    );
+}

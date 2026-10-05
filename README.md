@@ -8,7 +8,8 @@ See [CHARTER.md](CHARTER.md) for goals, invariants, and milestones.
 
 ## Status
 
-Milestone 1 (headless foundation) in progress.
+The headless simulation core is on main. The native shell renders a placeholder
+material grid and is not driven by the simulation yet.
 
 ## Prior art
 
@@ -27,6 +28,28 @@ Closest references:
 - S. Chenney, "Simulation Level-Of-Detail," Game Developers Conference, 2001.
 - Unity [Maximum Allowed Timestep](https://docs.unity3d.com/Manual/class-TimeManager.html) and
   Unreal [Significance Manager](https://dev.epicgames.com/documentation/en-us/unreal-engine/significance-manager-in-unreal-engine).
+
+## Run
+
+```sh
+cargo run -p cascade-app
+```
+
+Drag with the left mouse button to pan. Scroll to zoom. Arrow keys and WASD also pan.
+The overlay graphs actual frame intervals and shows upload backlog. **DESTROY PERFORMANCE**
+is visible and not wired yet.
+
+A native smoke check opens a window, pans, zooms, resizes, and exits:
+
+```sh
+cargo run -p cascade-app -- --smoke
+```
+
+Headless tests do not open a window or need a GPU:
+
+```sh
+cargo test -p cascade-app
+```
 
 ## Development
 
