@@ -1599,6 +1599,7 @@ mod tests {
         let first = w.step();
         assert_eq!(first.commands, 3);
         assert_eq!(first.recoveries, 2 * 16 * 16);
+        assert!(first.charged >= 16 * 16 * 10);
         assert_eq!(
             first.evaluations, 0,
             "paint wakes join the next traditional frontier"
@@ -1650,6 +1651,7 @@ mod tests {
         let metrics = w.step();
         assert_eq!(metrics.evaluations, 10);
         assert_eq!(metrics.recoveries, 2 * 32 * 32);
+        assert!(metrics.charged >= 32 * 32 * 10);
         assert_eq!(metrics.pending_cells, 0);
         assert!(metrics.charged > metrics.allowed);
     }
