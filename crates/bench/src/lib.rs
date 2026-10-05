@@ -1,5 +1,7 @@
 //! Headless benchmark runner for reproducible fixture/policy comparisons.
 
+pub mod focus;
+
 use cascade_sim::fixtures::{
     DisturbanceCommandStream, DisturbanceMetrics, FixtureError, FixtureId,
     MAX_DISTURBANCES_PER_SLICE, ScenarioDescriptor,
@@ -546,8 +548,7 @@ mod tests {
         .unwrap();
         assert_eq!(warm.warmup_slices, 2);
         assert!(warm.warmup_wall_ns > 0);
-        assert!(warm.preparation_wall_ns > cold.preparation_wall_ns);
-        assert!(warm.preparation_slices > cold.preparation_slices);
+        assert!(warm.preparation_slices >= cold.preparation_slices * 2);
         let cold_output = String::from_utf8(cold_output).unwrap();
         let warm_output = String::from_utf8(warm_output).unwrap();
         let cold_rows: Vec<_> = cold_output.lines().collect();

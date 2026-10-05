@@ -22,6 +22,12 @@ Release build: `cargo build --release -p cascade-bench`. The runner reports prep
 
 Reference machine: MacBook Air (Mac14,2), Apple M2 with 8 CPU cores, 16 GB RAM and integrated M2 GPU; macOS 27.0.1; built-in 2560 x 1664 display. Rust 1.99.0 (`b940084d7`, aarch64-apple-darwin), Cargo 1.99.0 (`5f94df478`). `Cargo.lock` SHA-256: `c4084ec2080b2c4da29d605573b159b02504f86af481d13c5807e565d419afe7`. Power mode, thermal state, background load, and display refresh/presentation mode were not controlled.
 
+## Player-action focus latency
+
+The repeatable three-policy runner is `cargo +1.99.0 run --release -p cascade-bench -- --player-action-comparison --width 4096 --height 4096 --budget 1000000 --slices 4096`. It re-prepares `mixed-overload-v1` independently for traditional, bounded FIFO, and bounded focus; admits one seeded background disturbance every four slices and scripted paint/ignite/detonate player actions every eight slices. It reports action-to-first-rule-effect and local-settle distributions in slices and wall time, background evaluation/blast throughput, oldest pending age, and final backlog. The action local-settle sample is censored when the neighborhood has not settled by the run end.
+
+The full-size three-policy runner and three accepted quiet-host repetitions are documented in [player-focus results v1](../benchmarks/results/player-focus-v1.md). Its scripted stream pairs safe upper-half paint commands with an immediate follow-up ignite on the newly painted wood or explosive, and selects detonation targets from fixture explosives. Each full run has 4,096 slices per policy and at least 30 first-effect and local-settle samples per action type. `SliceMetrics.action_effect_candidates` exposes action-record probes, and a per-chunk fixed bitset keeps unrelated traditional work from scanning pending action history. Across the three accepted runs, bounded-focus action-to-first-effect p95 was 2.754 ms aggregate, with paint/ignite/detonate p95 of 2.777/2.709/2.755 ms; all three types had 170 or 171 effect and settle samples. Traditional headless action-to-first-effect p95 was 133.372 ms. These are simulator action latencies, not native frame intervals. The post-fix native smoke did not produce a valid `SMOKE_RESULT`, so no native frame p99 is claimed. The short 512-slice capture remains exploratory, not the charter's three 60-second acceptance repetitions; camera/UI acknowledgment and native presentation latency remain outside this headless measurement.
+
 ## Historical native smoke, before the frontier correction
 
 The following M2 development-profile smoke was run by the app integration on main before the corrected traditional frontier. It is preserved as historical native-renderer evidence only and does not measure the traditional behavior described above.
@@ -62,7 +68,7 @@ A follow-up screenshot smoke ran the same command with `--screenshot docs/cascad
 
 ## World-size resource bounds
 
-At 4096 x 4096 with default ready capacities, one `World` accounts for 101,468,160 bytes (96.77 MiB) of simulation-owned arrays, including its one-byte-per-cell traditional snapshot. The app holds a normal-capacity world and a tiny-capacity alternate world; together their simulation arrays account for 202,147,904 bytes (192.78 MiB). The CPU material grid adds 16 MiB; the material texture is a separate 16 MiB GPU resource. Allocator metadata and process RSS are excluded. Startup allocation and full-size fixture-preparation latency are separate from steady-state measurements.
+At 4096 x 4096 with default ready capacities, one `World` accounts for 102,800,896 bytes (98.04 MiB) of simulation-owned arrays, including focus rings, the action-record ring, its per-chunk action-effect index, and its one-byte-per-cell traditional snapshot. The app holds a normal-capacity world and a tiny-capacity alternate world; each has a separately bounded allocation. The CPU material grid adds 16 MiB; the material texture is a separate 16 MiB GPU resource. Allocator metadata and process RSS are excluded. Startup allocation and full-size fixture-preparation latency are separate from steady-state measurements.
 
 ## Game-feel measurement
 
@@ -114,7 +120,7 @@ The frame-interval summary is per presented policy window. Bounded focus is the 
 - The defined traditional full-scan policy is clearly over 4 ms at full size, but its idle two-scan cost dominates many slices. The measured p99 comparison is policy-specific and is not evidence about optimized conventional engines.
 - The 1,200-command full-size burst did not resolve or reach an empty/stable state for either policy within 1,800 slices; completion time is right-censored.
 - Native evidence includes one 120-frame-per-policy full-size release smoke against the corrected traditional policy, not three sustained 60-second captures. Longer frame-interval distributions, camera/UI responsiveness under stalls, uploads, and GPU timings remain outstanding.
-- The app maximum/default now read the selected 1,000,000-credit allowance from profile v3.
+- The app maximum/default read the selected 1,000,000-credit allowance from profile v3. Its focus service-share values are initial scheduler parameters and have not been calibrated.
 - Static descriptors overlap between calibration and validation; only their disturbance command streams are distinct.
 - Full-size startup, fixture preparation, and rendering completed in this smoke; sustained full-size interaction remains unmeasured.
 

@@ -1,4 +1,5 @@
 # Reference machine headless candidate, calibrated 2026-10-05 after correcting traditional frontier semantics.
+# Focus-share values are initial scheduler parameters, not yet calibrated by the milestone-6 action benchmark.
 version = 3
 name = "m2-16gb-headless"
 reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
@@ -7,6 +8,10 @@ simulator_max_supported_credits = 10000000
 app_current_max_credits = 1000000
 app_current_default_credits = 1000000
 ready_capacity_per_lane = 32768
+focus_share_percent = 50
+background_min_service_percent = 20
+focus_region_capacity = 8
+action_record_capacity = 256
 command_capacity = 256
 calibration_workloads = [
   "burning-forest-v1 + 64 seeded disturbance commands/slice",
