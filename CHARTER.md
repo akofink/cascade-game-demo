@@ -1,4 +1,4 @@
-# Cascade: Bounded-Computation Simulation Charter
+# Cascade: Bounded-Work Simulation Charter
 
 Status: implementation charter for v0.1  
 Audience: a coding agent starting from an empty repository  
@@ -28,6 +28,12 @@ Credits bound algorithmic work, not elapsed milliseconds. A general-purpose OS, 
 
 The research question is whether the resulting delay, staleness, and scheduling artifacts are acceptable and legible to the player.
 
+### Positioning and prior art
+
+The individual mechanisms are established: sleeping bodies, simulation level of detail, significance-driven tick rates, capped physics catch-up, time-critical collision detection with progressive refinement, multi-rate simulation, and hard real-time budgeting. Do not claim any of them as new. The project explores **bounded-work simulation**: making the per-slice work bound a first-class engine invariant, so that every player-triggerable workload is resumable bounded work under one common budget, rather than a per-subsystem optimization.
+
+Cite prior art in `README.md`, including Hubbard's time-critical collision detection (ACM TOG 1996), Dingliana and O'Sullivan's graceful degradation of collision handling (CGF 2000), Chenney's simulation level of detail (GDC 2001), Unity's Maximum Allowed Timestep, and Unreal's Significance Manager. Verify each citation against its primary source before publishing.
+
 ## 3. Demo concept
 
 The player is an engineer and saboteur in a cellular test facility. They paint materials, build reservoirs and explosive chains, ignite wood, remove supports beneath loose sand, and trigger disasters. The challenge is to create more work than the simulator can immediately resolve.
@@ -40,7 +46,7 @@ Required controls:
 - Ignite or detonate a selected cell.
 - Pause, single-step one scheduler slice, reset, and load a named fixture.
 - Adjust simulation credits within validated limits.
-- Switch between bounded and traditional comparison runs by restarting a fixture.
+- Switch between bounded and traditional comparison runs by restarting a fixture. This comparison is the demo's headline: the same trigger under both policies, with frame-interval and pending-work graphs side by side or recorded per run.
 - Activate a prominently labeled **DESTROY PERFORMANCE** button.
 - Toggle metrics and a deferred-work overlay.
 
@@ -247,8 +253,8 @@ Require deterministic repetition within each mode, not necessarily identical fin
 1. **Headless foundation:** Cargo workspace, pinned toolchain, world layout, resource caps, integer rules, job contract, credit accounting, fixed queues, and replay tests. Exit: adversarial generated sequences cannot exceed credits or capacities.
 2. **Visible vertical slice:** window, texture renderer, input, overlay, sand and explosives, bounded uploads. Exit: a small interactive chain reaction with visible work/backlog metrics.
 3. **Complete v0.1 rules:** water, fire, dormancy/waking, bounded brush/reset/fixture preparation, and recovery cursor. Exit: local-rule tests and full-size world run without dynamic queue growth.
-4. **Adversarial demo:** all required stress fixtures, DESTROY PERFORMANCE, command saturation feedback, and recovery tests. Exit: sustained overload preserves every structural invariant and responsive controls on the reference profile.
-5. **Comparison and evidence:** traditional mode, replayable paired runs, latency distributions, resource audit, and benchmark report. Exit: acceptance criteria below are met or honestly reported as unmet.
+4. **Adversarial demo:** all required stress fixtures, DESTROY PERFORMANCE, the in-app traditional versus bounded switch, command saturation feedback, and recovery tests. Exit: sustained overload preserves every structural invariant and responsive controls on the reference profile, and the same fixture visibly stalls in traditional mode.
+5. **Comparison and evidence:** replayable paired runs, latency distributions, resource audit, and benchmark report. Exit: acceptance criteria below are met or honestly reported as unmet.
 
 Do not start a later research feature to avoid fixing a failed milestone.
 
@@ -343,7 +349,7 @@ Never publish illustrative FPS values as measured evidence. Keep raw captures ou
 - GPU/OS behavior remains outside the structural proof. Maintain a clear boundary between invariants, performance observations, and unsupported claims.
 - A naive traditional baseline can exaggerate the benefit. Use the same rules/resources and report throughput and completion time alongside responsiveness.
 
-Open experiments after v0.1: camera-aware priority with fairness, better logical-time semantics, aggregated dormant structures, adaptive credits with recorded schedules, worker threads, GPU compute, and eventually 3D. None are authorization to expand v0.1.
+Open experiments after v0.1: incremental progress reports carrying an error or completeness estimate so the scheduler can spend work where it most reduces visible error, value-driven selection over pending work, camera-aware priority with fairness, better logical-time semantics, aggregated dormant structures, adaptive credits with recorded schedules, worker threads, GPU compute, and eventually 3D. None are authorization to expand v0.1.
 
 ## 20. First tasks for the coding agent
 

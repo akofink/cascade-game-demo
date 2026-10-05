@@ -10,6 +10,21 @@ See [CHARTER.md](CHARTER.md) for goals, invariants, and milestones.
 
 Milestone 1 (headless foundation) in progress.
 
+## Prior art
+
+The mechanisms here are not new: sleeping objects, simulation level of detail, significance-driven
+tick rates, capped physics catch-up, and progressive-refinement collision detection all predate this
+project. Cascade explores making a per-update work bound the engine's central invariant, so every
+player-triggerable workload is resumable bounded work under one budget. Closest references:
+
+- P. M. Hubbard, "Approximating Polyhedra with Spheres for Time-Critical Collision Detection,"
+  ACM Transactions on Graphics 15(3), 1996.
+- J. Dingliana and C. O'Sullivan, "Graceful Degradation of Collision Handling in Physically Based
+  Animation," Computer Graphics Forum 19(3), 2000. [doi:10.1111/1467-8659.00416](https://doi.org/10.1111/1467-8659.00416)
+- S. Chenney, "Simulation Level-Of-Detail," Game Developers Conference, 2001.
+- Unity [Maximum Allowed Timestep](https://docs.unity3d.com/Manual/class-TimeManager.html) and
+  Unreal [Significance Manager](https://dev.epicgames.com/documentation/en-us/unreal-engine/significance-manager-in-unreal-engine).
+
 ## Development
 
 Requires Rust via `rustup`; the toolchain is pinned in `rust-toolchain.toml`.
