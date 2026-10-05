@@ -3,7 +3,7 @@
 use cascade_sim::fixtures::FixtureId;
 
 use crate::{
-    DemoMetrics, MaterialChoice, PolicyChoice,
+    DemoMetrics, MaterialChoice,
     metrics::{FrameSummary, TARGET_FRAME_NS},
 };
 
@@ -11,6 +11,7 @@ pub struct OverlayInput<'a> {
     pub world: (u32, u32),
     pub summary: FrameSummary,
     pub intervals_ns: &'a [u64],
+    pub pending_samples: &'a [usize],
     pub sim_cpu_ms: f32,
     pub upload_cpu_ms: f32,
     pub submit_cpu_ms: f32,
@@ -39,7 +40,7 @@ pub struct OverlayActions {
     pub material: Option<MaterialChoice>,
     pub credit_draft: Option<u32>,
     pub apply_credits: bool,
-    pub policy: Option<PolicyChoice>,
+    pub toggle_policy: bool,
     pub deferred_overlay: Option<bool>,
     pub destroy_pressed: bool,
     pub destroy_held: bool,
@@ -48,13 +49,22 @@ pub struct OverlayActions {
 pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut OverlayActions) {
     egui::Window::new("Cascade")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
-        .default_width(360.0)
+        .default_width(560.0)
         .show(ctx, |ui| {
             let preparing = input.sim.reset_in_progress
                 || input
                     .sim
                     .fixture_progress
                     .is_some_and(|progress| !progress.complete && !progress.cancelled);
+            ui.heading(
+                egui::RichText::new(format!("POLICY: {}", input.sim.policy.to_uppercase()))
+                    .strong()
+                    .color(if input.sim.policy == "bounded" {
+                        egui::Color32::from_rgb(92, 210, 143)
+                    } else {
+                        egui::Color32::from_rgb(250, 142, 64)
+                    }),
+            );
             ui.label("Bounded-work cellular simulation");
             ui.label(format!("world: {} x {}", input.world.0, input.world.1));
             ui.label("drag to pan; scroll to zoom; right-click ignite; shift-right-click detonate");
@@ -116,22 +126,20 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                     actions.cancel_fixture = true;
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Restart fixture under policy:");
-                if ui
-                    .add_enabled(!preparing, egui::Button::new("Bounded"))
-                    .clicked()
-                {
-                    actions.policy = Some(PolicyChoice::Bounded);
-                }
-                if ui
-                    .add_enabled(!preparing, egui::Button::new("Traditional"))
-                    .clicked()
-                {
-                    actions.policy = Some(PolicyChoice::Traditional);
-                }
-                ui.label(format!("current: {}", input.sim.policy));
-            });
+            let other_policy = if input.sim.policy == "bounded" {
+                "traditional"
+            } else {
+                "bounded"
+            };
+            if ui
+                .add_enabled(
+                    !preparing,
+                    egui::Button::new(format!("Same trigger: restart {other_policy}")),
+                )
+                .clicked()
+            {
+                actions.toggle_policy = true;
+            }
             let mut credits = input.credit_draft;
             if ui
                 .add_enabled(
@@ -160,7 +168,17 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                 actions.deferred_overlay = Some(show_deferred);
             }
             ui.separator();
-            draw_intervals(ui, input.intervals_ns);
+            let graph_width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label("Frame interval (ms)");
+                    draw_intervals(ui, input.intervals_ns, graph_width);
+                });
+                ui.vertical(|ui| {
+                    ui.label("Pending work (cells)");
+                    draw_pending(ui, input.pending_samples, graph_width);
+                });
+            });
             if input.summary.samples == 0 {
                 ui.label("frame intervals: waiting");
             } else {
@@ -287,8 +305,8 @@ impl ScenarioDescriptorName {
     }
 }
 
-fn draw_intervals(ui: &mut egui::Ui, intervals_ns: &[u64]) {
-    let (response, painter) = ui.allocate_painter(egui::vec2(320.0, 72.0), egui::Sense::hover());
+fn draw_intervals(ui: &mut egui::Ui, intervals_ns: &[u64], width: f32) {
+    let (response, painter) = ui.allocate_painter(egui::vec2(width, 72.0), egui::Sense::hover());
     let rect = response.rect;
     painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(16, 18, 24));
     if intervals_ns.is_empty() {
@@ -321,6 +339,30 @@ fn draw_intervals(ui: &mut egui::Ui, intervals_ns: &[u64]) {
                 ),
             ],
             egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 160)),
+        );
+    }
+}
+
+fn draw_pending(ui: &mut egui::Ui, pending: &[usize], width: f32) {
+    let (response, painter) = ui.allocate_painter(egui::vec2(width, 72.0), egui::Sense::hover());
+    let rect = response.rect;
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(16, 18, 24));
+    if pending.is_empty() {
+        return;
+    }
+    let peak = pending.iter().copied().max().unwrap_or(1).max(1) as f32;
+    let y_of = |value: usize| rect.bottom() - (value as f32 / peak).clamp(0.0, 1.0) * rect.height();
+    let step = rect.width() / (pending.len().saturating_sub(1).max(1) as f32);
+    for index in 1..pending.len() {
+        painter.line_segment(
+            [
+                egui::pos2(
+                    rect.left() + (index - 1) as f32 * step,
+                    y_of(pending[index - 1]),
+                ),
+                egui::pos2(rect.left() + index as f32 * step, y_of(pending[index])),
+            ],
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(240, 180, 72)),
         );
     }
 }

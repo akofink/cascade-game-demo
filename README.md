@@ -50,8 +50,9 @@ iteration admits at most 64 brush descriptors. Right-click ignites wood or explo
 detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
 The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000) with an explicit apply-and-restart action, switches between bounded and traditional scheduling by restarting the same fixture, and toggles deferred-cell highlighting. Traditional mode processes the ready frontier captured at update start without the slice credit cap. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
 admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.
-The overlay graphs actual frame intervals and reports scheduler credits, quanta, pending work,
-command coalescing/rejection, and upload staleness.
+The overlay prominently labels the active scheduler, plots frame intervals beside pending-work
+history, and offers a one-click same-fixture restart under the other policy. It also reports
+scheduler credits, quanta, pending work, command coalescing/rejection, and upload staleness.
 
 A native smoke check opens a window, incrementally prepares the mixed fixture, uploads the world,
 checks a sampled pixel, pans, zooms, resizes/minimizes, then runs matched 120-frame bounded and

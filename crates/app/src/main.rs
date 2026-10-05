@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use cascade_app::{
     BRUSH_CELLS_PER_FRAME, CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord, DEMO_HEIGHT, DEMO_WIDTH,
-    Demo, FrameHistory, MAX_CHUNKS_PER_FRAME, OverlayActions, OverlayInput, PALETTE, SurfaceChange,
-    UploadBudget, UploadPlan, UploadScheduler, ViewCommand, apply_command, bytes_per_chunk,
-    frame_uniform, show_overlay, surface_change, zoom_factor,
+    Demo, FrameHistory, MAX_CHUNKS_PER_FRAME, OverlayActions, OverlayInput, PALETTE, PolicyChoice,
+    SurfaceChange, UploadBudget, UploadPlan, UploadScheduler, ViewCommand, apply_command,
+    bytes_per_chunk, frame_uniform, show_overlay, surface_change, zoom_factor,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -20,6 +20,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const FRAME_SAMPLES: usize = 240;
 
 struct Gpu {
     window: Arc<Window>,
@@ -275,6 +276,7 @@ impl App {
     }
 
     fn apply_overlay_actions(&mut self, actions: OverlayActions) {
+        let mut restart_disturbance = false;
         if actions.toggle_pause {
             self.demo.toggle_paused();
         }
@@ -309,12 +311,24 @@ impl App {
         {
             eprintln!("restart fixture with adjusted credits: {error}");
         }
-        if let Some(policy) = actions.policy {
+        if actions.toggle_policy {
             let previous = self.demo.policy();
-            self.demo.set_policy(policy);
+            let next = match previous {
+                PolicyChoice::Bounded => PolicyChoice::Traditional,
+                PolicyChoice::Traditional => PolicyChoice::Bounded,
+            };
+            self.demo.set_destroy_held(false);
+            self.destroy_started = false;
+            self.demo.set_policy(next);
             if let Err(error) = self.demo.start_fixture() {
                 self.demo.set_policy(previous);
-                eprintln!("restart fixture for policy: {error}");
+                eprintln!("restart fixture under other policy: {error}");
+            } else {
+                self.history = FrameHistory::default();
+                self.last_present = None;
+                self.demo.set_destroy_held(true);
+                self.destroy_started = true;
+                restart_disturbance = true;
             }
         }
         if let Some(show) = actions.deferred_overlay
@@ -323,7 +337,9 @@ impl App {
             self.deferred_overlay = show;
             self.uploads.mark_all();
         }
-        self.demo.set_destroy_held(actions.destroy_held);
+        if !restart_disturbance {
+            self.demo.set_destroy_held(actions.destroy_held);
+        }
         if actions.destroy_held && !self.destroy_started {
             let mixed = cascade_sim::fixtures::FixtureId::MixedOverload;
             let already_preparing_mixed =
@@ -346,7 +362,7 @@ impl App {
                     self.destroy_started = true;
                 }
             }
-        } else if !actions.destroy_held {
+        } else if !actions.destroy_held && !restart_disturbance {
             self.destroy_started = false;
         }
         if actions.destroy_pressed {
@@ -531,13 +547,18 @@ impl App {
 
         let world = self.demo.dimensions();
         let uniform = frame_uniform(&self.camera, world);
-        let mut intervals = [0_u64; 240];
+        let mut intervals = [0_u64; FRAME_SAMPLES];
         let interval_count = self.history.copy_intervals_ns(&mut intervals);
+        let current_pending = self.demo.metrics().slice.pending_cells;
+        self.history.record_pending(current_pending);
+        let mut pending_samples = [0_usize; FRAME_SAMPLES];
+        let pending_count = self.history.copy_pending(&mut pending_samples);
         let summary = self.history.summary();
         let overlay = OverlayInput {
             world,
             summary,
             intervals_ns: &intervals[..interval_count],
+            pending_samples: &pending_samples[..pending_count],
             sim_cpu_ms: self.sim_cpu_ms,
             upload_cpu_ms: self.upload_cpu_ms,
             submit_cpu_ms: self.submit_cpu_ms,
