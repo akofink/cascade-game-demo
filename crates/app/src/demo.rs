@@ -776,4 +776,21 @@ mod tests {
         assert!(progress.prepared_cells > 0);
         assert!(demo.metrics().paused);
     }
+
+    #[test]
+    fn detonate_command_sets_explosive_before_a_quiet_slice_finishes() {
+        let mut demo = Demo::new_with_size(64, 64).unwrap();
+        demo.set_credits(80);
+        demo.paint_material_at(6, 6, Material::Sand).unwrap();
+        demo.tick();
+        let mark = demo.detonate_at(6, 6).expect("cell");
+        assert!(mark.admitted);
+        demo.tick();
+        let cell = demo.world().cell(6, 6).unwrap();
+        assert!(
+            cell.material == Material::Explosive || cell.material == Material::Air,
+            "material {:?}",
+            cell.material
+        );
+    }
 }
