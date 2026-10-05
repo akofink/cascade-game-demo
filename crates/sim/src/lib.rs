@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 pub const CHUNK_SIDE: u32 = 32;
 pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
-pub const RULE_VERSION: u32 = 4;
+pub const RULE_VERSION: u32 = 5;
 pub const MAX_QUANTUM_COST: u32 = 24;
 pub const MAX_BUDGET_CREDITS: u32 = 10_000_000;
 pub const APPLICATION_CPU_STORAGE_LIMIT: usize = 256 * 1024 * 1024;
