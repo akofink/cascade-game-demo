@@ -26,7 +26,7 @@ Effect latency distributions include action records with an observed first effec
 
 ## Interpretation and limits
 
-Bounded focus measured action-to-first-effect p95 wall latency of 14.3 ms, below the charter's 50 ms target, versus 132.8 ms bounded FIFO and 385.1 ms traditional in this capture. All 64 focused actions observed a first effect. Focus local-settle p95 was 442.1 ms versus 1353.4 ms for bounded FIFO; all 64 actions settled in both bounded runs within this capture window.
+Bounded focus measured action-to-first-effect p95 wall latency of 14.3 ms, below the charter's 50 ms target, versus 132.8 ms bounded FIFO and 385.1 ms traditional in this capture. All 64 focused actions observed a first effect. Focus local-settle p95 was 442.1 ms versus 1353.4 ms for bounded FIFO; 64/64 focus actions and 62/64 FIFO actions settled within this capture window.
 
 Background service remained nonzero and met its configured minimum share in the scheduler test. Its measured quantum count was about 52.5% lower with focus than bounded FIFO (8.58M vs 18.05M), showing the performance tradeoff of the configured 50% focus share under this load. Focus ended with a higher pending-channel count (5.73M vs 2.43M FIFO). Traditional's oldest-age counter was zero at sampled slice boundaries despite residual pending channels; do not compare that value as a measure of full-frontier completion. The traditional wall-time comparison also includes its charter-defined full-world frontier scans.
 
