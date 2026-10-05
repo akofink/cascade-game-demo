@@ -6,7 +6,7 @@ effects resolve more slowly instead of stalling the frame.
 
 See [CHARTER.md](CHARTER.md) for goals, invariants, and milestones.
 
-Read the [documentation site](https://akofink.github.io/cascade-game-demo/).
+Read the [documentation site](https://akofink.com/cascade-game-demo/).
 
 ## Status
 
