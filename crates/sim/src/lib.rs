@@ -8,9 +8,10 @@ use std::hash::{Hash, Hasher};
 pub const CHUNK_SIDE: u32 = 32;
 pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
-pub const RULE_VERSION: u32 = 3;
+pub const RULE_VERSION: u32 = 4;
 pub const MAX_QUANTUM_COST: u32 = 24;
 pub const MAX_BUDGET_CREDITS: u32 = 100_000;
+pub const APPLICATION_CPU_STORAGE_LIMIT: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -65,6 +66,20 @@ impl Capacity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum SchedulerPolicy {
+    Bounded,
+    Traditional,
+}
+impl SchedulerPolicy {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bounded => "bounded",
+            Self::Traditional => "traditional",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellView {
     pub material: Material,
@@ -98,6 +113,8 @@ pub enum SimError {
     ResetInProgress,
     FixtureInProgress,
     CommandCapacityExceeded,
+    ReadyCapacityExceeded,
+    ResourceLimitExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -279,6 +296,7 @@ pub struct World {
     fixture: Option<fixtures::PreparationCursor>,
     fixture_waiting: Option<fixtures::ScenarioDescriptor>,
     fixture_status: fixtures::FixtureProgress,
+    policy: SchedulerPolicy,
 }
 
 impl World {
@@ -307,7 +325,10 @@ impl World {
         if ready_capacity.0 == 0 || command_capacity.0 == 0 {
             return Err(SimError::CapacityZero);
         }
-        if command_capacity.0 > 256 {
+        if ready_capacity.0 > DEFAULT_READY_CAPACITY {
+            return Err(SimError::ReadyCapacityExceeded);
+        }
+        if command_capacity.0 > DEFAULT_COMMAND_CAPACITY {
             return Err(SimError::CommandCapacityExceeded);
         }
         let chunks_x = width.div_ceil(CHUNK_SIDE);
@@ -315,6 +336,27 @@ impl World {
         let chunk_count = (chunks_x as usize)
             .checked_mul(chunks_y as usize)
             .ok_or(SimError::WorldTooLarge)?;
+        let resource_bytes = count
+            .checked_mul(std::mem::size_of::<Cell>() + std::mem::size_of::<PendingCell>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    (ready_capacity.0 * 2).checked_mul(std::mem::size_of::<Option<Job>>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    command_capacity
+                        .0
+                        .checked_mul(std::mem::size_of::<Option<Command>>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(chunk_count.checked_mul(std::mem::size_of::<bool>())?)
+            })
+            .ok_or(SimError::WorldTooLarge)?;
+        if resource_bytes > APPLICATION_CPU_STORAGE_LIMIT {
+            return Err(SimError::ResourceLimitExceeded);
+        }
         Ok(Self {
             width,
             height,
@@ -342,6 +384,7 @@ impl World {
             fixture: None,
             fixture_waiting: None,
             fixture_status: fixtures::FixtureProgress::default(),
+            policy: SchedulerPolicy::Bounded,
         })
     }
     pub fn dimensions(&self) -> (u32, u32) {
@@ -364,6 +407,9 @@ impl World {
         self.budget = budget;
         Ok(())
     }
+    pub fn policy(&self) -> SchedulerPolicy {
+        self.policy
+    }
     pub fn slice_index(&self) -> u64 {
         self.slice
     }
@@ -373,6 +419,13 @@ impl World {
     pub fn start_fixture(
         &mut self,
         descriptor: fixtures::ScenarioDescriptor,
+    ) -> Result<(), fixtures::FixtureError> {
+        self.start_fixture_with_policy(descriptor, SchedulerPolicy::Bounded)
+    }
+    pub fn start_fixture_with_policy(
+        &mut self,
+        descriptor: fixtures::ScenarioDescriptor,
+        policy: SchedulerPolicy,
     ) -> Result<(), fixtures::FixtureError> {
         if self.reset_cursor.is_some() {
             return Err(fixtures::FixtureError::ResetInProgress);
@@ -391,6 +444,7 @@ impl World {
             return Err(fixtures::FixtureError::CapacityMismatch);
         }
         self.reset().map_err(fixtures::FixtureError::from)?;
+        self.policy = policy;
         self.fixture_waiting = Some(descriptor);
         self.fixture_status = fixtures::FixtureProgress {
             descriptor: Some(descriptor),
@@ -812,8 +866,19 @@ impl World {
             }
         }
     }
-    /// Run exactly one bounded slice. Selection probes, reset cells, recovery, commands, and rules are charged before work.
+    /// Run exactly one policy slice. Traditional mode drains only the ready frontier captured at entry.
     pub fn step(&mut self) -> SliceMetrics {
+        if self.policy == SchedulerPolicy::Traditional
+            && self.reset_cursor.is_none()
+            && self.fixture.is_none()
+            && self.fixture_waiting.is_none()
+        {
+            return self.step_traditional();
+        }
+        self.step_bounded()
+    }
+    /// Bounded mode charges every probe and quantum before work.
+    fn step_bounded(&mut self) -> SliceMetrics {
         let mut m = SliceMetrics {
             allowed: self.budget.0,
             slice: self.slice + 1,
@@ -1007,12 +1072,87 @@ impl World {
     pub fn reset_in_progress(&self) -> bool {
         self.reset_cursor.is_some()
     }
+    fn step_traditional(&mut self) -> SliceMetrics {
+        let mut metrics = SliceMetrics {
+            allowed: self.budget.0,
+            slice: self.slice + 1,
+            ..SliceMetrics::default()
+        };
+        let recovery = usize::from(self.pending_count > self.ready_len());
+        let mut frontier = [
+            self.eval_ready.len(),
+            self.blast_ready.len(),
+            recovery,
+            self.command_len(),
+        ];
+        let mut remaining = frontier.iter().sum::<usize>();
+        while remaining > 0 {
+            let lane = self.lane_cursor % 4;
+            self.lane_cursor = (self.lane_cursor + 1) % 4;
+            metrics.charged += self.costs.selection.0;
+            metrics.selections += 1;
+            if frontier[lane as usize] == 0 {
+                continue;
+            }
+            frontier[lane as usize] -= 1;
+            remaining -= 1;
+            match lane {
+                0 => {
+                    if let Some(job) = self.eval_ready.pop() {
+                        metrics.charged += self.costs.evaluate.0;
+                        if job.generation == self.generation {
+                            self.pending[job.cell.index()].set(PendingCell::EVAL_QUEUED, false);
+                            self.execute_evaluate(job.cell);
+                            metrics.evaluations += 1;
+                        }
+                    }
+                }
+                1 => {
+                    if let Some(job) = self.blast_ready.pop() {
+                        metrics.charged += self.costs.blast.0;
+                        if job.generation == self.generation {
+                            self.execute_blast(job.cell);
+                            metrics.blasts += 1;
+                        }
+                    }
+                }
+                2 => {
+                    metrics.charged += self.costs.recovery.0;
+                    self.recover_one();
+                    metrics.recoveries += 1;
+                }
+                _ => {
+                    if let Some(command) =
+                        self.deferred_command.take().or_else(|| self.commands.pop())
+                    {
+                        metrics.charged += self.costs.command.0;
+                        let Command::Paint { cell, .. } = command;
+                        self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
+                        self.execute_command(command);
+                        metrics.commands += 1;
+                    }
+                }
+            }
+        }
+        self.slice = self.slice.saturating_add(1);
+        metrics.ready_len = self.ready_len();
+        metrics.pending_cells = self.pending_count;
+        metrics.oldest_pending_age = if self.oldest_pending_since == 0 {
+            0
+        } else {
+            self.slice.saturating_sub(self.oldest_pending_since)
+        };
+        metrics.rejected_commands = self.rejected_commands;
+        metrics.coalesced_commands = self.coalesced_commands;
+        metrics
+    }
     pub fn state_hash(&self) -> u64 {
         let mut h = DefaultHasher::new();
         RULE_VERSION.hash(&mut h);
         self.width.hash(&mut h);
         self.height.hash(&mut h);
         self.generation.hash(&mut h);
+        self.policy.hash(&mut h);
         self.slice.hash(&mut h);
         self.cells.hash(&mut h);
         self.pending.hash(&mut h);
@@ -1095,6 +1235,28 @@ mod tests {
         assert_eq!(
             World::new(1, 1, Credits::new(25), Capacity::new(1), Capacity::new(257)).err(),
             Some(SimError::CommandCapacityExceeded)
+        );
+        assert_eq!(
+            World::new(
+                1,
+                1,
+                Credits::new(25),
+                Capacity::new(DEFAULT_READY_CAPACITY + 1),
+                Capacity::new(1)
+            )
+            .err(),
+            Some(SimError::ReadyCapacityExceeded)
+        );
+        assert_eq!(
+            World::new(
+                60_000_000,
+                1,
+                Credits::new(25),
+                Capacity::new(1),
+                Capacity::new(1)
+            )
+            .err(),
+            Some(SimError::ResourceLimitExceeded)
         );
         let costs = CostContract::default();
         assert_eq!(costs.blast.get(), MAX_QUANTUM_COST);
@@ -1339,6 +1501,56 @@ mod tests {
         blast_world.trigger_blast(blaster, 2).unwrap();
         blast_world.step();
         assert!(blast_world.cell(2, 1).unwrap().burning > 0);
+    }
+    #[test]
+    fn traditional_policy_drains_only_the_captured_frontier_without_credit_cap() {
+        use crate::fixtures::{FixtureId, ScenarioDescriptor};
+        let mut w = World::new(
+            16,
+            16,
+            Credits::new(25),
+            Capacity::new(64),
+            Capacity::new(16),
+        )
+        .unwrap();
+        w.start_fixture_with_policy(
+            ScenarioDescriptor::get(FixtureId::QuietWorld),
+            SchedulerPolicy::Traditional,
+        )
+        .unwrap();
+        while w
+            .fixture_progress()
+            .is_some_and(|progress| !progress.complete)
+        {
+            w.step();
+        }
+        assert_eq!(w.policy(), SchedulerPolicy::Traditional);
+        for i in 0..3 {
+            assert_eq!(
+                w.submit(Command::Paint {
+                    cell: CellId::from_index(20 + i),
+                    material: Material::Sand
+                }),
+                SubmitResult::Accepted
+            );
+        }
+        let first = w.step();
+        assert_eq!(first.commands, 3);
+        assert_eq!(
+            first.evaluations, 0,
+            "paint wakes join the next traditional frontier"
+        );
+        assert!(
+            first.charged > first.allowed,
+            "traditional mode has no slice credit cap"
+        );
+        let ready_at_entry = w.ready_len();
+        let second = w.step();
+        assert_eq!(second.evaluations as usize, ready_at_entry);
+        assert!(
+            w.ready_len() > 0,
+            "work created by evaluations remains for the next update"
+        );
     }
     #[test]
     fn replay_hash_matches() {
