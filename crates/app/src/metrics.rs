@@ -1,4 +1,4 @@
-//! Fixed frame-interval history. Percentiles are nearest-rank over the ring.
+//! Fixed frame-interval and pending-work history. Percentiles use nearest rank.
 
 /// Intervals strictly longer than this missed a 60 Hz presentation target.
 pub const TARGET_FRAME_NS: u64 = 16_666_667;
@@ -8,6 +8,7 @@ const RING: usize = 240;
 #[derive(Clone, Debug)]
 pub struct FrameHistory {
     intervals_ns: [u64; RING],
+    pending_cells: [usize; RING],
     len: usize,
     cursor: usize,
     missed_target: u64,
@@ -17,6 +18,7 @@ impl Default for FrameHistory {
     fn default() -> Self {
         Self {
             intervals_ns: [0; RING],
+            pending_cells: [0; RING],
             len: 0,
             cursor: 0,
             missed_target: 0,
@@ -35,6 +37,10 @@ pub struct FrameSummary {
 }
 
 impl FrameHistory {
+    pub fn record_pending(&mut self, pending_cells: usize) {
+        self.pending_cells[self.cursor] = pending_cells;
+    }
+
     pub fn record_interval(&mut self, interval_ns: u64) {
         if interval_ns > TARGET_FRAME_NS {
             self.missed_target += 1;
@@ -56,6 +62,16 @@ impl FrameHistory {
         let start = if self.len < RING { 0 } else { self.cursor };
         for (dst, offset) in (0..n).enumerate() {
             out[dst] = self.intervals_ns[(start + offset) % RING];
+        }
+        n
+    }
+
+    /// Oldest to newest, aligned with recorded intervals. Returns the written sample count.
+    pub fn copy_pending(&self, out: &mut [usize]) -> usize {
+        let n = self.len.min(out.len());
+        let start = if self.len < RING { 0 } else { self.cursor };
+        for (dst, offset) in (0..n).enumerate() {
+            out[dst] = self.pending_cells[(start + offset) % RING];
         }
         n
     }
@@ -123,6 +139,7 @@ mod tests {
     fn ring_keeps_chronological_order_and_cumulative_misses() {
         let mut history = FrameHistory::default();
         for value in 0..RING as u64 + 5 {
+            history.record_pending(value as usize * 2);
             history.record_interval(if value == 3 {
                 TARGET_FRAME_NS + 5
             } else {
@@ -134,6 +151,10 @@ mod tests {
         assert_eq!(n, RING);
         assert_eq!(out[0], 5);
         assert_eq!(out[RING - 1], RING as u64 + 4);
+        let mut pending = [0_usize; RING];
+        assert_eq!(history.copy_pending(&mut pending), RING);
+        assert_eq!(pending[0], 10);
+        assert_eq!(pending[RING - 1], (RING + 4) * 2);
         assert_eq!(history.missed_target(), 1);
         assert_eq!(history.summary().samples, RING);
     }
