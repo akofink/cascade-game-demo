@@ -1,4 +1,5 @@
 /target
+/book/
 *.profraw
 /benchmarks/raw/
 .DS_Store

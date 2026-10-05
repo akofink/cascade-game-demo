@@ -1,0 +1,12 @@
+[book]
+title = "Cascade"
+language = "en"
+src = "."
+
+[build]
+create-missing = false
+
+[output.html]
+site-url = "/cascade-game-demo/"
+git-repository-url = "https://github.com/akofink/cascade-game-demo"
+edit-url-template = "https://github.com/akofink/cascade-game-demo/edit/main/{path}"

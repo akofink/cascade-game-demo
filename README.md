@@ -6,6 +6,8 @@ effects resolve more slowly instead of stalling the frame.
 
 See [CHARTER.md](CHARTER.md) for goals, invariants, and milestones.
 
+Read the [documentation site](https://akofink.com/cascade-game-demo/).
+
 ## Status
 
 The headless simulation core is on main. The native shell renders a placeholder
@@ -60,6 +62,15 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+### Documentation site
+
+Install [mdBook 0.5.4](https://github.com/rust-lang/mdBook/releases/tag/v0.5.4), then
+run `mdbook build` or `mdbook serve`. The book reads the Markdown files in place.
+Add a Markdown page to `SUMMARY.md` to publish it, including future performance
+reports and curated benchmark summaries. Use relative links between listed pages;
+link source files to `https://github.com/akofink/cascade-game-demo/blob/main/…`.
+Pull requests build the book; pushes to `main` deploy it to GitHub Pages.
 
 ## License
 
