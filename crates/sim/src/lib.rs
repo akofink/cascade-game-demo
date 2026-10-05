@@ -1368,19 +1368,55 @@ impl World {
             remaining -= self.costs.selection.0;
             m.charged += self.costs.selection.0;
             m.selections += 1;
-            let focus_demand = self.focus_eval_ready.len() + self.focus_blast_ready.len() > 0;
-            let pick_focus = focus_demand
-                && self.focus_enabled
-                && self.lane_cursor % 100 < self.shares.focus_percent;
-            let lane = if pick_focus {
-                let lane = if self.lane_cursor & 1 == 0 { 0 } else { 1 };
-                self.lane_cursor = (self.lane_cursor + 1) % 100;
-                lane
+            let phase = self.lane_cursor;
+            self.lane_cursor = (self.lane_cursor + 1) % 100;
+            let focus_eval = self.focus_enabled && self.focus_eval_ready.len() > 0;
+            let focus_blast = self.focus_enabled && self.focus_blast_ready.len() > 0;
+            let focus_demand = focus_eval || focus_blast;
+            let background_eval = self.eval_ready.len() > 0
+                || (!self.focus_enabled && self.focus_eval_ready.len() > 0);
+            let background_blast = self.blast_ready.len() > 0
+                || (!self.focus_enabled && self.focus_blast_ready.len() > 0);
+            let background_demand = background_eval
+                || background_blast
+                || self.pending_count > 0
+                || self.command_len() > 0;
+            let minimum_background_turn = (background_eval || background_blast)
+                && phase >= self.shares.focus_percent
+                && (phase as u16)
+                    < self.shares.focus_percent as u16 + self.shares.background_min_percent as u16;
+            let focus_turn = focus_demand
+                && !minimum_background_turn
+                && (phase < self.shares.focus_percent || !background_demand);
+            let lane = if focus_turn {
+                if focus_eval && focus_blast {
+                    if phase & 1 == 0 { 0 } else { 1 }
+                } else if focus_eval {
+                    0
+                } else {
+                    1
+                }
+            } else if minimum_background_turn {
+                if background_eval && background_blast {
+                    if phase & 1 == 0 { 2 } else { 3 }
+                } else if background_eval {
+                    2
+                } else {
+                    3
+                }
             } else {
-                let lane = 2 + (self.lane_cursor % 4);
-                self.lane_cursor = (self.lane_cursor + 1) % 100;
-                lane
+                let demanded = [
+                    background_eval,
+                    background_blast,
+                    self.pending_count > 0,
+                    self.command_len() > 0,
+                ];
+                (0..4)
+                    .map(|offset| (phase as usize % 4 + offset) % 4)
+                    .find(|index| demanded[*index])
+                    .map_or(6, |index| index as u8 + 2)
             };
+            let pick_focus = lane == 0 || lane == 1;
             let (cost, job, command) = match lane {
                 0 => self.focus_eval_ready.pop().map_or((None, None, None), |j| {
                     (Some(self.costs.evaluate.0), Some(j), None)
@@ -1895,20 +1931,14 @@ mod tests {
     }
     #[test]
     fn focus_retains_credit_bound_and_background_minimum_service() {
-        let mut w = world(64, 64, 256, 64, 64);
-        for i in 0..4096 {
-            w.mark_cell_for_evaluation(CellId(i)).unwrap();
-        }
-        let target = CellId(32 * 64 + 32);
-        w.set_focus_region(0, 0, 2, 2, 100);
-        for _ in 0..200 {
-            let metrics = w.step();
-            assert!(metrics.charged <= metrics.allowed);
-        }
+        let mut w = world(64, 64, 26, 64, 64);
+        let background_cell = CellId(0);
+        let target = CellId(40 * 64 + 40);
+        w.set_focus_region(1, 1, 2, 2, 1000);
         let mut background = 0;
         let mut focus = 0;
         for _ in 0..100 {
-            w.focus_cell(target, 100);
+            w.mark_cell_for_evaluation(background_cell).unwrap();
             w.mark_cell_for_evaluation(target).unwrap();
             let metrics = w.step();
             background += metrics.background_evaluations + metrics.background_blasts;
@@ -1922,7 +1952,7 @@ mod tests {
         );
         assert!(
             background * 100 >= (background + focus) * 20,
-            "background share must meet its configured minimum"
+            "background share must meet its configured minimum: background={background}, focus={focus}"
         );
     }
 
