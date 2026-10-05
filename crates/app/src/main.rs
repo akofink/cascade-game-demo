@@ -24,7 +24,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const FRAME_SAMPLES: usize = 240;
 
 struct ScreenshotReadback {
@@ -89,9 +89,12 @@ struct Smoke {
     result_printed: bool,
     bounded: PolicySmoke,
     traditional: PolicySmoke,
+    focus: PolicySmoke,
     traditional_started: bool,
+    focus_started: bool,
     bounded_armed: bool,
     traditional_armed: bool,
+    focus_armed: bool,
     failed: Option<String>,
 }
 
@@ -126,6 +129,8 @@ struct App {
     last_cursor: Option<(f32, f32)>,
     last_paint_cell: Option<(i32, i32)>,
     feel: Feel,
+    last_viewport: Option<FocusRect>,
+    viewport_submit_age: u32,
     outdated_handled: bool,
     surface_rebuilds: u32,
     skip_timeout: u32,
@@ -229,6 +234,9 @@ impl App {
                 std::process::exit(1);
             }
         };
+        if !smoke && focus_linked() {
+            demo.set_policy(PolicyChoice::BoundedFocus);
+        }
         if let Err(error) = demo.start_fixture() {
             eprintln!("initial fixture: {error}");
             std::process::exit(1);
@@ -267,6 +275,8 @@ impl App {
             last_cursor: None,
             last_paint_cell: None,
             feel: Feel::new(chunks_x, chunks_y),
+            last_viewport: None,
+            viewport_submit_age: 0,
             outdated_handled: false,
             surface_rebuilds: 0,
             skip_timeout: 0,
@@ -293,9 +303,12 @@ impl App {
                 result_printed: false,
                 bounded: PolicySmoke::default(),
                 traditional: PolicySmoke::default(),
+                focus: PolicySmoke::default(),
                 traditional_started: false,
+                focus_started: false,
                 bounded_armed: false,
                 traditional_armed: false,
+                focus_armed: false,
                 failed: None,
             }),
             screenshot_path,
@@ -881,13 +894,18 @@ impl App {
         };
         smoke.presents += 1;
         let sim_metrics = self.demo.metrics();
-        let is_traditional = sim_metrics.policy == "traditional";
-        let run = if is_traditional {
-            &mut smoke.traditional
-        } else {
-            &mut smoke.bounded
+        let policy_label = match sim_metrics.policy {
+            "traditional" => "traditional",
+            "bounded focus" => "bounded-focus",
+            _ => "bounded-fifo",
+        };
+        let run = match policy_label {
+            "traditional" => &mut smoke.traditional,
+            "bounded-focus" => &mut smoke.focus,
+            _ => &mut smoke.bounded,
         };
         let mut script_this_frame = false;
+        let mut script_step = 0;
         if (1..120).contains(&run.frames) {
             run.last_pending = sim_metrics.slice.pending_cells;
             run.max_pending = run
@@ -905,29 +923,22 @@ impl App {
             run.p99_frame_interval_ns = summary.p99_ns;
             run.frames += 1;
             script_this_frame = run.frames.is_multiple_of(10) && run.frames < 120;
+            script_step = run.frames / 10;
             if run.frames == 120 {
-                let label = if is_traditional {
-                    "traditional"
-                } else {
-                    "bounded-fifo"
-                };
-                print_feel(label, &self.feel);
-                if !is_traditional {
+                print_feel(policy_label, &self.feel);
+                let last_window = policy_label == "bounded-focus"
+                    || (policy_label == "traditional" && !focus_linked());
+                if !last_window {
                     self.feel.clear_latencies();
                 }
                 self.demo.set_destroy_held(false);
-                if is_traditional && !self.demo.destroy_latched() {
+                if last_window && !self.demo.destroy_latched() {
                     self.demo.toggle_destroy_latch();
                 }
             }
         }
         if script_this_frame {
-            let step = if is_traditional {
-                smoke.traditional.frames / 10
-            } else {
-                smoke.bounded.frames / 10
-            };
-            self.scripted_player_action(step);
+            self.scripted_player_action(script_step);
         }
         let fixture_complete = sim_metrics
             .fixture_progress
@@ -970,6 +981,35 @@ impl App {
             self.last_present = None;
             self.demo.set_destroy_held(true);
             smoke.traditional.frames = 1;
+        }
+        if smoke.traditional.frames >= 120 && focus_linked() && !smoke.focus_started {
+            self.demo.set_destroy_held(false);
+            self.demo.set_policy(PolicyChoice::BoundedFocus);
+            if let Err(error) = self.demo.start_fixture() {
+                smoke.failed = Some(format!("start focus smoke fixture: {error}"));
+            } else {
+                smoke.focus_started = true;
+                self.history = FrameHistory::default();
+                self.last_present = None;
+            }
+        }
+        if smoke.focus_started
+            && self
+                .demo
+                .metrics()
+                .fixture_progress
+                .is_some_and(|progress| progress.complete)
+            && !smoke.focus_armed
+        {
+            smoke.focus_armed = true;
+            self.feel.clear_latencies();
+            let pending = self.demo.metrics().slice.pending_cells;
+            smoke.focus.first_pending = pending;
+            smoke.focus.last_pending = pending;
+            self.history = FrameHistory::default();
+            self.last_present = None;
+            self.demo.set_destroy_held(true);
+            smoke.focus.frames = 1;
         }
         if smoke.presents >= 1
             && !smoke.readback_ok
@@ -1083,6 +1123,7 @@ impl App {
             && smoke.zero_ok
             && smoke.bounded.frames >= 120
             && smoke.traditional.frames >= 120
+            && (!focus_linked() || smoke.focus.frames >= 120)
             && smoke.presents >= 20;
         if ready && !smoke.settled_printed {
             smoke.settled_printed = true;
@@ -1336,9 +1377,39 @@ impl App {
             };
             len += 1;
         }
-        self.feel.set_focus(&rects[..len]);
         if focus_linked() && self.demo.policy().focus_enabled() {
-            submit_viewport(self.demo.world_mut(), rects[0]);
+            let mut sim_rects = [rects[0]; 8];
+            let mut sim_len = 0;
+            for region in self.demo.world().active_focus_regions() {
+                if sim_len == sim_rects.len() {
+                    break;
+                }
+                sim_rects[sim_len] = FocusRect {
+                    min_chunk_x: region.min_chunk_x,
+                    min_chunk_y: region.min_chunk_y,
+                    max_chunk_x: region.max_chunk_x,
+                    max_chunk_y: region.max_chunk_y,
+                    kind: FocusKind::Viewport,
+                };
+                sim_len += 1;
+            }
+            if sim_len == 0 {
+                self.feel.set_focus(&rects[..1]);
+            } else {
+                self.feel.set_focus(&sim_rects[..sim_len]);
+            }
+            let viewport = rects[0];
+            let changed = self.last_viewport != Some(viewport);
+            if changed || self.viewport_submit_age >= 4 {
+                submit_viewport(self.demo.world_mut(), viewport);
+                self.last_viewport = Some(viewport);
+                self.viewport_submit_age = 0;
+            } else {
+                self.viewport_submit_age = self.viewport_submit_age.saturating_add(1);
+            }
+        } else {
+            self.feel
+                .set_focus(if focus_linked() { &[] } else { &rects[..len] });
         }
     }
 
