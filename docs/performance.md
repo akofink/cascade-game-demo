@@ -114,12 +114,29 @@ Command: `cargo run --release -p cascade-app -- --smoke --world-size 4096 --scre
 
 The frame-interval summary is per presented policy window. Bounded focus is the third window; its camera and paint latencies are about one frame. Its detonate actions were admitted, but none produced a visible-effect sample in that window. Traditional simulation CPU reached 1947.87 ms, about 20 times the 87 ms maximum in the pre-focus full-size smoke above, while the one-minute load average was under 3 at the start. That traditional column is reported as adverse. It is not explained by the load gate alone and is not a claim that the focus scheduler made traditional mode that slow. The earlier 85.82 ms traditional p99 remains the quiet pre-focus comparison.
 
+## Native three-policy smoke after action-effect indexing
+
+The native smoke ran twice in release mode on main revision `3016f6f` with `--smoke --world-size 4096`; both completed with `SMOKE_RESULT ok`. The reported 1-minute load moved from 2.4 to 2.7. The detailed second run was 120 frames per policy:
+
+| Metric | Bounded FIFO | Bounded focus | Traditional |
+| --- | ---: | ---: | ---: |
+| Frame interval p99 / max | 17.98 / 17.99 ms | not reported | 136.68 / 136.85 ms |
+| Maximum simulation CPU | 4.08 ms | not reported | 146.25 ms |
+| Camera p50 / p95 | 16.61 / 17.74 ms | 16.42 / 17.10 ms | 67.25 / 136.67 ms |
+| Paint visible p50 / p95 | 16.30 / 16.75 ms | 16.09 / 16.51 ms | 66.62 / 66.63 ms |
+| Ignite visible | 815.82 ms (n=1) | 17.04 ms (n=1) | 136.67 ms (n=1) |
+| Detonate visible p50 / p95 | 17.75 / 1019.28 ms (n=4) | no samples | 67.15 / 92.66 ms (n=4) |
+
+Traditional frame p99 of 136.68 ms is substantially below the previous 820.68 ms regression, but remains about 1.6x the pre-focus 80-86 ms range. This is one detailed native run; p50/p95 values with n=1 or n=4 are descriptive, not stable percentile estimates. The bounded-focus detonate stream still has no visible-effect sample. This is an app smoke scripting gap tracked in [issue #26](https://github.com/akofink/cascade-game-demo/issues/26); the simulator follow-up did not edit app code.
+
+The traditional path does not execute bounded focus-lane selection: `World::step` dispatches directly to `step_traditional`. It still scans the fixed 256-entry action ring in `update_action_settle` each slice. While an action awaits first effect, each captured evaluation or blast calls `note_action_effect`; the chunk index limits record candidates but does not eliminate the per-work-item chunk lookup. These are plausible contributors to the residual cost, but the smoke does not isolate their share and no causal attribution is claimed.
+
 ## Remaining unmet targets
 
 - Paired headless fixtures are 300 measured slices per run, not 60 seconds per fixture. Calibration and burst/recovery runs are 1,800 slices and also fall short of 60 seconds.
 - The defined traditional full-scan policy is clearly over 4 ms at full size, but its idle two-scan cost dominates many slices. The measured p99 comparison is policy-specific and is not evidence about optimized conventional engines.
 - The 1,200-command full-size burst did not resolve or reach an empty/stable state for either policy within 1,800 slices; completion time is right-censored.
-- Native evidence includes one 120-frame-per-policy full-size release smoke against the corrected traditional policy, not three sustained 60-second captures. Longer frame-interval distributions, camera/UI responsiveness under stalls, uploads, and GPU timings remain outstanding.
+- The post-action-index native smoke completed twice, with one detailed 120-frame-per-policy result above. This is not three sustained 60-second captures; longer frame-interval distributions, camera/UI responsiveness under stalls, uploads, and GPU timings remain outstanding. Bounded-focus detonate has no visible-effect sample; see issue #26.
 - The app maximum/default read the selected 1,000,000-credit allowance from profile v3. Its focus service-share values are initial scheduler parameters and have not been calibrated.
 - Static descriptors overlap between calibration and validation; only their disturbance command streams are distinct.
 - Full-size startup, fixture preparation, and rendering completed in this smoke; sustained full-size interaction remains unmeasured.

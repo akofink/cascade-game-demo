@@ -1,6 +1,6 @@
 # Player-action focus comparison v1
 
-Status: three quiet-host full-size repetitions accepted. This is headless simulation evidence; the post-fix native frame-interval p99 remains unverified because the smoke could not complete a visible run in this environment.
+Status: three quiet-host full-size headless repetitions accepted. The post-fix native smoke also completed twice on main; bounded-focus native detonate still has no visible-effect samples. Native frame and action observations are separate from the headless results below.
 
 ## Reproduction
 
@@ -49,6 +49,23 @@ Per-action distributions are medians of each repetition's nearest-rank percentil
 | Bounded focus | Detonate | 170; 1.691 / 2.755 ms | 170; 1.691 / 2.755 ms |
 
 All three repetitions produced identical final hashes and deterministic work/backlog counts for each policy. The action-effect index examined 8,510 candidates in traditional mode over the full run instead of probing every action record for every simulation cell. The regression tests also assert zero candidates for completed actions and unrelated traditional chunks.
+
+## Native smoke follow-up
+
+Two release-mode native `--smoke --world-size 4096` runs on main revision `3016f6f` completed with `SMOKE_RESULT ok`; the recorded 1-minute load changed from 2.4 to 2.7. The detailed second run reported:
+
+| Metric | Bounded FIFO | Bounded focus | Traditional |
+| --- | ---: | ---: | ---: |
+| Frame interval p99 / max | 17.98 / 17.99 ms | not reported | 136.68 / 136.85 ms |
+| Maximum simulation CPU | 4.08 ms | not reported | 146.25 ms |
+| Camera p50 / p95 | 16.61 / 17.74 ms | 16.42 / 17.10 ms | 67.25 / 136.67 ms |
+| Paint visible p50 / p95 | 16.30 / 16.75 ms | 16.09 / 16.51 ms | 66.62 / 66.63 ms |
+| Ignite visible | 815.82 ms (n=1) | 17.04 ms (n=1) | 136.67 ms (n=1) |
+| Detonate visible p50 / p95 | 17.75 / 1019.28 ms (n=4) | no samples | 67.15 / 92.66 ms (n=4) |
+
+Traditional frame p99 of 136.68 ms is substantially below the prior 820.68 ms regression, though still about 1.6x the pre-focus 80-86 ms range. This is one detailed 120-frame-per-policy run; action percentiles with n=1 or n=4 are descriptive only, not stable estimates. The bounded-focus native detonate gap is an app smoke scripting issue, tracked in [issue #26](https://github.com/akofink/cascade-game-demo/issues/26); no app code was changed for this simulator follow-up.
+
+Code-path inspection found no bounded focus-lane selection in traditional mode: `World::step` dispatches directly to `step_traditional`. Traditional still calls `update_action_settle` over the fixed 256-record ring each slice. While any applied action awaits first effect, every captured evaluation/blast also calls `note_action_effect`; the chunk index bounds candidate comparisons but does not eliminate that per-work-item chunk lookup. These are plausible contributors to the residual 1.6x cost, but this smoke does not isolate their contribution and no causal attribution is claimed.
 
 ## Interpretation and limits
 
