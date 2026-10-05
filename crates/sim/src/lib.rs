@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 pub const CHUNK_SIDE: u32 = 32;
 pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
-pub const RULE_VERSION: u32 = 1;
+pub const RULE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -16,6 +16,7 @@ pub enum Material {
     Wood = 2,
     Sand = 3,
     Explosive = 4,
+    Water = 5,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -60,16 +61,20 @@ impl Capacity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellView {
     pub material: Material,
+    /// Pending blast energy, preserved for the existing renderer-facing view.
     pub state: u8,
+    pub burning: u8,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct Cell {
     material: Material,
+    burning: u8,
 }
 impl Default for Cell {
     fn default() -> Self {
         Self {
             material: Material::Air,
+            burning: 0,
         }
     }
 }
@@ -82,6 +87,29 @@ pub enum SimError {
     CapacityZero,
     GenerationExhausted,
     OutOfBounds,
+    ResetInProgress,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[repr(C)]
+struct PendingCell {
+    flags: u8,
+    blast: u8,
+}
+impl PendingCell {
+    const EVAL_PENDING: u8 = 1;
+    const EVAL_QUEUED: u8 = 2;
+    const BLAST_QUEUED: u8 = 4;
+    fn has(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+    fn set(&mut self, flag: u8, value: bool) {
+        if value {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +117,10 @@ pub struct ResourceTable {
     pub cells: usize,
     pub cell_bytes: usize,
     pub pending_bytes: usize,
+    pub ready_bytes: usize,
+    pub command_bytes: usize,
+    pub chunk_bytes: usize,
+    pub total_bytes: usize,
     pub ready_capacity: Capacity,
     pub command_capacity: Capacity,
     pub chunk_count: usize,
@@ -101,15 +133,17 @@ pub struct CostContract {
     pub blast: Credits,
     pub recovery: Credits,
     pub command: Credits,
+    pub reset_cell: Credits,
 }
 impl Default for CostContract {
     fn default() -> Self {
         Self {
             selection: Credits(1),
-            evaluate: Credits(8),
-            blast: Credits(12),
+            evaluate: Credits(12),
+            blast: Credits(16),
             recovery: Credits(4),
             command: Credits(6),
+            reset_cell: Credits(4),
         }
     }
 }
@@ -160,6 +194,10 @@ impl<T: Copy> Ring<T> {
     fn len(&self) -> usize {
         self.len
     }
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -171,6 +209,7 @@ pub enum SubmitResult {
     Accepted,
     Coalesced,
     RejectedFull,
+    ResetInProgress,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -188,6 +227,8 @@ pub struct SliceMetrics {
     pub pending_cells: usize,
     pub oldest_pending_age: u64,
     pub slice: u64,
+    pub reset_cells: u32,
+    pub reset_in_progress: bool,
 }
 
 /// Fixed-layout simulation world. Total storage is exposed by [`World::resources`].
@@ -197,11 +238,8 @@ pub struct World {
     chunks_x: u32,
     chunks_y: u32,
     cells: Vec<Cell>,
-    eval_pending: Vec<bool>,
-    blast_pending: Vec<u8>,
-    eval_queued: Vec<bool>,
-    blast_queued: Vec<bool>,
-    pending_since: Vec<u64>,
+    pending: Vec<PendingCell>,
+    reset_cursor: Option<usize>,
     pending_count: usize,
     oldest_pending_since: u64,
     eval_ready: Ring<Job>,
@@ -237,7 +275,7 @@ impl World {
         if count > u32::MAX as usize {
             return Err(SimError::WorldTooLarge);
         }
-        if budget.0 < 13 {
+        if budget.0 < 17 {
             return Err(SimError::BudgetTooSmall);
         }
         if ready_capacity.0 == 0 || command_capacity.0 == 0 {
@@ -254,11 +292,8 @@ impl World {
             chunks_x,
             chunks_y,
             cells: vec![Cell::default(); count],
-            eval_pending: vec![false; count],
-            blast_pending: vec![0; count],
-            eval_queued: vec![false; count],
-            blast_queued: vec![false; count],
-            pending_since: vec![0; count],
+            pending: vec![PendingCell::default(); count],
+            reset_cursor: None,
             pending_count: 0,
             oldest_pending_since: 0,
             eval_ready: Ring::new(ready_capacity.0),
@@ -293,7 +328,17 @@ impl World {
         ResourceTable {
             cells: self.cells.len(),
             cell_bytes: std::mem::size_of::<Cell>(),
-            pending_bytes: self.cells.len() * (1 + 1 + 1 + 1 + 8),
+            pending_bytes: self.pending.len() * std::mem::size_of::<PendingCell>(),
+            ready_bytes: (self.eval_ready.slots.len() + self.blast_ready.slots.len())
+                * std::mem::size_of::<Option<Job>>(),
+            command_bytes: self.commands.slots.len() * std::mem::size_of::<Option<Command>>(),
+            chunk_bytes: self.dirty_chunks.len() * std::mem::size_of::<bool>(),
+            total_bytes: self.cells.len() * std::mem::size_of::<Cell>()
+                + self.pending.len() * std::mem::size_of::<PendingCell>()
+                + (self.eval_ready.slots.len() + self.blast_ready.slots.len())
+                    * std::mem::size_of::<Option<Job>>()
+                + self.commands.slots.len() * std::mem::size_of::<Option<Command>>()
+                + self.dirty_chunks.len() * std::mem::size_of::<bool>(),
             ready_capacity: Capacity(self.eval_ready.slots.len() + self.blast_ready.slots.len()),
             command_capacity: Capacity(self.commands.slots.len()),
             chunk_count: self.dirty_chunks.len(),
@@ -304,7 +349,8 @@ impl World {
         let c = self.cells[id.index()];
         Some(CellView {
             material: c.material,
-            state: self.blast_pending[id.index()],
+            state: self.pending[id.index()].blast,
+            burning: c.burning,
         })
     }
     pub fn cell_id(&self, x: u32, y: u32) -> Option<CellId> {
@@ -333,6 +379,9 @@ impl World {
         drained
     }
     pub fn submit(&mut self, command: Command) -> SubmitResult {
+        if self.reset_cursor.is_some() {
+            return SubmitResult::ResetInProgress;
+        }
         let Command::Paint { cell, .. } = command;
         if cell.index() >= self.cells.len() {
             self.rejected_commands += 1;
@@ -375,21 +424,55 @@ impl World {
             return Ok(());
         }
         self.set_material(id, Material::Explosive);
-        if self.blast_pending[id.index()] == 0 {
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
+        }
+        if self.pending[id.index()].blast == 0 {
             self.pending_count += 1;
         }
-        let merged = self.blast_pending[id.index()].max(energy.min(15));
-        if merged != self.blast_pending[id.index()] {
+        let merged = self.pending[id.index()].blast.max(energy.min(15));
+        if merged != self.pending[id.index()].blast {
             self.mark_dirty(id);
         }
-        self.blast_pending[id.index()] = merged;
+        self.pending[id.index()].blast = merged;
         self.mark_pending(id, false);
         self.try_queue(id, JobKind::Blast);
         Ok(())
     }
-    pub fn mark_cell_for_evaluation(&mut self, id: CellId) -> Result<(), SimError> {
+    /// Ignite wood or an explosive using the same bounded cell-state channels as natural fire.
+    pub fn ignite(&mut self, id: CellId) -> Result<(), SimError> {
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
+        }
         if id.index() >= self.cells.len() {
             return Err(SimError::OutOfBounds);
+        }
+        match self.cells[id.index()].material {
+            Material::Wood => self.ignite_wood(id),
+            Material::Explosive => self.trigger_blast(id, 8)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    fn ignite_wood(&mut self, id: CellId) {
+        let cell = &mut self.cells[id.index()];
+        if cell.material == Material::Wood && cell.burning == 0 {
+            cell.burning = 12;
+            self.mark_dirty(id);
+            self.mark_pending(id, true);
+            self.try_queue(id, JobKind::Evaluate);
+            self.wake_neighbors(id);
+        }
+    }
+    pub fn mark_cell_for_evaluation(&mut self, id: CellId) -> Result<(), SimError> {
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
+        }
+        if id.index() >= self.cells.len() {
+            return Err(SimError::OutOfBounds);
+        }
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
         }
         self.mark_pending(id, true);
         self.try_queue(id, JobKind::Evaluate);
@@ -398,27 +481,24 @@ impl World {
     fn mark_pending(&mut self, id: CellId, evaluate: bool) {
         let i = id.index();
         if evaluate {
-            if !self.eval_pending[i] {
-                self.eval_pending[i] = true;
+            if !self.pending[i].has(PendingCell::EVAL_PENDING) {
+                self.pending[i].set(PendingCell::EVAL_PENDING, true);
                 self.pending_count += 1;
             }
-        } else if self.blast_pending[i] == 0 {
+        } else if self.pending[i].blast == 0 {
             return;
         }
-        if self.pending_since[i] == 0 {
-            self.pending_since[i] = self.slice.saturating_add(1);
-            if self.oldest_pending_since == 0 {
-                self.oldest_pending_since = self.pending_since[i];
-            }
+        if self.oldest_pending_since == 0 {
+            self.oldest_pending_since = self.slice.saturating_add(1);
         }
     }
     fn try_queue(&mut self, id: CellId, kind: JobKind) {
         let i = id.index();
-        let queued = match kind {
-            JobKind::Evaluate => &mut self.eval_queued[i],
-            JobKind::Blast => &mut self.blast_queued[i],
+        let queued_flag = match kind {
+            JobKind::Evaluate => PendingCell::EVAL_QUEUED,
+            JobKind::Blast => PendingCell::BLAST_QUEUED,
         };
-        if *queued {
+        if self.pending[i].has(queued_flag) {
             return;
         }
         let ring = match kind {
@@ -433,7 +513,7 @@ impl World {
             })
             .is_ok()
         {
-            *queued = true;
+            self.pending[i].set(queued_flag, true);
         }
     }
     fn wake_neighbors(&mut self, id: CellId) {
@@ -457,74 +537,115 @@ impl World {
         let i = id.index();
         if self.cells[i].material != material {
             self.cells[i].material = material;
+            self.cells[i].burning = 0;
             self.mark_dirty(id);
         }
     }
     fn execute_evaluate(&mut self, id: CellId) {
         let i = id.index();
-        if self.eval_pending[i] {
-            self.eval_pending[i] = false;
+        if self.pending[i].has(PendingCell::EVAL_PENDING) {
+            self.pending[i].set(PendingCell::EVAL_PENDING, false);
             self.pending_count -= 1;
         }
-        self.pending_since[i] = if self.blast_pending[i] > 0 {
-            self.pending_since[i]
-        } else {
-            0
-        };
-        if self.cells[i].material != Material::Sand {
-            return;
+        if self.pending_count == 0 {
+            self.oldest_pending_since = 0;
         }
-        let y = id.0 / self.width;
-        if y + 1 >= self.height {
-            return;
+        let material = self.cells[i].material;
+        let (x, y) = (id.0 % self.width, id.0 / self.width);
+        if material == Material::Sand || material == Material::Water {
+            let below = (y + 1 < self.height).then_some(CellId(id.0 + self.width));
+            if let Some(below) = below.filter(|b| self.cells[b.index()].material == Material::Air) {
+                self.set_material(below, material);
+                self.set_material(id, Material::Air);
+                self.wake_neighbors(id);
+                self.wake_neighbors(below);
+                return;
+            }
+            if material == Material::Water {
+                let first_left = (x.wrapping_add(y) & 1) == 0;
+                let sides = if first_left { [-1i32, 1] } else { [1, -1] };
+                for dx in sides {
+                    let nx = x as i32 + dx;
+                    if nx >= 0 && nx < self.width as i32 {
+                        let side = CellId(y * self.width + nx as u32);
+                        if self.cells[side.index()].material == Material::Air {
+                            self.set_material(side, Material::Water);
+                            self.set_material(id, Material::Air);
+                            self.wake_neighbors(id);
+                            self.wake_neighbors(side);
+                            return;
+                        }
+                    }
+                }
+            }
         }
-        let below = CellId(id.0 + self.width);
-        if self.cells[below.index()].material == Material::Air {
-            self.set_material(below, Material::Sand);
-            self.set_material(id, Material::Air);
-            self.wake_neighbors(id);
-            self.wake_neighbors(below);
+        if material == Material::Wood && self.cells[i].burning > 0 {
+            let neighbors = self.neighbors(id);
+            for neighbor in neighbors.into_iter().flatten() {
+                match self.cells[neighbor.index()].material {
+                    Material::Wood => self.ignite_wood(neighbor),
+                    Material::Explosive => {
+                        let _ = self.trigger_blast(neighbor, 8);
+                    }
+                    _ => {}
+                }
+            }
+            if self.cells[i].burning > 0 {
+                self.cells[i].burning -= 1;
+                self.mark_dirty(id);
+                if self.cells[i].burning == 0 {
+                    self.set_material(id, Material::Air);
+                } else {
+                    self.mark_pending(id, true);
+                    self.try_queue(id, JobKind::Evaluate);
+                }
+            }
         }
+    }
+    fn neighbors(&self, id: CellId) -> [Option<CellId>; 4] {
+        let (x, y) = (id.0 % self.width, id.0 / self.width);
+        [
+            (y > 0).then(|| CellId(id.0 - self.width)),
+            (x > 0).then(|| CellId(id.0 - 1)),
+            (x + 1 < self.width).then(|| CellId(id.0 + 1)),
+            (y + 1 < self.height).then(|| CellId(id.0 + self.width)),
+        ]
     }
     fn execute_blast(&mut self, id: CellId) {
         let i = id.index();
-        let energy = self.blast_pending[i];
-        if self.blast_pending[i] > 0 {
+        let energy = self.pending[i].blast;
+        if energy > 0 {
             self.pending_count -= 1;
         }
-        if self.blast_pending[i] > 0 {
+        if energy > 0 {
             self.mark_dirty(id);
         }
-        self.blast_pending[i] = 0;
-        self.blast_queued[i] = false;
-        if !self.eval_pending[i] {
-            self.pending_since[i] = 0;
+        self.pending[i].blast = 0;
+        self.pending[i].set(PendingCell::BLAST_QUEUED, false);
+        if self.pending_count == 0 {
+            self.oldest_pending_since = 0;
         }
         if energy == 0 {
             return;
         }
         self.set_material(id, Material::Air);
-        if energy > 1 {
-            let (x, y) = (id.0 % self.width, id.0 / self.width);
-            for (dx, dy) in [(0i32, -1i32), (-1, 0), (1, 0), (0, 1)] {
-                let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
-                if nx >= 0 && ny >= 0 && nx < self.width as i32 && ny < self.height as i32 {
-                    let n = CellId(ny as u32 * self.width + nx as u32);
-                    let ni = n.index();
-                    if self.cells[ni].material == Material::Explosive {
-                        if self.blast_pending[ni] == 0 {
-                            self.pending_count += 1;
-                        }
-                        let merged = self.blast_pending[ni].max(energy - 1);
-                        if merged != self.blast_pending[ni] {
-                            self.mark_dirty(n);
-                        }
-                        self.blast_pending[ni] = merged;
-                        self.mark_pending(n, false);
-                        self.try_queue(n, JobKind::Blast);
+        for neighbor in self.neighbors(id).into_iter().flatten() {
+            let ni = neighbor.index();
+            match self.cells[ni].material {
+                Material::Explosive if energy > 1 => {
+                    if self.pending[ni].blast == 0 {
+                        self.pending_count += 1;
                     }
+                    let merged = self.pending[ni].blast.max(energy - 1);
+                    if merged != self.pending[ni].blast {
+                        self.mark_dirty(neighbor);
+                    }
+                    self.pending[ni].blast = merged;
+                    self.mark_pending(neighbor, false);
+                    self.try_queue(neighbor, JobKind::Blast);
                 }
+                Material::Wood => self.ignite_wood(neighbor),
+                _ => {}
             }
         }
         self.wake_neighbors(id);
@@ -533,10 +654,12 @@ impl World {
         let i = self.recovery_cursor;
         self.recovery_cursor = (i + 1) % self.cells.len();
         let id = CellId(i as u32);
-        if self.eval_pending[i] && !self.eval_queued[i] {
+        if self.pending[i].has(PendingCell::EVAL_PENDING)
+            && !self.pending[i].has(PendingCell::EVAL_QUEUED)
+        {
             self.try_queue(id, JobKind::Evaluate);
         }
-        if self.blast_pending[i] > 0 && !self.blast_queued[i] {
+        if self.pending[i].blast > 0 && !self.pending[i].has(PendingCell::BLAST_QUEUED) {
             self.try_queue(id, JobKind::Blast);
         }
     }
@@ -550,7 +673,7 @@ impl World {
             }
         }
     }
-    /// Run exactly one bounded slice. Selection probes, recovery, commands, and rule quanta are charged before work.
+    /// Run exactly one bounded slice. Selection probes, reset cells, recovery, commands, and rules are charged before work.
     pub fn step(&mut self) -> SliceMetrics {
         let mut m = SliceMetrics {
             allowed: self.budget.0,
@@ -558,6 +681,29 @@ impl World {
             ..SliceMetrics::default()
         };
         let mut remaining = self.budget.0;
+        if let Some(mut cursor) = self.reset_cursor {
+            while cursor < self.cells.len()
+                && remaining >= self.costs.selection.0 + self.costs.reset_cell.0
+            {
+                remaining -= self.costs.selection.0 + self.costs.reset_cell.0;
+                m.charged += self.costs.selection.0 + self.costs.reset_cell.0;
+                m.selections += 1;
+                let id = CellId(cursor as u32);
+                self.cells[cursor] = Cell::default();
+                self.pending[cursor] = PendingCell::default();
+                self.mark_dirty(id);
+                cursor += 1;
+                m.reset_cells += 1;
+            }
+            self.reset_cursor = (cursor < self.cells.len()).then_some(cursor);
+            self.slice = self.slice.saturating_add(1);
+            m.reset_in_progress = self.reset_cursor.is_some();
+            m.ready_len = self.ready_len();
+            m.pending_cells = self.pending_count;
+            m.rejected_commands = self.rejected_commands;
+            m.coalesced_commands = self.coalesced_commands;
+            return m;
+        }
         while remaining >= self.costs.selection.0 {
             remaining -= self.costs.selection.0;
             m.charged += self.costs.selection.0;
@@ -605,7 +751,7 @@ impl World {
                 let i = j.cell.index();
                 match j.kind {
                     JobKind::Evaluate => {
-                        self.eval_queued[i] = false;
+                        self.pending[i].set(PendingCell::EVAL_QUEUED, false);
                         self.execute_evaluate(j.cell);
                         m.evaluations += 1;
                     }
@@ -634,28 +780,31 @@ impl World {
         m.coalesced_commands = self.coalesced_commands;
         m
     }
-    /// Increment generation and clear the world in bounded slices by using a resumable clear cursor.
+    /// Begin a generation-safe reset. Cell storage is cleared by charged, resumable quanta in `step`.
     pub fn reset(&mut self) -> Result<(), SimError> {
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
+        }
         self.generation.0 = self
             .generation
             .0
             .checked_add(1)
             .ok_or(SimError::GenerationExhausted)?;
-        self.eval_ready = Ring::new(self.eval_ready.slots.len());
-        self.blast_ready = Ring::new(self.blast_ready.slots.len());
-        self.commands = Ring::new(self.commands.slots.len());
-        self.eval_pending.fill(false);
-        self.blast_pending.fill(0);
-        self.eval_queued.fill(false);
-        self.blast_queued.fill(false);
-        self.pending_since.fill(0);
+        self.eval_ready.clear();
+        self.blast_ready.clear();
+        self.commands.clear();
         self.pending_count = 0;
         self.oldest_pending_since = 0;
-        self.cells.fill(Cell::default());
-        self.dirty_chunks.fill(true);
         self.recovery_cursor = 0;
         self.deferred_command = None;
+        self.reset_cursor = Some(0);
         Ok(())
+    }
+    pub fn reset_progress(&self) -> Option<(usize, usize)> {
+        self.reset_cursor.map(|cursor| (cursor, self.cells.len()))
+    }
+    pub fn reset_in_progress(&self) -> bool {
+        self.reset_cursor.is_some()
     }
     pub fn state_hash(&self) -> u64 {
         let mut h = DefaultHasher::new();
@@ -665,11 +814,7 @@ impl World {
         self.generation.hash(&mut h);
         self.slice.hash(&mut h);
         self.cells.hash(&mut h);
-        self.eval_pending.hash(&mut h);
-        self.blast_pending.hash(&mut h);
-        self.eval_queued.hash(&mut h);
-        self.blast_queued.hash(&mut h);
-        self.pending_since.hash(&mut h);
+        self.pending.hash(&mut h);
         self.eval_ready.head.hash(&mut h);
         self.eval_ready.len.hash(&mut h);
         self.eval_ready.slots.hash(&mut h);
@@ -683,6 +828,7 @@ impl World {
         self.dirty_cursor.hash(&mut h);
         self.pending_count.hash(&mut h);
         self.oldest_pending_since.hash(&mut h);
+        self.reset_cursor.hash(&mut h);
         self.recovery_cursor.hash(&mut h);
         self.lane_cursor.hash(&mut h);
         self.budget.hash(&mut h);
@@ -843,6 +989,20 @@ mod tests {
         let old = w.generation();
         w.reset().unwrap();
         assert_ne!(old, w.generation());
+        assert_eq!(w.reset_progress(), Some((0, 16)));
+        assert_eq!(
+            w.submit(Command::Paint {
+                cell: id,
+                material: Material::Stone
+            }),
+            SubmitResult::ResetInProgress
+        );
+        while w.reset_in_progress() {
+            let metrics = w.step();
+            assert!(metrics.charged <= metrics.allowed);
+        }
+        assert_eq!(w.reset_progress(), None);
+        assert_eq!(w.cell(0, 0).unwrap().material, Material::Air);
         for _ in 0..10 {
             w.step();
         }
@@ -878,6 +1038,82 @@ mod tests {
         }
         assert_eq!(w.cell(1, 1).unwrap().material, Material::Air);
         assert_eq!(w.cell(6, 1).unwrap().material, Material::Explosive);
+    }
+    #[test]
+    fn reset_is_incremental_and_charged() {
+        let mut w = world(16, 4, 17, 2, 2);
+        for i in 0..64 {
+            w.set_material(CellId(i), Material::Stone);
+        }
+        w.reset().unwrap();
+        let first = w.step();
+        assert_eq!(first.reset_cells, 3);
+        assert_eq!(first.charged, 15);
+        assert!(first.reset_in_progress);
+        assert_eq!(w.cell(0, 0).unwrap().material, Material::Air);
+        assert_eq!(w.cell(3, 0).unwrap().material, Material::Stone);
+        while w.reset_in_progress() {
+            assert!(w.step().charged <= 17);
+        }
+        assert!(w.cells.iter().all(|cell| cell.material == Material::Air));
+    }
+    #[test]
+    fn compact_storage_fits_default_world_budget() {
+        let w = world(
+            4096,
+            4096,
+            32,
+            DEFAULT_READY_CAPACITY,
+            DEFAULT_COMMAND_CAPACITY,
+        );
+        let resources = w.resources();
+        assert_eq!(resources.cell_bytes, 2);
+        assert_eq!(resources.pending_bytes, 2 * 4096 * 4096);
+        assert!(resources.total_bytes < 256 * 1024 * 1024);
+    }
+    #[test]
+    fn water_gravity_and_spreading_conserve_cells() {
+        let mut w = world(7, 5, 64, 32, 4);
+        let water = w.cell_id(3, 0).unwrap();
+        w.set_material(water, Material::Water);
+        w.mark_cell_for_evaluation(water).unwrap();
+        for _ in 0..80 {
+            w.step();
+        }
+        assert_eq!(
+            w.cells
+                .iter()
+                .filter(|c| c.material == Material::Water)
+                .count(),
+            1
+        );
+        assert_eq!(w.cell(3, 4).unwrap().material, Material::Water);
+    }
+    #[test]
+    fn fire_burns_wood_and_ignites_explosives_and_blast_ignites_wood() {
+        let mut w = world(8, 3, 64, 32, 4);
+        let wood = w.cell_id(1, 1).unwrap();
+        let wood2 = w.cell_id(2, 1).unwrap();
+        let explosive = w.cell_id(3, 1).unwrap();
+        w.set_material(wood, Material::Wood);
+        w.set_material(wood2, Material::Wood);
+        w.set_material(explosive, Material::Explosive);
+        w.ignite(wood).unwrap();
+        assert!(w.cell(1, 1).unwrap().burning > 0);
+        for _ in 0..100 {
+            w.step();
+        }
+        assert_eq!(w.cell(1, 1).unwrap().material, Material::Air);
+        assert_eq!(w.cell(2, 1).unwrap().material, Material::Air);
+        assert_eq!(w.cell(3, 1).unwrap().material, Material::Air);
+
+        let mut blast_world = world(4, 3, 64, 16, 4);
+        let blastwood = blast_world.cell_id(2, 1).unwrap();
+        let blaster = blast_world.cell_id(1, 1).unwrap();
+        blast_world.set_material(blastwood, Material::Wood);
+        blast_world.trigger_blast(blaster, 2).unwrap();
+        blast_world.step();
+        assert!(blast_world.cell(2, 1).unwrap().burning > 0);
     }
     #[test]
     fn replay_hash_matches() {
