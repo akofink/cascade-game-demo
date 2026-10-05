@@ -286,6 +286,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "image",
  "pollster",
  "toml",
  "wgpu",

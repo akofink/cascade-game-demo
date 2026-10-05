@@ -19,6 +19,19 @@ remains incremental. The headless core includes complete rules, seeded fixtures,
 traditional policies, and a benchmark runner. See the [performance evidence](docs/performance.md)
 for corrected headless results and limitations.
 
+## Try it
+
+1. Start the representative full-size release build:
+
+   ```sh
+   cargo run --release -p cascade-app -- --world-size 4096
+   ```
+
+2. Hold **DESTROY PERFORMANCE** to prepare the mixed-overload fixture and admit the seeded disturbance stream. Watch the policy label and the side-by-side frame-interval and pending-work graphs.
+3. Click **Same trigger: restart traditional** (or the bounded option if traditional is active). The app restarts the same fixture and disturbance stream under the other policy. Traditional mode intentionally processes the complete captured frontier and may visibly stall.
+
+![Cascade's traditional scheduler during the full-size overload comparison](docs/cascade-overload.png)
+
 ## Prior art
 
 The mechanisms here are not new: sleeping objects, simulation level of detail, significance-driven
@@ -40,9 +53,9 @@ Closest references:
 ## Run
 
 ```sh
-cargo run -p cascade-app
+cargo run --release -p cascade-app
 # Full charter-size world (fixed size for this run)
-cargo run -p cascade-app -- --world-size 4096
+cargo run --release -p cascade-app -- --world-size 4096
 ```
 
 Drag with the left mouse button to pan; scroll to zoom. Arrow keys and WASD also pan.
@@ -60,7 +73,7 @@ checks a sampled pixel, pans, zooms, resizes/minimizes, then runs matched 120-fr
 traditional disturbance bursts and reports per-policy frame/backlog measurements:
 
 ```sh
-cargo run -p cascade-app -- --smoke
+cargo run --release -p cascade-app -- --smoke --world-size 4096 --screenshot docs/cascade-overload.png
 ```
 
 Headless tests do not open a window or need a GPU:
