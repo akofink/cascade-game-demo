@@ -66,6 +66,7 @@ pub struct DemoMetrics {
     pub policy: Policy,
     pub selected_fixture: FixtureId,
     pub fixture_progress: Option<cascade_sim::fixtures::FixtureProgress>,
+    pub reset_in_progress: bool,
     pub destroy_held: bool,
     pub disturbance_emitted: u64,
     pub resource_bytes: usize,
@@ -164,6 +165,7 @@ impl Demo {
             policy: self.policy,
             selected_fixture: self.selected_fixture,
             fixture_progress: self.world.fixture_progress(),
+            reset_in_progress: self.world.reset_in_progress(),
             destroy_held: self.destroy_held,
             disturbance_emitted: self.last_disturbance,
             resource_bytes: self.world.resources().total_bytes
@@ -201,9 +203,11 @@ impl Demo {
         if self
             .world
             .fixture_progress()
-            .is_some_and(|progress| !progress.complete)
+            .is_some_and(|progress| !progress.complete && !progress.cancelled)
         {
-            self.world.cancel_fixture();
+            return Err(
+                "cancel the current fixture preparation before starting another".to_string(),
+            );
         }
         let wants_tiny = descriptor.id == FixtureId::TinyCapacity;
         if wants_tiny != self.tiny_capacity_active {

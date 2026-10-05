@@ -47,6 +47,11 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
         .default_width(360.0)
         .show(ctx, |ui| {
+            let preparing = input.sim.reset_in_progress
+                || input
+                    .sim
+                    .fixture_progress
+                    .is_some_and(|progress| !progress.complete && !progress.cancelled);
             ui.label("Bounded-work cellular simulation");
             ui.label(format!("world: {} x {}", input.world.0, input.world.1));
             ui.label("drag to pan; scroll to zoom; right-click ignite; shift-right-click detonate");
@@ -93,7 +98,10 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                     }
                 });
             ui.horizontal(|ui| {
-                if ui.button("Prepare selected fixture").clicked() {
+                if ui
+                    .add_enabled(!preparing, egui::Button::new("Prepare selected fixture"))
+                    .clicked()
+                {
                     actions.load_fixture = true;
                 }
                 if input
@@ -106,10 +114,16 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("Bounded").clicked() {
+                if ui
+                    .add_enabled(!preparing, egui::Button::new("Bounded"))
+                    .clicked()
+                {
                     actions.policy = Some(Policy::Bounded);
                 }
-                if ui.button("Traditional").clicked() {
+                if ui
+                    .add_enabled(!preparing, egui::Button::new("Traditional"))
+                    .clicked()
+                {
                     actions.policy = Some(Policy::Traditional);
                 }
                 ui.label(format!("current: {:?}", input.sim.policy));

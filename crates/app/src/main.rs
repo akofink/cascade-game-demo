@@ -274,12 +274,27 @@ impl App {
         }
         self.demo.set_destroy_held(actions.destroy_held);
         if actions.destroy_held && !self.destroy_started {
-            self.demo
-                .select_fixture(cascade_sim::fixtures::FixtureId::MixedOverload);
-            if let Err(error) = self.demo.start_fixture() {
-                eprintln!("start mixed overload: {error}");
+            let mixed = cascade_sim::fixtures::FixtureId::MixedOverload;
+            let already_preparing_mixed =
+                self.demo
+                    .metrics()
+                    .fixture_progress
+                    .is_some_and(|progress| {
+                        progress
+                            .descriptor
+                            .is_some_and(|descriptor| descriptor.id == mixed)
+                            && !progress.complete
+                            && !progress.cancelled
+                    });
+            if already_preparing_mixed {
+                self.destroy_started = true;
+            } else {
+                self.demo.cancel_fixture();
+                self.demo.select_fixture(mixed);
+                if self.demo.start_fixture().is_ok() {
+                    self.destroy_started = true;
+                }
             }
-            self.destroy_started = true;
         } else if !actions.destroy_held {
             self.destroy_started = false;
         }
@@ -619,6 +634,8 @@ impl App {
                     smoke.failed = Some(error);
                 }
             }
+            // The smoke-only synchronous GPU readback must not contaminate frame intervals.
+            self.last_present = None;
         }
         if !smoke.ready_printed {
             smoke.ready_printed = true;
