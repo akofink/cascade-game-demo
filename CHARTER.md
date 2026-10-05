@@ -167,6 +167,17 @@ Prove eventual servicing for finite accepted demand and test it. Do not promise 
 
 Camera-distance and visibility priority are optional after the baseline works. If introduced, retain minimum background service and record camera inputs in replays. Never resort the entire pending set each frame.
 
+### Player focus (milestone 6)
+
+Game feel under load is a first-class result: the player's own actions should resolve promptly even when the world is saturated, while the rest of the world visibly defers. Add a bounded **player focus** priority:
+
+- Focus is simulation state set only through admitted commands (an action's target region with a slice-count lifetime, and optionally the camera viewport), so replays reproduce it. A fixed number of focus regions over chunk metadata gives O(1) membership.
+- Work admitted for a cell in a focused chunk enters fixed-capacity focus lanes; overflow falls back to the normal lanes or pending state. A charged focus-recovery cursor promotes already-pending cells inside newly focused chunks. Duplicate or promoted entries are suppressed or charged as stale.
+- The scheduler gives focus lanes a fixed service share when non-empty and guarantees background lanes a nonzero minimum share whenever background demand exists. Shares are recorded profile parameters; the credit invariant is unchanged.
+- Acknowledge every admitted action in the next presented frame (for example a marker at the target), and label it as acknowledgment, not resolution.
+
+Measure: action-to-first-effect latency (admission to the first executed quantum touching the target neighborhood) and local settle time, in slices and wall time, plus camera/UI feedback latency and background throughput, for traditional, bounded FIFO, and bounded with focus, under the same scripted overload and player action stream.
+
 ### Frame-loop contract
 
 Poll input, advance bounded preparation/simulation work, perform capped texture uploads, draw the UI/world, and present. No loop attempts to repay an accumulated wall-time deficit with unlimited simulation slices. After a stall, resume the normal allowance and record missed presentation opportunities.
@@ -258,6 +269,7 @@ Require deterministic repetition within each mode, not necessarily identical fin
 3. **Complete v0.1 rules:** water, fire, dormancy/waking, bounded brush/reset/fixture preparation, and recovery cursor. Exit: local-rule tests and full-size world run without dynamic queue growth.
 4. **Adversarial demo:** all required stress fixtures, DESTROY PERFORMANCE, the in-app traditional versus bounded switch, command saturation feedback, and recovery tests. Exit: sustained overload preserves every structural invariant and responsive controls on the reference profile, and the same fixture visibly stalls in traditional mode.
 5. **Comparison and evidence:** replayable paired runs, latency distributions, resource audit, and benchmark report. Exit: acceptance criteria below are met or honestly reported as unmet.
+6. **Interactivity under load:** player focus scheduling, action acknowledgment, scripted player-action stream, and game-feel metrics. Exit: under sustained mixed overload, bounded-with-focus action-to-first-effect p95 is at or below 50 ms on the reference profile while background lanes keep their minimum share; results for all three policies are reported.
 
 Do not start a later research feature to avoid fixing a failed milestone.
 
@@ -281,6 +293,7 @@ After warm-up, run each fixture for at least 60 seconds, three times, at a fixed
 - Simulation slice duration: p99 at or below 4 ms after fixed-profile calibration.
 - Frame interval: p99 at or below 20 ms, with every interval over 33.3 ms counted and maximum disclosed.
 - Camera/UI feedback latency: p95 at or below 50 ms using a documented measurement method. This is distinct from material-effect resolution latency.
+- Player action-to-first-effect latency under sustained overload with focus enabled: p95 at or below 50 ms, with background minimum service maintained.
 - Full-size mixed overload stays within resource limits and does not crash, deadlock, or lose accepted work.
 - Finite stress bursts drain or reach a verified stable state within a measured recovery window; report the duration rather than hiding slow completion.
 - In at least one paired heavy-work fixture, bounded mode materially reduces p99 frame latency while the report shows its effect-completion cost. Target a twofold reduction; if the baseline cannot be overloaded within declared caps, report the comparison as inconclusive.
