@@ -10,6 +10,7 @@ pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
 pub const FOCUS_REGION_CAPACITY: usize = 8;
 pub const ACTION_RECORD_CAPACITY: usize = 256;
+pub const PLAYER_ACTION_FOCUS_LIFETIME_SLICES: u16 = 8;
 pub const RULE_VERSION: u32 = 6;
 pub const MAX_QUANTUM_COST: u32 = 24;
 pub const MAX_BUDGET_CREDITS: u32 = 10_000_000;
@@ -1294,7 +1295,7 @@ impl World {
         match command {
             Command::Paint { cell, material } => {
                 self.note_action_applied(cell);
-                self.focus_cell(cell, 8);
+                self.focus_cell(cell, PLAYER_ACTION_FOCUS_LIFETIME_SLICES);
                 self.set_material(cell, material);
                 self.mark_pending(cell, true);
                 self.try_queue(cell, JobKind::Evaluate);
@@ -1302,12 +1303,12 @@ impl World {
             }
             Command::Ignite { cell } => {
                 self.note_action_applied(cell);
-                self.focus_cell(cell, 8);
+                self.focus_cell(cell, PLAYER_ACTION_FOCUS_LIFETIME_SLICES);
                 let _ = self.ignite(cell);
             }
             Command::Detonate { cell, energy } => {
                 self.note_action_applied(cell);
-                self.focus_cell(cell, 8);
+                self.focus_cell(cell, PLAYER_ACTION_FOCUS_LIFETIME_SLICES);
                 let _ = self.trigger_blast(cell, energy);
             }
             Command::FocusViewport {

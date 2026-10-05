@@ -1,3 +1,4 @@
+use cascade_bench::focus::run_player_action_comparison;
 use cascade_bench::{BenchConfig, OutputFormat, run};
 use cascade_sim::SchedulerPolicy;
 use cascade_sim::fixtures::{FixtureId, ScenarioDescriptor};
@@ -15,11 +16,17 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     let mut format = OutputFormat::Csv;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
+    let mut action_comparison = false;
     while index < args.len() {
         let option = args[index].as_str();
         if option == "--help" || option == "-h" {
             print_help();
             return Ok(());
+        }
+        if option == "--player-action-comparison" {
+            action_comparison = true;
+            index += 1;
+            continue;
         }
         let value = args
             .get(index + 1)
@@ -53,6 +60,16 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     }
     let stdout = io::stdout();
     let mut output = stdout.lock();
+    if action_comparison {
+        run_player_action_comparison(
+            config.width,
+            config.height,
+            config.budget,
+            config.slices,
+            &mut output,
+        )?;
+        return Ok(());
+    }
     let summary = run(config, format, &mut output)?;
     if format == OutputFormat::Csv {
         eprintln!(
@@ -89,9 +106,9 @@ fn parse_fixture(value: &str) -> Result<FixtureId, String> {
 
 fn print_help() {
     println!(
-        "cascade-bench [--fixture NAME] [--policy bounded|traditional] [--slices N] [--warmup-slices N] [--format csv|json] [--width N] [--height N] [--budget CREDITS] [--disturbances N] [--disturbances-per-slice N]"
+        "cascade-bench [--fixture NAME] [--policy bounded|traditional] [--slices N] [--warmup-slices N] [--format csv|json] [--width N] [--height N] [--budget CREDITS] [--disturbances N] [--disturbances-per-slice N] [--player-action-comparison]"
     );
     println!(
-        "Fixture preparation and optional warm-up are timed separately and excluded from measured slice durations."
+        "Fixture preparation and optional warm-up are timed separately and excluded from measured slice durations. The player-action comparison runs all three policies against mixed overload."
     );
 }
