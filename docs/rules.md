@@ -6,20 +6,24 @@ The row-major world has a closed boundary. Out-of-range neighbors do not exist. 
 
 Materials are Air, Stone, Wood, Sand, Explosive, and Water. Stone is fixed until changed by an explicit edit. Burning is a cell-state countdown on wood, not an additional material. Cell reads preserve the existing `state` byte for pending blast energy and add `burning` as an additive state field.
 
+<link rel="stylesheet" href="rules-images/rules.css">
+
+**Illustration palette:** Air `#17212b`, stone `#78838d`, wood `#8d4e31`, sand `#e5b84f`, explosive `#f05832`, water `#45a9c5`. Strip overlays: amber marks pending work, orange marks heat or blast energy, and pale highlights mark cells executed in the latest slice. Each panel prints its simulation step; all panels come from the real simulation.
+
 ## Granular and water movement
 
 Sand and water inspect the cell directly below. If it is Air, the material moves there atomically. Sand otherwise remains dormant. Water otherwise tries one horizontal neighbor; initial direction is selected by `(x + y) mod 2`, and it tries the opposite direction if blocked. The closed boundary prevents escape. This intentionally simple local spreading rule may oscillate and is not a pressure-fluid model.
 
 A successful move clears the source, fills the destination, and wakes cardinal neighbors of both cells. Sand and water counts are conserved by simulation movement. Explicit paint/reset can change counts. Each evaluation inspects a fixed bounded neighborhood, and no rule searches an unbounded column or region.
 
-<figure>
-  <img src="rules-images/sand-gravity.png" alt="Sand before and after twelve local simulation slices">
-  <figcaption>Left: seeded sand over a stone floor. Right: after 12 slices, serviced grains have fallen through local gravity.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/sand-gravity.png" alt="Four simulation steps show a sand pile resting on a removable stone support, the support painted away, and grains falling through the opening">
+  <figcaption>Steps 1, 5, 6, and 13: sand stacks on a temporary stone shelf; painting one support cell to air opens a notch, and later service moves grains down.</figcaption>
 </figure>
 
-<figure>
-  <img src="rules-images/water-spread.png" alt="Water before and after twelve local simulation slices">
-  <figcaption>Left: a narrow water column. Right: after 12 slices, water has fallen and spread to locally available cells.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/water-spread.png" alt="Four simulation steps show water falling through a one-cell gap in a stone basin floor and spreading through the lower chamber">
+  <figcaption>Each frame follows another fixed group of simulation slices: water falls through the one-cell floor opening, then spreads through the lower chamber where a neighbor is available.</figcaption>
 </figure>
 
 ## Fire and explosives
@@ -28,19 +32,19 @@ Wood ignition sets a 12-service burn countdown. On each serviced burning-wood ev
 
 A blast request changes its target to Explosive and merges energy by `max(existing, min(requested, 15))`, not addition. A serviced blast converts the explosive cell to Air. Each cardinal adjacent explosive receives `max(existing, energy - 1)` when energy exceeds one. Adjacent wood is ignited by the blast regardless of remaining propagation energy. Blast energy is finite, saturating, and attenuates by one edge; this is not an additive physical shock wave. Stone, sand, and water are not destroyed by blast in this rules version.
 
-<figure>
-  <img src="rules-images/wood-fire.png" alt="Wood before ignition and after five simulation slices">
-  <figcaption>Left: a wood row. Right: after ignition and 5 slices, burning wood is still wood while its service countdown advances and neighbors wake.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/wood-fire.png" alt="Four simulation steps show a wood patch igniting at its center and neighboring wood catching fire">
+  <figcaption>From an unlit 12-by-6 wood patch through three increasing service intervals: orange heat spreads to adjacent wood while burning cells remain wood during their countdown.</figcaption>
 </figure>
 
-<figure>
-  <img src="rules-images/explosive-ignition.png" alt="Explosives before and after one ignition slice">
-  <figcaption>Left: an explosive row. Right: after ignition and 1 slice, the first explosive has been serviced and propagation is pending.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/explosive-ignition.png" alt="Four simulation steps show ignition at one end of an explosive chain and attenuating blast energy advancing toward wood">
+  <figcaption>Successive fixed slice groups show an end cell ignited, serviced into air, and energy advancing along the explosive row before reaching adjacent wood.</figcaption>
 </figure>
 
-<figure>
-  <img src="rules-images/blast-attenuation.png" alt="Blast energy before and after four propagation slices">
-  <figcaption>Left: a triggered blast with pending energy. Right: after 4 slices, propagation energy has attenuated along the explosive chain.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/blast-attenuation.png" alt="Four simulation steps show an energy-8 blast spreading through explosives inside stone walls and igniting neighboring wood">
+  <figcaption>Energy 8 is triggered at the left end of the explosive chain. Each serviced edge loses one energy; neighboring wood ignites, while stone contains the scene and remains unchanged.</figcaption>
 </figure>
 
 Fire, blast, and edit activity wake only fixed cardinal neighborhoods. All timers advance on service, not wall time. Under overload, different regions progress at different rates; this is not uniform time dilation.
@@ -51,19 +55,19 @@ Duplicate reevaluation requests coalesce to one per-cell pending bit. Blast requ
 
 Reset increments a checked world generation immediately, discards queued command/job frontiers, and blocks new edits while a cursor clears one cell per charged reset quantum. Every old job is generation-tagged and cannot mutate the new generation. Reset progress is observable; cancellation is deliberately not offered for world reset. Starting a fixture schedules reset and then a versioned fixture cursor, both advanced only by `World::step`; fixture progress and cancellation are observable. Reset marks renderer chunks dirty as cells are cleared.
 
-<figure>
-  <img src="rules-images/dormancy-waking.png" alt="Dormant sand and a nearby cell before and after a wake request">
-  <figcaption>Left: settled sand is dormant. Right: after 1 slice, a local edit has woken its neighborhood for bounded reevaluation.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/dormancy-waking.png" alt="Four simulation steps show settled dormant sand and its bounded reevaluation after a local wake request">
+  <figcaption>After settling, a cell on the stone ledge is explicitly marked for evaluation. The following three slices service only admitted local work; the sand stays dormant unless newly woken.</figcaption>
 </figure>
 
-<figure>
-  <img src="rules-images/reset-preparation.png" alt="A prepared wood region before and partway through incremental reset">
-  <figcaption>Left: a seeded wood region. Right: after 4 reset slices, the clearing cursor has removed only part of the world.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/reset-preparation.png" alt="Four simulation steps show a wood-filled world being cleared in small charged reset batches">
+  <figcaption>After reset begins, each 100-credit slice clears only a bounded prefix of cells. The frames show successive partial progress, not one instantaneous whole-world clear.</figcaption>
 </figure>
 
-<figure>
-  <img src="rules-images/fixture-preparation.png" alt="A wood scene before and during explosive-lattice fixture preparation">
-  <figcaption>Left: a prepared wood region. Right: after 6 slices of incremental reset and fixture preparation, part of the seeded explosive lattice is ready.</figcaption>
+<figure class="rule-strip-figure">
+  <img src="rules-images/fixture-preparation.png" alt="Four simulation steps show the existing wood scene cleared and replaced by a seeded explosive lattice through incremental fixture preparation">
+  <figcaption>Each 160-credit slice first advances reset and then fixture preparation by charged cells; successive frames reveal an expanding deterministic explosive lattice.</figcaption>
 </figure>
 
 Regenerate these deterministic, 32 by 24, simulation-derived illustrations with `cargo run --locked -p cascade-rule-shots -- docs/rules-images`. Each strip compares the captured setup state with the state after the fixed number of `World::step` calls in `crates/rule-shots/src/main.rs`; colors and overlays match the interactive tour.

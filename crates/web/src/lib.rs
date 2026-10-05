@@ -1,4 +1,6 @@
-use cascade_sim::{Capacity, Command, Credits, Material, SchedulerPolicy, SubmitResult, World};
+use cascade_sim::{
+    CHUNK_SIDE, Capacity, Command, Credits, Material, SchedulerPolicy, SubmitResult, World,
+};
 use wasm_bindgen::prelude::*;
 
 const SIDE: u32 = 128;
@@ -87,16 +89,19 @@ impl TourWorld {
         )
     }
     pub fn ignite(&mut self, x: u32, y: u32) -> bool {
-        self.world
-            .cell_id(x, y)
-            .is_some_and(|cell| self.world.ignite(cell).is_ok())
+        self.world.cell_id(x, y).is_some_and(|cell| {
+            matches!(
+                self.world.submit(Command::Ignite { cell }),
+                SubmitResult::Accepted | SubmitResult::Coalesced
+            )
+        })
     }
     pub fn seed_scene(&mut self, scene: u8) {
         let w = self.width;
         let floor = self.height - 12;
-        for x in 4..w - 4 {
-            for dx in 0..1 {
-                let _ = self.paint(x + dx, floor, 1);
+        if scene % 6 != 3 {
+            for x in 4..w - 4 {
+                let _ = self.paint(x, floor, 1);
             }
         }
         match scene % 6 {
@@ -131,6 +136,14 @@ impl TourWorld {
                 }
             }
             3 => {
+                for y in 36..44 {
+                    for x in 40..48 {
+                        let _ = self.paint(x, y, 2);
+                    }
+                    for x in 52..60 {
+                        let _ = self.paint(x, y, 4);
+                    }
+                }
                 for x in 32..96 {
                     let _ = self.paint(x, 78, 4);
                 }
@@ -138,7 +151,6 @@ impl TourWorld {
                     let _ = self.paint(32, y, 2);
                     let _ = self.paint(95, y, 2);
                 }
-                let _ = self.ignite(32, 78);
             }
             4 => {
                 for x in [24, 48, 72, 96] {
@@ -176,7 +188,7 @@ impl TourWorld {
         self.last_age = m.oldest_pending_age;
     }
     pub fn cells(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity((self.width * self.height * 4) as usize);
+        let mut out = Vec::with_capacity((self.width * self.height * 5) as usize);
         for y in 0..self.height {
             for x in 0..self.width {
                 let cell = self.world.cell(x, y).expect("validated grid coordinate");
@@ -185,6 +197,13 @@ impl TourWorld {
                 out.push(cell.state.max(cell.burning));
                 out.push(u8::from(self.world.cell_pending(x, y).unwrap_or(false)));
                 out.push(u8::from(self.world.cell_executed_last(id)));
+                let focused = self.world.active_focus_regions().any(|region| {
+                    let chunk_x = x / CHUNK_SIDE;
+                    let chunk_y = y / CHUNK_SIDE;
+                    (region.min_chunk_x..region.max_chunk_x).contains(&chunk_x)
+                        && (region.min_chunk_y..region.max_chunk_y).contains(&chunk_y)
+                });
+                out.push(u8::from(focused));
             }
         }
         out
@@ -233,6 +252,12 @@ impl TourWorld {
     }
     pub fn reset_done(&self) -> bool {
         !self.world.reset_in_progress()
+    }
+    pub fn focus_regions(&self) -> u32 {
+        self.world
+            .active_focus_regions()
+            .count()
+            .min(u32::MAX as usize) as u32
     }
 }
 
