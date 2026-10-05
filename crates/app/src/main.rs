@@ -3,8 +3,11 @@
 //! GPU objects for the cell texture and pipeline are created once. The swapchain
 //! is reconfigured only when the physical size changes to a non-zero value.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+
+use image::ImageEncoder;
 
 use cascade_app::{
     BRUSH_CELLS_PER_FRAME, CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord, DEMO_HEIGHT, DEMO_WIDTH,
@@ -22,6 +25,15 @@ use winit::window::{Window, WindowId};
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const FRAME_SAMPLES: usize = 240;
 
+struct ScreenshotReadback {
+    buffer: wgpu::Buffer,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    format: wgpu::TextureFormat,
+}
+
 struct Gpu {
     window: Arc<Window>,
     instance: wgpu::Instance,
@@ -30,6 +42,7 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     configured_size: (u32, u32),
+    initial_size: (u32, u32),
     surface_reconfigures: u32,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -112,11 +125,14 @@ struct App {
     skip_occluded: u32,
     skip_outdated: u32,
     smoke: Option<Smoke>,
+    screenshot_path: Option<PathBuf>,
+    screenshot_resize_requested: bool,
+    screenshot_written: bool,
     exit_code: i32,
 }
 
 fn main() {
-    let (smoke, world_size) = match parse_args() {
+    let (smoke, world_size, screenshot_path) = match parse_args() {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
@@ -131,7 +147,7 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(smoke, world_size);
+    let mut app = App::new(smoke, world_size, screenshot_path);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("event loop stopped: {error}");
         std::process::exit(1);
@@ -151,14 +167,20 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     builder.build()
 }
 
-fn parse_args() -> Result<(bool, u32), String> {
+fn parse_args() -> Result<(bool, u32, Option<PathBuf>), String> {
     let mut smoke = false;
     let mut world_size = DEMO_WIDTH;
+    let mut screenshot_path = None;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--smoke" => smoke = true,
+            "--screenshot" => {
+                let value = args.get(index + 1).ok_or("missing path for --screenshot")?;
+                screenshot_path = Some(PathBuf::from(value));
+                index += 1;
+            }
             "--world-size" => {
                 let value = args
                     .get(index + 1)
@@ -176,7 +198,7 @@ fn parse_args() -> Result<(bool, u32), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "cascade-app [--smoke] [--world-size N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. Drag to pan. Scroll to zoom. --smoke prepares the mixed fixture, checks a sampled pixel, exercises pan/zoom/resize, and runs paired bounded/traditional overloads before exit.",
+                    "cascade-app [--smoke] [--world-size N] [--screenshot PATH]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. Drag to pan. Scroll to zoom. --smoke prepares the mixed fixture, checks a sampled pixel, exercises pan/zoom/resize, and runs paired bounded/traditional overloads before exit. --screenshot writes a PNG from GPU readback after the measured smoke frames and requires --smoke.",
                     cascade_app::MAX_WORLD_AXIS
                 );
                 std::process::exit(0);
@@ -185,11 +207,14 @@ fn parse_args() -> Result<(bool, u32), String> {
         }
         index += 1;
     }
-    Ok((smoke, world_size))
+    if screenshot_path.is_some() && !smoke {
+        return Err("--screenshot requires --smoke".to_string());
+    }
+    Ok((smoke, world_size, screenshot_path))
 }
 
 impl App {
-    fn new(smoke: bool, world_size: u32) -> Self {
+    fn new(smoke: bool, world_size: u32, screenshot_path: Option<PathBuf>) -> Self {
         let mut demo = match Demo::new_with_size(world_size, world_size) {
             Ok(demo) => demo,
             Err(error) => {
@@ -261,6 +286,9 @@ impl App {
                 traditional_armed: false,
                 failed: None,
             }),
+            screenshot_path,
+            screenshot_resize_requested: false,
+            screenshot_written: false,
             exit_code: 0,
         }
     }
@@ -594,6 +622,21 @@ impl App {
             show_overlay(&egui_ctx, &overlay, &mut actions);
         });
         self.apply_overlay_actions(actions);
+        let screenshot_path = if self.screenshot_path.is_some()
+            && !self.screenshot_written
+            && self
+                .smoke
+                .as_ref()
+                .is_some_and(|smoke| smoke.settled_printed && smoke.hold_frames >= 5)
+            && self
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.configured_size == gpu.initial_size)
+        {
+            self.screenshot_path.clone()
+        } else {
+            None
+        };
         let gpu = self.gpu.as_mut().expect("gpu still present");
         gpu.egui_state
             .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -660,6 +703,48 @@ impl App {
             gpu.egui_renderer
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen);
         }
+        let screenshot = screenshot_path.map(|path| {
+            let width = gpu.config.width;
+            let height = gpu.config.height;
+            let unpadded_bytes_per_row = width * 4;
+            let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(alignment) * alignment;
+            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("smoke-screenshot-readback"),
+                size: u64::from(padded_bytes_per_row) * u64::from(height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            ScreenshotReadback {
+                buffer,
+                path,
+                width,
+                height,
+                padded_bytes_per_row,
+                format: gpu.config.format,
+            }
+        });
         gpu.queue.submit(
             user_cmds
                 .into_iter()
@@ -668,6 +753,20 @@ impl App {
         self.submit_cpu_ms = submit_started.elapsed().as_secs_f32() * 1000.0;
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        if let Some(readback) = screenshot {
+            match save_screenshot(&gpu.device, readback) {
+                Ok(bytes) => {
+                    self.screenshot_written = true;
+                    if let Some(path) = &self.screenshot_path {
+                        println!("SMOKE_SCREENSHOT {} bytes={bytes}", path.display());
+                    }
+                }
+                Err(error) => {
+                    self.fail(event_loop, error);
+                    return;
+                }
+            }
+        }
         for id in &full_output.textures_delta.free {
             gpu.egui_renderer.free_texture(id);
         }
@@ -777,6 +876,17 @@ impl App {
             // The smoke-only synchronous GPU readback must not contaminate frame intervals.
             self.last_present = None;
         }
+        if smoke.settled_printed
+            && self.screenshot_path.is_some()
+            && !self.screenshot_resize_requested
+        {
+            self.screenshot_resize_requested = true;
+            if let Some(gpu) = self.gpu.as_ref() {
+                let _ = gpu
+                    .window
+                    .request_inner_size(PhysicalSize::new(gpu.initial_size.0, gpu.initial_size.1));
+            }
+        }
         if !smoke.ready_printed {
             smoke.ready_printed = true;
             println!("SMOKE_READY");
@@ -868,6 +978,7 @@ impl App {
         let failed = smoke.failed.clone();
         let finish = smoke.settled_printed
             && smoke.hold_frames >= 45
+            && (self.screenshot_path.is_none() || self.screenshot_written)
             && failed.is_none()
             && !smoke.result_printed;
         if finish {
@@ -1152,7 +1263,11 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        match create_gpu(event_loop, self.demo.dimensions()) {
+        match create_gpu(
+            event_loop,
+            self.demo.dimensions(),
+            self.screenshot_path.is_some(),
+        ) {
             Ok(gpu) => {
                 let viewport = (gpu.config.width as f32, gpu.config.height as f32);
                 self.camera.fit(self.demo.dimensions(), viewport);
@@ -1172,7 +1287,11 @@ impl ApplicationHandler for App {
     }
 }
 
-fn create_gpu(event_loop: &ActiveEventLoop, world: (u32, u32)) -> Result<Gpu, String> {
+fn create_gpu(
+    event_loop: &ActiveEventLoop,
+    world: (u32, u32),
+    capture_surface: bool,
+) -> Result<Gpu, String> {
     let attributes = Window::default_attributes()
         .with_title("Cascade")
         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
@@ -1219,7 +1338,20 @@ fn create_gpu(event_loop: &ActiveEventLoop, world: (u32, u32)) -> Result<Gpu, St
     {
         config.present_mode = wgpu::PresentMode::Fifo;
     }
-    config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    if capture_surface
+        && (!capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC)
+            || !matches!(
+                config.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+            ))
+    {
+        return Err("surface does not support RGBA8 screenshot readback".to_string());
+    }
+    config.usage = if capture_surface {
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+    } else {
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+    };
     surface.configure(&device, &config);
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1344,6 +1476,7 @@ fn create_gpu(event_loop: &ActiveEventLoop, world: (u32, u32)) -> Result<Gpu, St
         device,
         queue,
         configured_size: (config.width, config.height),
+        initial_size: (config.width, config.height),
         surface_reconfigures: 1,
         config,
         pipeline,
@@ -1420,6 +1553,76 @@ fn color_attachment<'a>(
             store: wgpu::StoreOp::Store,
         },
     }
+}
+
+fn save_screenshot(device: &wgpu::Device, screenshot: ScreenshotReadback) -> Result<u64, String> {
+    let slice = screenshot.buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| format!("screenshot poll: {error}"))?;
+    receiver
+        .recv()
+        .map_err(|error| format!("screenshot map channel: {error}"))?
+        .map_err(|error| format!("screenshot map: {error}"))?;
+
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|error| format!("screenshot mapped view: {error}"))?;
+    let row_bytes = screenshot.width as usize * 4;
+    let padded_row_bytes = screenshot.padded_bytes_per_row as usize;
+    let mut rgba = Vec::with_capacity(row_bytes * screenshot.height as usize);
+    for row in mapped
+        .chunks_exact(padded_row_bytes)
+        .take(screenshot.height as usize)
+    {
+        for pixel in row[..row_bytes].as_chunks::<4>().0 {
+            match screenshot.format {
+                wgpu::TextureFormat::Bgra8Unorm => {
+                    rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+                wgpu::TextureFormat::Rgba8Unorm => rgba.extend_from_slice(pixel),
+                _ => {
+                    return Err(format!(
+                        "unsupported screenshot format: {:?}",
+                        screenshot.format
+                    ));
+                }
+            }
+        }
+    }
+    drop(mapped);
+    screenshot.buffer.unmap();
+
+    if let Some(parent) = screenshot
+        .path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create screenshot directory: {error}"))?;
+    }
+    let file = std::fs::File::create(&screenshot.path)
+        .map_err(|error| format!("create screenshot: {error}"))?;
+    let encoder = image::codecs::png::PngEncoder::new_with_quality(
+        file,
+        image::codecs::png::CompressionType::Best,
+        image::codecs::png::FilterType::Adaptive,
+    );
+    encoder
+        .write_image(
+            &rgba,
+            screenshot.width,
+            screenshot.height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| format!("encode screenshot PNG: {error}"))?;
+    std::fs::metadata(&screenshot.path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("stat screenshot: {error}"))
 }
 
 fn stored_pixel(format: wgpu::TextureFormat, rgba: [u8; 4]) -> [u8; 4] {

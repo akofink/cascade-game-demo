@@ -11,6 +11,7 @@ cascade-sim = { path = "../sim" }
 egui = "0.36.2"
 egui-wgpu = "0.36.2"
 egui-winit = "0.36.2"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "1.0.1"
 toml = "0.9"
 wgpu = "30.0.1"
