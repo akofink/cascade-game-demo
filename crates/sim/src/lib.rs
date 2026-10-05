@@ -156,6 +156,8 @@ pub struct ResourceTable {
     pub pending_bytes: usize,
     pub captured_frontier_bytes: usize,
     pub ready_bytes: usize,
+    pub focus_ready_bytes: usize,
+    pub action_record_bytes: usize,
     pub command_bytes: usize,
     pub chunk_bytes: usize,
     pub total_bytes: usize,
@@ -217,9 +219,19 @@ impl FocusRegion {
 pub struct ActionRecord {
     pub sequence: u64,
     pub admitted_slice: u64,
+    pub action_applied_slice: Option<u64>,
     pub first_effect_slice: Option<u64>,
     pub local_settle_slice: Option<u64>,
     pub target: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FocusRegionView {
+    pub min_chunk_x: u32,
+    pub min_chunk_y: u32,
+    pub max_chunk_x: u32,
+    pub max_chunk_y: u32,
+    pub remaining_slices: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -527,8 +539,29 @@ impl World {
     pub fn service_shares(&self) -> ServiceShares {
         self.shares
     }
+    pub fn active_focus_regions(&self) -> impl Iterator<Item = FocusRegionView> + '_ {
+        self.focus_regions.iter().filter_map(|region| {
+            (self.focus_enabled && region.expires_after > self.slice).then_some(FocusRegionView {
+                min_chunk_x: region.min_x,
+                min_chunk_y: region.min_y,
+                max_chunk_x: region.max_x,
+                max_chunk_y: region.max_y,
+                remaining_slices: region.expires_after.saturating_sub(self.slice),
+            })
+        })
+    }
     pub fn action_records(&self) -> impl Iterator<Item = ActionRecord> + '_ {
         self.action_records.iter().flatten().copied()
+    }
+    pub fn latest_action_sequence(&self) -> Option<u64> {
+        (self.action_sequence > 0).then_some(self.action_sequence)
+    }
+    pub fn action_record(&self, sequence: u64) -> Option<ActionRecord> {
+        self.action_records
+            .iter()
+            .flatten()
+            .find(|record| record.sequence == sequence)
+            .copied()
     }
     fn chunk_xy(&self, id: CellId) -> (u32, u32) {
         let x = id.0 % self.width;
@@ -554,7 +587,7 @@ impl World {
             min_y: y.saturating_sub(1),
             max_x: (x + 2).min(self.chunks_x),
             max_y: (y + 2).min(self.chunks_y),
-            expires_after: self.slice.saturating_add(lifetime.max(1) as u64),
+            expires_after: self.slice.saturating_add(lifetime.max(1) as u64 + 1),
         };
         let slot = self
             .focus_regions
@@ -640,11 +673,13 @@ impl World {
             cell_bytes: std::mem::size_of::<Cell>(),
             pending_bytes: self.pending.len() * std::mem::size_of::<PendingCell>(),
             captured_frontier_bytes: self.captured_frontier.len(),
-            ready_bytes: (self.eval_ready.slots.len()
-                + self.blast_ready.slots.len()
-                + self.focus_eval_ready.slots.len()
+            ready_bytes: (self.eval_ready.slots.len() + self.blast_ready.slots.len())
+                * std::mem::size_of::<Option<Job>>(),
+            focus_ready_bytes: (self.focus_eval_ready.slots.len()
                 + self.focus_blast_ready.slots.len())
                 * std::mem::size_of::<Option<Job>>(),
+            action_record_bytes: self.action_records.len()
+                * std::mem::size_of::<Option<ActionRecord>>(),
             command_bytes: self.commands.slots.len() * std::mem::size_of::<Option<Command>>(),
             chunk_bytes: self.dirty_chunks.len() * std::mem::size_of::<bool>(),
             total_bytes: self.cells.len() * std::mem::size_of::<Cell>()
@@ -713,6 +748,21 @@ impl World {
         if self.fixture.is_some() || self.fixture_waiting.is_some() {
             return SubmitResult::FixtureInProgress;
         }
+        if let Command::FocusViewport {
+            min_chunk_x,
+            min_chunk_y,
+            max_chunk_x,
+            max_chunk_y,
+            ..
+        } = command
+            && (min_chunk_x >= max_chunk_x
+                || min_chunk_y >= max_chunk_y
+                || min_chunk_x >= self.chunks_x
+                || min_chunk_y >= self.chunks_y)
+        {
+            self.rejected_commands += 1;
+            return SubmitResult::RejectedFull;
+        }
         let target = match command {
             Command::Paint { cell, .. }
             | Command::Ignite { cell }
@@ -746,6 +796,7 @@ impl World {
                 return SubmitResult::RejectedFull;
             }
             self.coalesced_commands += 1;
+            self.register_action(cell);
             return SubmitResult::Coalesced;
         }
         match self.commands.push_index(command) {
@@ -1102,6 +1153,7 @@ impl World {
         self.action_records[self.action_cursor] = Some(ActionRecord {
             sequence: self.action_sequence,
             admitted_slice: self.slice.saturating_add(1),
+            action_applied_slice: None,
             first_effect_slice: None,
             local_settle_slice: None,
             target: cell.0,
@@ -1114,7 +1166,11 @@ impl World {
             let target = record.target;
             let (tx, ty) = (target % self.width, target / self.width);
             let (x, y) = (cell.0 % self.width, cell.0 / self.width);
-            if tx.abs_diff(x) <= 1 && ty.abs_diff(y) <= 1 && record.first_effect_slice.is_none() {
+            if tx.abs_diff(x) <= 1
+                && ty.abs_diff(y) <= 1
+                && record.action_applied_slice.is_some()
+                && record.first_effect_slice.is_none()
+            {
                 record.first_effect_slice = Some(slice);
             }
         }
@@ -1145,6 +1201,14 @@ impl World {
             }
         }
     }
+    fn note_action_applied(&mut self, cell: CellId) {
+        let slice = self.slice.saturating_add(1);
+        for record in self.action_records.iter_mut().flatten() {
+            if record.target == cell.0 && record.action_applied_slice.is_none() {
+                record.action_applied_slice = Some(slice);
+            }
+        }
+    }
     fn set_focus_region(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32, lifetime: u16) {
         if !self.focus_enabled {
             return;
@@ -1154,7 +1218,7 @@ impl World {
             min_y: min_y.min(self.chunks_y),
             max_x: max_x.min(self.chunks_x),
             max_y: max_y.min(self.chunks_y),
-            expires_after: self.slice.saturating_add(lifetime.max(1) as u64),
+            expires_after: self.slice.saturating_add(lifetime.max(1) as u64 + 1),
         };
         if region.min_x >= region.max_x || region.min_y >= region.max_y {
             return;
@@ -1175,6 +1239,7 @@ impl World {
     fn execute_command(&mut self, command: Command) {
         match command {
             Command::Paint { cell, material } => {
+                self.note_action_applied(cell);
                 self.focus_cell(cell, 8);
                 self.set_material(cell, material);
                 self.mark_pending(cell, true);
@@ -1182,10 +1247,12 @@ impl World {
                 self.wake_neighbors(cell);
             }
             Command::Ignite { cell } => {
+                self.note_action_applied(cell);
                 self.focus_cell(cell, 8);
                 let _ = self.ignite(cell);
             }
             Command::Detonate { cell, energy } => {
+                self.note_action_applied(cell);
                 self.focus_cell(cell, 8);
                 let _ = self.trigger_blast(cell, energy);
             }
@@ -1449,12 +1516,6 @@ impl World {
                 if let Command::Paint { cell, .. } = c {
                     self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
                 }
-                if let Command::Paint { cell, .. }
-                | Command::Ignite { cell }
-                | Command::Detonate { cell, .. } = c
-                {
-                    self.note_action_effect(cell);
-                }
                 self.execute_command(c);
                 m.commands += 1;
             } else {
@@ -1565,15 +1626,19 @@ impl World {
             if captured & CAPTURED_EVAL != 0 {
                 metrics.charged += self.costs.selection.0 + self.costs.evaluate.0;
                 metrics.selections += 1;
+                self.note_action_effect(id);
                 self.execute_evaluate_captured(id);
                 metrics.evaluations += 1;
+                metrics.background_evaluations += 1;
             }
             let blast = captured & CAPTURED_BLAST;
             if blast > 0 {
                 metrics.charged += self.costs.selection.0 + self.costs.blast.0;
                 metrics.selections += 1;
+                self.note_action_effect(id);
                 self.execute_blast_captured(id, blast);
                 metrics.blasts += 1;
+                metrics.background_blasts += 1;
             }
         }
 
@@ -1585,12 +1650,6 @@ impl World {
             metrics.selections += 1;
             if let Command::Paint { cell, .. } = command {
                 self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
-            }
-            if let Command::Paint { cell, .. }
-            | Command::Ignite { cell }
-            | Command::Detonate { cell, .. } = command
-            {
-                self.note_action_effect(cell);
             }
             self.execute_command(command);
             metrics.commands += 1;
@@ -1861,6 +1920,10 @@ mod tests {
             background > 0,
             "background work must progress under sustained focus demand"
         );
+        assert!(
+            background * 100 >= (background + focus) * 20,
+            "background share must meet its configured minimum"
+        );
     }
 
     #[test]
@@ -1883,6 +1946,19 @@ mod tests {
         assert_eq!(run(), run());
         let mut w = world(64, 64, 128, 16, 8);
         w.set_focus_region(0, 0, 1, 1, 2);
+        let view = w.active_focus_regions().next().unwrap();
+        assert_eq!(
+            (
+                view.min_chunk_x,
+                view.min_chunk_y,
+                view.max_chunk_x,
+                view.max_chunk_y
+            ),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(view.remaining_slices, 3);
+        assert!(w.is_focused(CellId(0)));
+        w.step();
         assert!(w.is_focused(CellId(0)));
         w.step();
         assert!(w.is_focused(CellId(0)));
@@ -1925,6 +2001,7 @@ mod tests {
         }
         let record = w.action_records().next().unwrap();
         assert_eq!(record.admitted_slice, admitted);
+        assert!(record.action_applied_slice.is_some());
         assert!(record.first_effect_slice.is_some());
         assert!(record.local_settle_slice.is_some());
     }
@@ -2051,7 +2128,7 @@ mod tests {
         assert_eq!(resources.cell_bytes, 2);
         assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
         assert_eq!(resources.captured_frontier_bytes, 4096 * 4096);
-        assert_eq!(resources.total_bytes, 102_272_000);
+        assert_eq!(resources.total_bytes, 102_276_096);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
