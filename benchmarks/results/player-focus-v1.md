@@ -12,6 +12,8 @@ cargo +1.99.0 run --release -p cascade-bench -- \
 
 Code revision: `a566f2d` (benchmark runner on merged simulator `793ed4a`, including its bounded execution-visualization path).
 
+Before and after the command, record `uptime`'s 1-minute load average. Accept timing only if both are below about 3; include both values with every policy row. Discard the capture if either exceeds the threshold.
+
 Reference machine: MacBook Air (Mac14,2), Apple M2, 16 GB RAM, macOS 27.0.1, Rust/Cargo 1.99.0. The existing reference profile reports a 1,000,000-credit allowance. Each policy started from a newly prepared `mixed-overload-v1` world. Preparation is excluded from measurement. The scripted stream admitted 64 player actions at eight-slice intervals (paint wood, ignite, paint explosive, detonate, repeat) at a deterministic center-region sequence, and one seeded background disturbance every four slices (fixture seed XOR `0x5a110ad5f00d0001`). Action wall latency is host monotonic elapsed time from command admission until the benchmark observes the first-effect/settle record; it includes fixed benchmark polling overhead. Each row is one 512-slice run, with no repetitions or warm-up.
 
 ## Results
