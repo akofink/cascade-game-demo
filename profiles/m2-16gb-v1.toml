@@ -1,0 +1,24 @@
+# Provisional reference-machine headless profile; calibrated 2026-10-05.
+# This is not an interactive frame-latency or full-size fixture certification.
+version = 1
+name = "m2-16gb-headless"
+reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
+credits_per_slice = 4096
+ready_capacity_per_lane = 32768
+command_capacity = 256
+calibration_fixture = "mixed-overload-v1"
+calibration_dimensions = [256, 256]
+calibration_slices = 1800
+calibration_repetitions = 1
+calibration_disturbances = 14400
+calibration_disturbances_per_slice = 8
+slice_p99_ns = 4375
+slice_max_ns = 5625
+budget_target_ns = 4000000
+warmup_slices = 0
+
+# Calibration fixture and conditions are intentionally recorded here. The separate
+# section-12 fixture suite is held out and is not used to select the credit count.
+# Tiny calibration dimensions and one repetition are a pilot only; profile status
+# remains provisional pending 60 s captures and full-size workload testing.
+status = "provisional"
