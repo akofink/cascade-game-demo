@@ -10,10 +10,12 @@ use std::time::Instant;
 use image::ImageEncoder;
 
 use cascade_app::{
-    BRUSH_CELLS_PER_FRAME, CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord, DEMO_HEIGHT, DEMO_WIDTH,
-    Demo, FrameHistory, MAX_CHUNKS_PER_FRAME, OverlayActions, OverlayInput, PALETTE, PolicyChoice,
-    SurfaceChange, UploadBudget, UploadPlan, UploadScheduler, ViewCommand, apply_command,
-    bytes_per_chunk, frame_uniform, show_overlay, surface_change, zoom_factor,
+    Ack, AckState, ActionKind, BRUSH_CELLS_PER_FRAME, CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord,
+    DEMO_HEIGHT, DEMO_WIDTH, Demo, Feel, FocusKind, FocusRect, FrameHistory, MAX_CHUNKS_PER_FRAME,
+    OverlayActions, OverlayInput, PALETTE, PlayerMark, PolicyChoice, SurfaceChange, UploadBudget,
+    UploadPlan, UploadScheduler, ViewCommand, apply_command, apply_focus_policy, brush_cells,
+    brush_radius_cells, bytes_per_chunk, clamped_zoom_lines, draw_player_marks, focus_linked,
+    frame_uniform, presented_byte, show_overlay, submit_viewport, surface_change, zoom_factor,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -111,14 +113,19 @@ struct App {
     submit_cpu_ms: f32,
     last_plan: UploadPlan,
     destroy_presses: u64,
-    destroy_started: bool,
+    destroy_press_at: Option<Instant>,
+    deferred_user_set: bool,
     occluded: bool,
     seeded: bool,
-    dragging: bool,
     painting: bool,
+    panning: bool,
+    pan_origin: Option<(f32, f32)>,
     shift_down: bool,
+    key_pan: (bool, bool, bool, bool),
     brush_commands_this_frame: usize,
     last_cursor: Option<(f32, f32)>,
+    last_paint_cell: Option<(i32, i32)>,
+    feel: Feel,
     outdated_handled: bool,
     surface_rebuilds: u32,
     skip_timeout: u32,
@@ -146,7 +153,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(smoke, world_size, screenshot_path);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("event loop stopped: {error}");
@@ -247,14 +254,19 @@ impl App {
             submit_cpu_ms: 0.0,
             last_plan: UploadPlan::default(),
             destroy_presses: 0,
-            destroy_started: false,
+            destroy_press_at: None,
+            deferred_user_set: false,
             occluded: false,
             seeded: false,
-            dragging: false,
             painting: false,
+            panning: false,
+            pan_origin: None,
             shift_down: false,
+            key_pan: (false, false, false, false),
             brush_commands_this_frame: 0,
             last_cursor: None,
+            last_paint_cell: None,
+            feel: Feel::new(chunks_x, chunks_y),
             outdated_handled: false,
             surface_rebuilds: 0,
             skip_timeout: 0,
@@ -304,7 +316,6 @@ impl App {
     }
 
     fn apply_overlay_actions(&mut self, actions: OverlayActions) {
-        let mut restart_disturbance = false;
         if actions.toggle_pause {
             self.demo.toggle_paused();
         }
@@ -339,63 +350,71 @@ impl App {
         {
             eprintln!("restart fixture with adjusted credits: {error}");
         }
-        if actions.toggle_policy {
-            let previous = self.demo.policy();
-            let next = match previous {
-                PolicyChoice::Bounded => PolicyChoice::Traditional,
-                PolicyChoice::Traditional => PolicyChoice::Bounded,
-            };
-            self.demo.set_destroy_held(false);
-            self.destroy_started = false;
-            self.demo.set_policy(next);
-            if let Err(error) = self.demo.start_fixture() {
-                self.demo.set_policy(previous);
-                eprintln!("restart fixture under other policy: {error}");
-            } else {
-                self.history = FrameHistory::default();
-                self.last_present = None;
-                self.demo.set_destroy_held(true);
-                self.destroy_started = true;
-                restart_disturbance = true;
-            }
+        if let Some(policy) = actions.policy {
+            self.restart_policy(policy);
         }
         if let Some(show) = actions.deferred_overlay
             && self.deferred_overlay != show
         {
+            self.deferred_user_set = true;
             self.deferred_overlay = show;
             self.uploads.mark_all();
+            self.feel.note_feedback(self.now_ns());
         }
-        if !restart_disturbance {
-            self.demo.set_destroy_held(actions.destroy_held);
-        }
-        if actions.destroy_held && !self.destroy_started {
-            let mixed = cascade_sim::fixtures::FixtureId::MixedOverload;
-            let already_preparing_mixed =
-                self.demo
-                    .metrics()
-                    .fixture_progress
-                    .is_some_and(|progress| {
-                        progress
-                            .descriptor
-                            .is_some_and(|descriptor| descriptor.id == mixed)
-                            && !progress.complete
-                            && !progress.cancelled
-                    });
-            if already_preparing_mixed {
-                self.destroy_started = true;
-            } else {
-                self.demo.cancel_fixture();
-                self.demo.select_fixture(mixed);
-                if self.demo.start_fixture().is_ok() {
-                    self.destroy_started = true;
-                }
+        if actions.destroy_pointer {
+            if self.destroy_press_at.is_none() {
+                self.destroy_press_at = Some(Instant::now());
             }
-        } else if !actions.destroy_held && !restart_disturbance {
-            self.destroy_started = false;
+            self.demo.set_destroy_held(true);
+            self.prefer_deferred_story();
+            self.feel.note_feedback(self.now_ns());
+        } else {
+            self.demo.set_destroy_held(false);
+            if actions.destroy_clicked {
+                let short = self.destroy_press_at.is_none_or(|started| {
+                    started.elapsed() < std::time::Duration::from_millis(280)
+                });
+                if short {
+                    self.demo.toggle_destroy_latch();
+                    self.prefer_deferred_story();
+                }
+                self.destroy_presses = self.destroy_presses.saturating_add(1);
+                self.destroy_press_at = None;
+                self.feel.note_feedback(self.now_ns());
+            }
         }
-        if actions.destroy_pressed {
-            self.destroy_presses = self.destroy_presses.saturating_add(1);
+    }
+
+    fn restart_policy(&mut self, policy: PolicyChoice) {
+        if policy == PolicyChoice::BoundedFocus && !focus_linked() {
+            return;
         }
+        let previous = self.demo.policy();
+        self.demo.set_destroy_held(false);
+        self.demo.set_policy(policy);
+        if let Err(error) = self.demo.start_fixture() {
+            self.demo.set_policy(previous);
+            apply_focus_policy(self.demo.world_mut(), previous.focus_enabled());
+            eprintln!("restart fixture under {}: {error}", policy.name());
+            return;
+        }
+        self.history = FrameHistory::default();
+        self.last_present = None;
+        if !self.demo.destroy_latched() {
+            self.demo.toggle_destroy_latch();
+        }
+        self.prefer_deferred_story();
+    }
+
+    fn prefer_deferred_story(&mut self) {
+        if !self.deferred_user_set && !self.deferred_overlay {
+            self.deferred_overlay = true;
+            self.uploads.mark_all();
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.clock_origin.elapsed().as_nanos() as u64
     }
 
     fn apply_size(&mut self, requested: (u32, u32)) {
@@ -449,6 +468,8 @@ impl App {
             .uploads
             .plan(bytes_per_chunk(1), UploadBudget::default());
         if let Some(gpu) = self.gpu.as_ref() {
+            let mut exempt = [(0_u32, 0_u32); 64];
+            let exempt_len = self.feel.exempt_cells(&mut exempt);
             for chunk in &plan.chunks[..plan.count] {
                 write_chunk(
                     &gpu.queue,
@@ -456,8 +477,39 @@ impl App {
                     self.demo.world(),
                     *chunk,
                     self.deferred_overlay,
+                    &exempt[..exempt_len],
                 );
             }
+            let mut uploaded = [(0_u32, 0_u32); MAX_CHUNKS_PER_FRAME];
+            for (index, chunk) in plan.chunks[..plan.count].iter().enumerate() {
+                uploaded[index] = (chunk.x, chunk.y);
+            }
+            let mut uploaded_len = plan.count;
+            let mut targets = [(0_u32, 0_u32); 16];
+            let target_len = self.demo.player_targets(&mut targets);
+            for &(x, y) in &targets[..target_len] {
+                if uploaded_len == uploaded.len() {
+                    break;
+                }
+                let chunk = (x / CHUNK_SIZE, y / CHUNK_SIZE);
+                if uploaded[..uploaded_len].contains(&chunk) {
+                    continue;
+                }
+                write_chunk(
+                    &gpu.queue,
+                    &gpu.grid_texture,
+                    self.demo.world(),
+                    ChunkCoord {
+                        x: chunk.0,
+                        y: chunk.1,
+                    },
+                    self.deferred_overlay,
+                    &exempt[..exempt_len],
+                );
+                uploaded[uploaded_len] = chunk;
+                uploaded_len += 1;
+            }
+            self.feel.note_uploads(&uploaded[..uploaded_len]);
         }
         self.upload_cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
         if let Some(smoke) = self.smoke.as_mut() {
@@ -562,6 +614,7 @@ impl App {
         let Some(frame) = self.acquire_frame(event_loop) else {
             return;
         };
+        self.apply_held_keys();
         let before_step = self.demo.metrics().slice;
         self.pre_step_pending = before_step.pending_cells;
         self.pre_step_ready = before_step.ready_len;
@@ -569,6 +622,14 @@ impl App {
         self.demo.tick();
         self.sim_cpu_ms = sim_started.elapsed().as_secs_f32() * 1000.0;
         self.upload_dirty();
+        self.update_focus_regions();
+        let viewport = self.viewport().unwrap_or((1.0, 1.0));
+        let story = self.story_line();
+        let surface_reconfigures = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.surface_reconfigures)
+            .unwrap_or(0);
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -583,6 +644,7 @@ impl App {
         let pending_count = self.history.copy_pending(&mut pending_samples);
         let summary = self.history.summary();
         let overlay = OverlayInput {
+            viewport,
             world,
             summary,
             intervals_ns: &intervals[..interval_count],
@@ -595,13 +657,21 @@ impl App {
             stale: self.last_plan.stale,
             uploaded_chunks: self.last_plan.count,
             payload_bytes: self.last_plan.payload_bytes,
-            surface_reconfigures: gpu.surface_reconfigures,
+            surface_reconfigures,
             destroy_presses: self.destroy_presses,
             sim: self.demo.metrics(),
             material: self.demo.selected_material(),
             credits: self.demo.credits(),
             credit_draft: self.credit_draft,
             deferred_overlay: self.deferred_overlay,
+            camera_latency: self.feel.camera_summary(),
+            paint_latency: self.feel.paint_summary(),
+            ignite_latency: self.feel.ignite_summary(),
+            detonate_latency: self.feel.detonate_summary(),
+            pending_actions: self.feel.pending_count(),
+            focus_linked: focus_linked(),
+            focus_enabled: self.demo.policy().focus_enabled(),
+            story,
         };
 
         let egui_ctx = gpu.egui_state.egui_ctx().clone();
@@ -618,7 +688,29 @@ impl App {
         gpu.egui_inited = true;
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         let mut actions = OverlayActions::default();
+        let mut mark_acks = [None; 64];
+        for (ack_len, ack) in self.feel.acks().enumerate() {
+            if ack_len == mark_acks.len() {
+                break;
+            }
+            mark_acks[ack_len] = Some(*ack);
+        }
+        let mut mark_focus = [None; 8];
+        for (focus_len, rect) in self.feel.focus_rects().enumerate() {
+            if focus_len == mark_focus.len() {
+                break;
+            }
+            mark_focus[focus_len] = Some(rect);
+        }
+        let show_focus = self.demo.policy().focus_enabled() || !focus_linked();
         let mut full_output = egui_ctx.run_ui(raw_input, |_| {
+            draw_player_marks(
+                &egui_ctx,
+                &self.camera,
+                mark_acks.iter().flatten().copied(),
+                mark_focus.iter().copied().flatten(),
+                show_focus,
+            );
             show_overlay(&egui_ctx, &overlay, &mut actions);
         });
         self.apply_overlay_actions(actions);
@@ -783,6 +875,7 @@ impl App {
     }
 
     fn after_present(&mut self, event_loop: &ActiveEventLoop) {
+        self.finish_presented_frame();
         let Some(mut smoke) = self.smoke.take() else {
             return;
         };
@@ -794,6 +887,7 @@ impl App {
         } else {
             &mut smoke.bounded
         };
+        let mut script_this_frame = false;
         if (1..120).contains(&run.frames) {
             run.last_pending = sim_metrics.slice.pending_cells;
             run.max_pending = run
@@ -810,15 +904,37 @@ impl App {
             run.max_frame_interval_ns = run.max_frame_interval_ns.max(summary.max_ns);
             run.p99_frame_interval_ns = summary.p99_ns;
             run.frames += 1;
+            script_this_frame = run.frames.is_multiple_of(10) && run.frames < 120;
             if run.frames == 120 {
+                let label = if is_traditional {
+                    "traditional"
+                } else {
+                    "bounded-fifo"
+                };
+                print_feel(label, &self.feel);
+                if !is_traditional {
+                    self.feel.clear_latencies();
+                }
                 self.demo.set_destroy_held(false);
+                if is_traditional && !self.demo.destroy_latched() {
+                    self.demo.toggle_destroy_latch();
+                }
             }
+        }
+        if script_this_frame {
+            let step = if is_traditional {
+                smoke.traditional.frames / 10
+            } else {
+                smoke.bounded.frames / 10
+            };
+            self.scripted_player_action(step);
         }
         let fixture_complete = sim_metrics
             .fixture_progress
             .is_some_and(|progress| progress.complete);
         if fixture_complete && !smoke.bounded_armed {
             smoke.bounded_armed = true;
+            self.feel.clear_latencies();
             smoke.bounded.first_pending = sim_metrics.slice.pending_cells;
             smoke.bounded.last_pending = sim_metrics.slice.pending_cells;
             self.history = FrameHistory::default();
@@ -846,6 +962,7 @@ impl App {
             && !smoke.traditional_armed
         {
             smoke.traditional_armed = true;
+            self.feel.clear_latencies();
             let pending = self.demo.metrics().slice.pending_cells;
             smoke.traditional.first_pending = pending;
             smoke.traditional.last_pending = pending;
@@ -1141,6 +1258,239 @@ impl App {
         }
     }
 
+    fn apply_held_keys(&mut self) {
+        let Some(viewport) = self.viewport() else {
+            return;
+        };
+        let (left, right, up, down) = self.key_pan;
+        let dx = (f32::from(u8::from(right)) - f32::from(u8::from(left))) * 12.0;
+        let dy = (f32::from(u8::from(down)) - f32::from(u8::from(up))) * 12.0;
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        self.pan_pixels(dx, dy, viewport, self.demo.dimensions());
+    }
+
+    fn pan_pixels(&mut self, dx: f32, dy: f32, viewport: (f32, f32), world: (u32, u32)) {
+        apply_command(
+            &mut self.camera,
+            ViewCommand::PanPixels { dx, dy },
+            viewport,
+            world,
+        );
+        self.feel.note_feedback(self.now_ns());
+    }
+
+    fn story_line(&self) -> &'static str {
+        if self.demo.metrics().reset_in_progress
+            || self
+                .demo
+                .metrics()
+                .fixture_progress
+                .is_some_and(|progress| !progress.complete && !progress.cancelled)
+        {
+            "Preparing the world. Your clicks are acknowledged and wait."
+        } else if self.demo.destroy_active() {
+            "Destroy is on. Paint: the ring is yours, gold is the world still catching up."
+        } else {
+            "Click DESTROY PERFORMANCE, then paint. Your mark stays ahead of the world."
+        }
+    }
+
+    fn update_focus_regions(&mut self) {
+        let Some(viewport) = self.viewport() else {
+            return;
+        };
+        let (width, height) = self.demo.dimensions();
+        let chunks_x = width / CHUNK_SIZE;
+        let chunks_y = height / CHUNK_SIZE;
+        if chunks_x == 0 || chunks_y == 0 {
+            return;
+        }
+        let (x0, y0) = self.camera.world_at_pixel(0.0, 0.0);
+        let (x1, y1) = self.camera.world_at_pixel(viewport.0, viewport.1);
+        let min_chunk_x = chunk_index(x0, chunks_x);
+        let min_chunk_y = chunk_index(y0, chunks_y);
+        let max_chunk_x = chunk_index(x1, chunks_x).saturating_add(1).min(chunks_x);
+        let max_chunk_y = chunk_index(y1, chunks_y).saturating_add(1).min(chunks_y);
+        let mut rects = [FocusRect {
+            min_chunk_x,
+            min_chunk_y,
+            max_chunk_x,
+            max_chunk_y,
+            kind: FocusKind::Viewport,
+        }; 8];
+        let mut len = 1;
+        for ack in self.feel.acks() {
+            if len == rects.len() || ack.state != AckState::Pending {
+                continue;
+            }
+            let cx = ack.x / CHUNK_SIZE;
+            let cy = ack.y / CHUNK_SIZE;
+            rects[len] = FocusRect {
+                min_chunk_x: cx.saturating_sub(1),
+                min_chunk_y: cy.saturating_sub(1),
+                max_chunk_x: (cx + 2).min(chunks_x),
+                max_chunk_y: (cy + 2).min(chunks_y),
+                kind: FocusKind::Action,
+            };
+            len += 1;
+        }
+        self.feel.set_focus(&rects[..len]);
+        if focus_linked() && self.demo.policy().focus_enabled() {
+            submit_viewport(self.demo.world_mut(), rects[0]);
+        }
+    }
+
+    fn finish_presented_frame(&mut self) {
+        let present_ns = self.now_ns();
+        self.feel.finish_feedback(present_ns);
+        let mut checks = [(0_u32, 0_u32, 0_u8, 0_u8); 64];
+        let mut count = 0;
+        for ack in self.feel.acks() {
+            if count == checks.len() {
+                break;
+            }
+            if let Some(cell) = self.demo.world().cell(ack.x, ack.y) {
+                checks[count] = (ack.x, ack.y, cell.material as u8, cell.burning);
+                count += 1;
+            }
+        }
+        self.feel.observe_actions(present_ns, |x, y| {
+            checks[..count]
+                .iter()
+                .find(|cell| cell.0 == x && cell.1 == y)
+                .map(|cell| (cell.2, cell.3))
+        });
+    }
+
+    fn note_mark(&mut self, mark: PlayerMark) {
+        let state = if mark.admitted {
+            AckState::Pending
+        } else if mark.kind == ActionKind::Ignite {
+            AckState::NoEffect
+        } else {
+            AckState::Rejected
+        };
+        self.feel.admit(Ack {
+            kind: mark.kind,
+            x: mark.x,
+            y: mark.y,
+            state,
+            admitted_ns: self.now_ns(),
+            seen_stamp: self.feel.stamp_of(mark.x / CHUNK_SIZE, mark.y / CHUNK_SIZE),
+            baseline_material: mark.material,
+            baseline_burning: mark.burning,
+            paint_material: mark.paint_material,
+            visible_frames: 0,
+        });
+    }
+
+    fn stamp_brush(&mut self, cursor: Option<(f32, f32)>) {
+        let Some((px, py)) = cursor.or(self.last_cursor) else {
+            return;
+        };
+        let (wx, wy) = self.camera.world_at_pixel(px, py);
+        if wx < 0.0 || wy < 0.0 {
+            return;
+        }
+        let cell = (wx.floor() as i32, wy.floor() as i32);
+        let from = self.last_paint_cell.unwrap_or(cell);
+        let mut cells = [(0_u32, 0_u32); BRUSH_CELLS_PER_FRAME];
+        let remaining = BRUSH_CELLS_PER_FRAME.saturating_sub(self.brush_commands_this_frame);
+        let count = brush_cells(
+            from,
+            cell,
+            brush_radius_cells(self.camera.cells_per_pixel),
+            remaining,
+            &mut cells,
+        );
+        self.brush_commands_this_frame += count;
+        let mut marked = false;
+        for &(x, y) in &cells[..count] {
+            if let Some(mark) = self.demo.paint_at(x, y)
+                && mark.admitted
+                && !marked
+            {
+                self.note_mark(mark);
+                marked = true;
+            }
+        }
+        if count > 0
+            && !marked
+            && let Some(mark) = self
+                .demo
+                .paint_at(cell.0.max(0) as u32, cell.1.max(0) as u32)
+        {
+            self.note_mark(mark);
+        }
+        self.last_paint_cell = Some(cell);
+    }
+
+    fn scripted_player_action(&mut self, step: u32) {
+        let (width, height) = self.demo.dimensions();
+        let mark = match step % 3 {
+            0 => self
+                .demo
+                .paint_material_at(width / 8, height / 8, cascade_sim::Material::Stone),
+            1 => self.scripted_ignite(width, height),
+            _ => self.demo.detonate_at(width / 8 + 32, height / 8 + 32),
+        };
+        if let Some(mark) = mark {
+            println!(
+                "SMOKE_ACTION step={step} kind={} admitted={} rejected={} at={},{} baseline={}",
+                mark.kind.name(),
+                mark.admitted,
+                mark.rejected,
+                mark.x,
+                mark.y,
+                mark.material
+            );
+            self.note_mark(mark);
+        }
+        if let Some(viewport) = self.viewport() {
+            self.pan_pixels(1.0, 0.0, viewport, (width, height));
+        }
+    }
+
+    fn scripted_ignite(&mut self, width: u32, height: u32) -> Option<PlayerMark> {
+        let x0 = width / 8;
+        let y0 = height / 2 + height / 8;
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let x = x0 + dx;
+                let y = y0 + dy;
+                let wood = self.demo.world().cell(x, y).is_some_and(|cell| {
+                    cell.material == cascade_sim::Material::Wood && cell.burning == 0
+                });
+                if wood {
+                    return self.demo.ignite_at(x, y);
+                }
+            }
+        }
+        self.demo.ignite_at(x0, y0)
+    }
+
+    fn pointer_action(&mut self, detonate: bool) {
+        let Some((px, py)) = self.last_cursor else {
+            return;
+        };
+        let (wx, wy) = self.camera.world_at_pixel(px, py);
+        if wx < 0.0 || wy < 0.0 {
+            return;
+        }
+        let x = wx.floor() as u32;
+        let y = wy.floor() as u32;
+        let mark = if detonate {
+            self.demo.detonate_at(x, y)
+        } else {
+            self.demo.ignite_at(x, y)
+        };
+        if let Some(mark) = mark {
+            self.note_mark(mark);
+        }
+    }
+
     fn apply_view_event(&mut self, event: &WindowEvent) {
         let Some(viewport) = self.viewport() else {
             return;
@@ -1150,81 +1500,107 @@ impl App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = *state == ElementState::Pressed;
                 if *button == MouseButton::Left {
-                    self.painting = pressed && self.shift_down;
-                    self.dragging = pressed && !self.shift_down;
-                } else if *button == MouseButton::Right
-                    && pressed
-                    && let Some((px, py)) = self.last_cursor
-                {
-                    let (wx, wy) = self.camera.world_at_pixel(px, py);
-                    if wx >= 0.0 && wy >= 0.0 {
-                        if self.shift_down {
-                            self.demo.detonate_at(wx.floor() as u32, wy.floor() as u32);
-                        } else {
-                            self.demo.ignite_at(wx.floor() as u32, wy.floor() as u32);
+                    self.painting = pressed;
+                    if pressed {
+                        self.stamp_brush(None);
+                    } else {
+                        self.last_paint_cell = None;
+                    }
+                } else if *button == MouseButton::Right {
+                    if pressed {
+                        self.panning = false;
+                        self.pan_origin = self.last_cursor;
+                    } else {
+                        if !self.panning {
+                            self.pointer_action(self.shift_down);
                         }
+                        self.panning = false;
+                        self.pan_origin = None;
                     }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x as f32, position.y as f32);
-                if self.dragging
+                if let Some(origin) = self.pan_origin {
+                    let distance = (cursor.0 - origin.0).hypot(cursor.1 - origin.1);
+                    if distance > 4.0 {
+                        self.panning = true;
+                    }
+                }
+                if self.panning
                     && let Some(previous) = self.last_cursor
                 {
-                    apply_command(
-                        &mut self.camera,
-                        ViewCommand::PanPixels {
-                            dx: cursor.0 - previous.0,
-                            dy: cursor.1 - previous.1,
-                        },
+                    self.pan_pixels(
+                        cursor.0 - previous.0,
+                        cursor.1 - previous.1,
                         viewport,
                         world,
                     );
                 }
-                if self.painting && self.brush_commands_this_frame < BRUSH_CELLS_PER_FRAME {
-                    let (wx, wy) = self.camera.world_at_pixel(cursor.0, cursor.1);
-                    if wx >= 0.0 && wy >= 0.0 {
-                        let remaining = BRUSH_CELLS_PER_FRAME - self.brush_commands_this_frame;
-                        self.brush_commands_this_frame += self.demo.submit_brush_disk(
-                            wx.floor() as u32,
-                            wy.floor() as u32,
-                            2,
-                            false,
-                            remaining,
-                        );
-                    }
+                if self.painting {
+                    self.stamp_brush(Some(cursor));
                 }
                 self.last_cursor = Some(cursor);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(offset) => offset.y as f32 / 40.0,
+                    MouseScrollDelta::PixelDelta(offset) => offset.y as f32 / 80.0,
                 };
-                let cursor = self
-                    .last_cursor
-                    .unwrap_or((viewport.0 * 0.5, viewport.1 * 0.5));
-                apply_command(
-                    &mut self.camera,
-                    ViewCommand::ZoomAt {
-                        cursor_x: cursor.0,
-                        cursor_y: cursor.1,
-                        factor: zoom_factor(lines),
-                    },
-                    viewport,
-                    world,
-                );
+                if clamped_zoom_lines(lines) != 0.0 {
+                    let cursor = self
+                        .last_cursor
+                        .unwrap_or((viewport.0 * 0.5, viewport.1 * 0.5));
+                    apply_command(
+                        &mut self.camera,
+                        ViewCommand::ZoomAt {
+                            cursor_x: cursor.0,
+                            cursor_y: cursor.1,
+                            factor: zoom_factor(lines),
+                        },
+                        viewport,
+                        world,
+                    );
+                    self.feel.note_feedback(self.now_ns());
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
                 if event.logical_key == Key::Named(NamedKey::Shift) {
-                    self.shift_down = event.state == ElementState::Pressed;
+                    self.shift_down = pressed;
+                    self.request_frame();
                     return;
                 }
-                if event.state != ElementState::Pressed {
+                if let Some(index) = pan_key_index(&event.logical_key) {
+                    match index {
+                        0 => self.key_pan.0 = pressed,
+                        1 => self.key_pan.1 = pressed,
+                        2 => self.key_pan.2 = pressed,
+                        3 => self.key_pan.3 = pressed,
+                        _ => {}
+                    }
+                    self.request_frame();
+                    return;
+                }
+                if let Key::Character(text) = &event.logical_key
+                    && text.eq_ignore_ascii_case("f")
+                {
+                    self.demo.set_destroy_key_held(pressed);
+                    if pressed {
+                        self.prefer_deferred_story();
+                    }
+                    self.feel.note_feedback(self.now_ns());
+                    self.request_frame();
+                    return;
+                }
+                if !pressed || event.repeat {
                     return;
                 }
                 match &event.logical_key {
-                    Key::Named(NamedKey::Space) => self.demo.toggle_paused(),
+                    Key::Named(NamedKey::Space) => {
+                        self.demo.toggle_paused();
+                        self.feel.note_feedback(self.now_ns());
+                    }
                     Key::Character(text) if text == "." => self.demo.single_step(),
                     Key::Character(text) if text.eq_ignore_ascii_case("r") => {
                         if let Err(error) = self.demo.reset() {
@@ -1233,28 +1609,17 @@ impl App {
                     }
                     _ => {}
                 }
-                let pan = match &event.logical_key {
-                    Key::Named(NamedKey::ArrowLeft) => Some((-32.0, 0.0)),
-                    Key::Named(NamedKey::ArrowRight) => Some((32.0, 0.0)),
-                    Key::Named(NamedKey::ArrowUp) => Some((0.0, -32.0)),
-                    Key::Named(NamedKey::ArrowDown) => Some((0.0, 32.0)),
-                    Key::Character(text) if text.eq_ignore_ascii_case("a") => Some((-32.0, 0.0)),
-                    Key::Character(text) if text.eq_ignore_ascii_case("d") => Some((32.0, 0.0)),
-                    Key::Character(text) if text.eq_ignore_ascii_case("w") => Some((0.0, -32.0)),
-                    Key::Character(text) if text.eq_ignore_ascii_case("s") => Some((0.0, 32.0)),
-                    _ => None,
-                };
-                if let Some((dx, dy)) = pan {
-                    apply_command(
-                        &mut self.camera,
-                        ViewCommand::PanPixels { dx, dy },
-                        viewport,
-                        world,
-                    );
-                }
+            }
+            WindowEvent::Focused(false) => {
+                self.painting = false;
+                self.panning = false;
+                self.pan_origin = None;
+                self.key_pan = (false, false, false, false);
+                self.demo.set_destroy_key_held(false);
             }
             _ => {}
         }
+        self.request_frame();
     }
 }
 
@@ -1282,8 +1647,13 @@ impl ApplicationHandler for App {
         self.on_window_event(event_loop, event);
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        self.request_frame();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.occluded && self.smoke.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            self.request_frame();
+        }
     }
 }
 
@@ -1338,6 +1708,8 @@ fn create_gpu(
     {
         config.present_mode = wgpu::PresentMode::Fifo;
     }
+    // One frame in flight keeps input-to-present on the next refresh instead of queuing another.
+    config.desired_maximum_frame_latency = 1;
     if capture_surface
         && (!capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC)
             || !matches!(
@@ -1495,6 +1867,7 @@ fn write_chunk(
     world: &cascade_sim::World,
     chunk: ChunkCoord,
     deferred_overlay: bool,
+    exempt: &[(u32, u32)],
 ) {
     let mut bytes = [0_u8; CHUNK_CELLS];
     let (width, height) = world.dimensions();
@@ -1503,15 +1876,20 @@ fn write_chunk(
             let cell_x = chunk.x * CHUNK_SIZE + x;
             let cell_y = chunk.y * CHUNK_SIZE + y;
             if cell_x < width && cell_y < height {
-                bytes[(y * CHUNK_SIZE + x) as usize] =
-                    if deferred_overlay && world.cell_pending(cell_x, cell_y) == Some(true) {
-                        6
-                    } else {
-                        world
-                            .cell(cell_x, cell_y)
-                            .map(|cell| cell.material as u8)
-                            .unwrap_or(0)
-                    };
+                let cell = world.cell(cell_x, cell_y);
+                let pending = world.cell_pending(cell_x, cell_y) == Some(true);
+                let exempt_cell = exempt.contains(&(cell_x, cell_y));
+                bytes[(y * CHUNK_SIZE + x) as usize] = cell
+                    .map(|cell| {
+                        presented_byte(
+                            cell.material as u8,
+                            cell.burning,
+                            pending,
+                            deferred_overlay,
+                            exempt_cell,
+                        )
+                    })
+                    .unwrap_or(0);
             }
         }
     }
@@ -1538,6 +1916,28 @@ fn write_chunk(
             depth_or_array_layers: 1,
         },
     );
+}
+
+fn pan_key_index(key: &winit::keyboard::Key) -> Option<usize> {
+    match key {
+        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => Some(0),
+        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => Some(1),
+        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => Some(2),
+        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => Some(3),
+        winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("a") => Some(0),
+        winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("d") => Some(1),
+        winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("w") => Some(2),
+        winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("s") => Some(3),
+        _ => None,
+    }
+}
+
+fn chunk_index(world: f32, chunks: u32) -> u32 {
+    if world <= 0.0 {
+        0
+    } else {
+        ((world as u32) / CHUNK_SIZE).min(chunks.saturating_sub(1))
+    }
 }
 
 fn color_attachment<'a>(
@@ -1645,6 +2045,30 @@ fn preferred_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureForm
 
 fn elapsed_ns(previous: Instant, now: Instant) -> u64 {
     u64::try_from(now.saturating_duration_since(previous).as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn print_feel(label: &str, feel: &Feel) {
+    let camera = feel.camera_summary();
+    let paint = feel.paint_summary();
+    let ignite = feel.ignite_summary();
+    let detonate = feel.detonate_summary();
+    println!(
+        "SMOKE_FEEL policy={label} focus={} camera_n={} camera_p50_ms={:.2} camera_p95_ms={:.2} paint_n={} paint_p50_ms={:.2} paint_p95_ms={:.2} ignite_n={} ignite_p50_ms={:.2} ignite_p95_ms={:.2} detonate_n={} detonate_p50_ms={:.2} detonate_p95_ms={:.2}",
+        if focus_linked() { "linked" } else { "unlinked" },
+        camera.samples,
+        camera.p50_ns as f32 / 1_000_000.0,
+        camera.p95_ns as f32 / 1_000_000.0,
+        paint.samples,
+        paint.p50_ns as f32 / 1_000_000.0,
+        paint.p95_ns as f32 / 1_000_000.0,
+        ignite.samples,
+        ignite.p50_ns as f32 / 1_000_000.0,
+        ignite.p95_ns as f32 / 1_000_000.0,
+        detonate.samples,
+        detonate.p50_ns as f32 / 1_000_000.0,
+        detonate.p95_ns as f32 / 1_000_000.0,
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {

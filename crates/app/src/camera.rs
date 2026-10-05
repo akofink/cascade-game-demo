@@ -85,7 +85,8 @@ fn clamp_axis(origin: f32, view: f32, world: f32) -> f32 {
 }
 
 pub fn zoom_factor(lines: f32) -> f32 {
-    1.1_f32.powf(lines)
+    let lines = crate::clamped_zoom_lines(lines);
+    1.08_f32.powf(lines)
 }
 
 pub fn apply_command(
