@@ -1,12 +1,15 @@
 //! Bounded-work cellular simulation core. Independent of windows, graphics, and wall clocks.
 
+pub mod fixtures;
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub const CHUNK_SIDE: u32 = 32;
 pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
-pub const RULE_VERSION: u32 = 2;
+pub const RULE_VERSION: u32 = 3;
+pub const MAX_QUANTUM_COST: u32 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -25,6 +28,9 @@ pub struct CellId(u32);
 impl CellId {
     pub const fn index(self) -> usize {
         self.0 as usize
+    }
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index as u32)
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -88,6 +94,8 @@ pub enum SimError {
     GenerationExhausted,
     OutOfBounds,
     ResetInProgress,
+    FixtureInProgress,
+    CommandCapacityExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -95,11 +103,13 @@ pub enum SimError {
 struct PendingCell {
     flags: u8,
     blast: u8,
+    paint_slot: u8,
 }
 impl PendingCell {
     const EVAL_PENDING: u8 = 1;
     const EVAL_QUEUED: u8 = 2;
     const BLAST_QUEUED: u8 = 4;
+    const PAINT_QUEUED: u8 = 8;
     fn has(self, flag: u8) -> bool {
         self.flags & flag != 0
     }
@@ -134,16 +144,18 @@ pub struct CostContract {
     pub recovery: Credits,
     pub command: Credits,
     pub reset_cell: Credits,
+    pub fixture_cell: Credits,
 }
 impl Default for CostContract {
     fn default() -> Self {
         Self {
             selection: Credits(1),
-            evaluate: Credits(12),
-            blast: Credits(16),
+            evaluate: Credits(24),
+            blast: Credits(24),
             recovery: Credits(4),
-            command: Credits(6),
+            command: Credits(12),
             reset_cell: Credits(4),
+            fixture_cell: Credits(crate::fixtures::FIXTURE_CELL_COST),
         }
     }
 }
@@ -174,13 +186,16 @@ impl<T: Copy> Ring<T> {
         }
     }
     fn push(&mut self, value: T) -> Result<(), T> {
+        self.push_index(value).map(|_| ())
+    }
+    fn push_index(&mut self, value: T) -> Result<usize, T> {
         if self.len == self.slots.len() {
             return Err(value);
         }
         let tail = (self.head + self.len) % self.slots.len();
         self.slots[tail] = Some(value);
         self.len += 1;
-        Ok(())
+        Ok(tail)
     }
     fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -210,6 +225,7 @@ pub enum SubmitResult {
     Coalesced,
     RejectedFull,
     ResetInProgress,
+    FixtureInProgress,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -229,6 +245,8 @@ pub struct SliceMetrics {
     pub slice: u64,
     pub reset_cells: u32,
     pub reset_in_progress: bool,
+    pub prepared_cells: u32,
+    pub fixture_in_progress: bool,
 }
 
 /// Fixed-layout simulation world. Total storage is exposed by [`World::resources`].
@@ -256,6 +274,9 @@ pub struct World {
     dirty_chunks: Vec<bool>,
     dirty_cursor: usize,
     deferred_command: Option<Command>,
+    fixture: Option<fixtures::PreparationCursor>,
+    fixture_waiting: Option<fixtures::ScenarioDescriptor>,
+    fixture_status: fixtures::FixtureProgress,
 }
 
 impl World {
@@ -275,11 +296,14 @@ impl World {
         if count > u32::MAX as usize {
             return Err(SimError::WorldTooLarge);
         }
-        if budget.0 < 17 {
+        if budget.0 < 25 {
             return Err(SimError::BudgetTooSmall);
         }
         if ready_capacity.0 == 0 || command_capacity.0 == 0 {
             return Err(SimError::CapacityZero);
+        }
+        if command_capacity.0 > 256 {
+            return Err(SimError::CommandCapacityExceeded);
         }
         let chunks_x = width.div_ceil(CHUNK_SIDE);
         let chunks_y = height.div_ceil(CHUNK_SIDE);
@@ -310,6 +334,9 @@ impl World {
             dirty_chunks: vec![false; chunk_count],
             dirty_cursor: 0,
             deferred_command: None,
+            fixture: None,
+            fixture_waiting: None,
+            fixture_status: fixtures::FixtureProgress::default(),
         })
     }
     pub fn dimensions(&self) -> (u32, u32) {
@@ -323,6 +350,59 @@ impl World {
     }
     pub fn slice_index(&self) -> u64 {
         self.slice
+    }
+    pub fn cell_count(&self) -> usize {
+        self.cells.len()
+    }
+    pub fn start_fixture(
+        &mut self,
+        descriptor: fixtures::ScenarioDescriptor,
+    ) -> Result<(), fixtures::FixtureError> {
+        if self.reset_cursor.is_some() {
+            return Err(fixtures::FixtureError::ResetInProgress);
+        }
+        if self.fixture.is_some() || self.fixture_waiting.is_some() {
+            return Err(fixtures::FixtureError::AlreadyPreparing);
+        }
+        if descriptor != fixtures::ScenarioDescriptor::get(descriptor.id) {
+            return Err(fixtures::FixtureError::InvalidDescriptor);
+        }
+        if descriptor.id == fixtures::FixtureId::TinyCapacity
+            && (self.eval_ready.slots.len() != 2
+                || self.blast_ready.slots.len() != 2
+                || self.commands.slots.len() != 2)
+        {
+            return Err(fixtures::FixtureError::CapacityMismatch);
+        }
+        self.reset().map_err(fixtures::FixtureError::from)?;
+        self.fixture_waiting = Some(descriptor);
+        self.fixture_status = fixtures::FixtureProgress {
+            descriptor: Some(descriptor),
+            total_cells: self.cells.len(),
+            ..fixtures::FixtureProgress::default()
+        };
+        Ok(())
+    }
+    pub fn fixture_progress(&self) -> Option<fixtures::FixtureProgress> {
+        self.fixture
+            .map(fixtures::PreparationCursor::progress)
+            .or_else(|| self.fixture_status.descriptor.map(|_| self.fixture_status))
+    }
+    pub fn cancel_fixture(&mut self) -> Option<fixtures::FixtureProgress> {
+        let had_cursor = self.fixture.is_some();
+        let cursor_progress = self
+            .fixture
+            .take()
+            .map(fixtures::PreparationCursor::progress);
+        let pending = self.fixture_waiting.take().is_some();
+        if !had_cursor && !pending {
+            return None;
+        }
+        let mut progress = cursor_progress.unwrap_or(self.fixture_status);
+        progress.cancelled = true;
+        progress.complete = false;
+        self.fixture_status = progress;
+        Some(progress)
     }
     pub fn resources(&self) -> ResourceTable {
         ResourceTable {
@@ -367,7 +447,7 @@ impl World {
     /// Clears at most `limit` dirty chunk marks and returns their coordinates in stable round-robin order.
     pub fn drain_dirty_chunks(&mut self, limit: usize, out: &mut Vec<(u32, u32)>) -> usize {
         let mut drained = 0;
-        for _ in 0..self.dirty_chunks.len().min(limit) {
+        for _ in 0..self.dirty_chunks.len().min(limit).min(256) {
             let i = self.dirty_cursor;
             self.dirty_cursor = (self.dirty_cursor + 1) % self.dirty_chunks.len().max(1);
             if self.dirty_chunks[i] {
@@ -382,33 +462,40 @@ impl World {
         if self.reset_cursor.is_some() {
             return SubmitResult::ResetInProgress;
         }
+        if self.fixture.is_some() || self.fixture_waiting.is_some() {
+            return SubmitResult::FixtureInProgress;
+        }
         let Command::Paint { cell, .. } = command;
-        if cell.index() >= self.cells.len() {
+        let index = cell.index();
+        if index >= self.cells.len() {
             self.rejected_commands += 1;
             return SubmitResult::RejectedFull;
         }
-        // Rotate exactly the existing bounded frontier, replacing at most one matching target.
-        let mut replaced = false;
-        let count = self.commands.len();
-        for _ in 0..count {
-            let old = self
+        if self.pending[index].has(PendingCell::PAINT_QUEUED) {
+            let slot = self.pending[index].paint_slot as usize;
+            if self
                 .commands
-                .pop()
-                .expect("ring length matches occupied entries");
-            let Command::Paint { cell: old_cell, .. } = old;
-            if old_cell == cell && !replaced {
-                let _ = self.commands.push(command);
-                replaced = true;
+                .slots
+                .get(slot)
+                .is_some_and(|entry| entry.is_some())
+            {
+                self.commands.slots[slot] = Some(command);
+            } else if matches!(self.deferred_command, Some(Command::Paint { cell: deferred, .. }) if deferred == cell)
+            {
+                self.deferred_command = Some(command);
             } else {
-                let _ = self.commands.push(old);
+                self.rejected_commands += 1;
+                return SubmitResult::RejectedFull;
             }
-        }
-        if replaced {
             self.coalesced_commands += 1;
             return SubmitResult::Coalesced;
         }
-        match self.commands.push(command) {
-            Ok(()) => SubmitResult::Accepted,
+        match self.commands.push_index(command) {
+            Ok(slot) => {
+                self.pending[index].paint_slot = slot as u8;
+                self.pending[index].set(PendingCell::PAINT_QUEUED, true);
+                SubmitResult::Accepted
+            }
             Err(_) => {
                 self.rejected_commands += 1;
                 SubmitResult::RejectedFull
@@ -420,13 +507,16 @@ impl World {
         if id.index() >= self.cells.len() {
             return Err(SimError::OutOfBounds);
         }
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
+        }
+        if self.fixture.is_some() || self.fixture_waiting.is_some() {
+            return Err(SimError::FixtureInProgress);
+        }
         if energy == 0 {
             return Ok(());
         }
         self.set_material(id, Material::Explosive);
-        if self.reset_cursor.is_some() {
-            return Err(SimError::ResetInProgress);
-        }
         if self.pending[id.index()].blast == 0 {
             self.pending_count += 1;
         }
@@ -443,6 +533,9 @@ impl World {
     pub fn ignite(&mut self, id: CellId) -> Result<(), SimError> {
         if self.reset_cursor.is_some() {
             return Err(SimError::ResetInProgress);
+        }
+        if self.fixture.is_some() || self.fixture_waiting.is_some() {
+            return Err(SimError::FixtureInProgress);
         }
         if id.index() >= self.cells.len() {
             return Err(SimError::OutOfBounds);
@@ -468,11 +561,11 @@ impl World {
         if self.reset_cursor.is_some() {
             return Err(SimError::ResetInProgress);
         }
+        if self.fixture.is_some() || self.fixture_waiting.is_some() {
+            return Err(SimError::FixtureInProgress);
+        }
         if id.index() >= self.cells.len() {
             return Err(SimError::OutOfBounds);
-        }
-        if self.reset_cursor.is_some() {
-            return Err(SimError::ResetInProgress);
         }
         self.mark_pending(id, true);
         self.try_queue(id, JobKind::Evaluate);
@@ -517,21 +610,44 @@ impl World {
         }
     }
     fn wake_neighbors(&mut self, id: CellId) {
-        let (x, y) = (id.0 % self.width, id.0 / self.width);
-        for (dx, dy) in [(0i32, -1i32), (-1, 0), (1, 0), (0, 1)] {
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-            if nx >= 0 && ny >= 0 && nx < self.width as i32 && ny < self.height as i32 {
-                let n = CellId(ny as u32 * self.width + nx as u32);
-                self.mark_pending(n, true);
-                self.try_queue(n, JobKind::Evaluate);
-            }
+        for neighbor in self.neighbors(id).into_iter().flatten() {
+            self.mark_pending(neighbor, true);
+            self.try_queue(neighbor, JobKind::Evaluate);
         }
     }
     fn mark_dirty(&mut self, id: CellId) {
         let chunk =
             (id.0 / self.width) / CHUNK_SIDE * self.chunks_x + (id.0 % self.width) / CHUNK_SIDE;
         self.dirty_chunks[chunk as usize] = true;
+    }
+    pub(crate) fn prepare_fixture_cell(
+        &mut self,
+        id: CellId,
+        material: Material,
+        burning: u8,
+        blast: u8,
+        active: bool,
+    ) -> Result<(), SimError> {
+        if self.reset_cursor.is_some() {
+            return Err(SimError::ResetInProgress);
+        }
+        if id.index() >= self.cells.len() {
+            return Err(SimError::OutOfBounds);
+        }
+        self.set_material(id, material);
+        self.cells[id.index()].burning = burning;
+        self.mark_dirty(id);
+        if (active && matches!(material, Material::Sand | Material::Water)) || burning > 0 {
+            self.mark_pending(id, true);
+            self.try_queue(id, JobKind::Evaluate);
+        }
+        if blast > 0 {
+            self.pending[id.index()].blast = blast.min(15);
+            self.pending_count += 1;
+            self.mark_pending(id, false);
+            self.try_queue(id, JobKind::Blast);
+        }
+        Ok(())
     }
     fn set_material(&mut self, id: CellId, material: Material) {
         let i = id.index();
@@ -563,18 +679,19 @@ impl World {
             }
             if material == Material::Water {
                 let first_left = (x.wrapping_add(y) & 1) == 0;
-                let sides = if first_left { [-1i32, 1] } else { [1, -1] };
-                for dx in sides {
-                    let nx = x as i32 + dx;
-                    if nx >= 0 && nx < self.width as i32 {
-                        let side = CellId(y * self.width + nx as u32);
-                        if self.cells[side.index()].material == Material::Air {
-                            self.set_material(side, Material::Water);
-                            self.set_material(id, Material::Air);
-                            self.wake_neighbors(id);
-                            self.wake_neighbors(side);
-                            return;
-                        }
+                let neighbors = self.neighbors(id);
+                let sides = if first_left {
+                    [neighbors[1], neighbors[2]]
+                } else {
+                    [neighbors[2], neighbors[1]]
+                };
+                for side in sides.into_iter().flatten() {
+                    if self.cells[side.index()].material == Material::Air {
+                        self.set_material(side, Material::Water);
+                        self.set_material(id, Material::Air);
+                        self.wake_neighbors(id);
+                        self.wake_neighbors(side);
+                        return;
                     }
                 }
             }
@@ -696,8 +813,56 @@ impl World {
                 m.reset_cells += 1;
             }
             self.reset_cursor = (cursor < self.cells.len()).then_some(cursor);
+            if self.reset_cursor.is_none()
+                && let Some(descriptor) = self.fixture_waiting.take()
+            {
+                self.fixture = Some(fixtures::PreparationCursor::new(
+                    descriptor,
+                    self.width,
+                    self.height,
+                    self.generation.get(),
+                ));
+            }
             self.slice = self.slice.saturating_add(1);
             m.reset_in_progress = self.reset_cursor.is_some();
+            m.fixture_in_progress = self.fixture.is_some() || self.fixture_waiting.is_some();
+            m.ready_len = self.ready_len();
+            m.pending_cells = self.pending_count;
+            m.rejected_commands = self.rejected_commands;
+            m.coalesced_commands = self.coalesced_commands;
+            return m;
+        }
+        if self.fixture.is_some() {
+            while remaining >= self.costs.selection.0 + self.costs.fixture_cell.0 {
+                remaining -= self.costs.selection.0 + self.costs.fixture_cell.0;
+                m.charged += self.costs.selection.0 + self.costs.fixture_cell.0;
+                m.selections += 1;
+                if let Some(mut cursor) = self.fixture.take() {
+                    let before = cursor.progress().prepared_cells;
+                    match cursor.advance_one(self) {
+                        Ok(()) => {
+                            if cursor.progress().prepared_cells > before {
+                                m.prepared_cells += 1;
+                            }
+                            if cursor.finished() {
+                                self.fixture_status = cursor.progress();
+                                self.fixture = None;
+                            } else {
+                                self.fixture = Some(cursor);
+                            }
+                        }
+                        Err(_) => {
+                            self.fixture_status.cancelled = true;
+                            self.fixture = None;
+                        }
+                    }
+                }
+                if self.fixture.is_none() {
+                    break;
+                }
+            }
+            self.slice = self.slice.saturating_add(1);
+            m.fixture_in_progress = self.fixture.is_some();
             m.ready_len = self.ready_len();
             m.pending_cells = self.pending_count;
             m.rejected_commands = self.rejected_commands;
@@ -761,6 +926,8 @@ impl World {
                     }
                 }
             } else if let Some(c) = command {
+                let Command::Paint { cell, .. } = c;
+                self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
                 self.execute_command(c);
                 m.commands += 1;
             } else {
@@ -778,6 +945,7 @@ impl World {
         };
         m.rejected_commands = self.rejected_commands;
         m.coalesced_commands = self.coalesced_commands;
+        m.fixture_in_progress = self.fixture.is_some() || self.fixture_waiting.is_some();
         m
     }
     /// Begin a generation-safe reset. Cell storage is cleared by charged, resumable quanta in `step`.
@@ -797,6 +965,17 @@ impl World {
         self.oldest_pending_since = 0;
         self.recovery_cursor = 0;
         self.deferred_command = None;
+        if let Some(cursor) = self.fixture.take() {
+            self.fixture_status = cursor.progress();
+            self.fixture_status.cancelled = true;
+            self.fixture_status.complete = false;
+        } else if self.fixture_waiting.is_some() {
+            self.fixture_status.cancelled = true;
+            self.fixture_status.complete = false;
+        } else {
+            self.fixture_status = fixtures::FixtureProgress::default();
+        }
+        self.fixture_waiting = None;
         self.reset_cursor = Some(0);
         Ok(())
     }
@@ -815,6 +994,9 @@ impl World {
         self.slice.hash(&mut h);
         self.cells.hash(&mut h);
         self.pending.hash(&mut h);
+        self.fixture.hash(&mut h);
+        self.fixture_waiting.hash(&mut h);
+        self.fixture_status.hash(&mut h);
         self.eval_ready.head.hash(&mut h);
         self.eval_ready.len.hash(&mut h);
         self.eval_ready.slots.hash(&mut h);
@@ -839,16 +1021,11 @@ impl World {
         self.eval_ready.len() + self.blast_ready.len()
     }
     pub fn command_len(&self) -> usize {
-        self.commands.len()
+        self.commands.len() + usize::from(self.deferred_command.is_some())
     }
     pub fn pending_channels(&self) -> usize {
         self.pending_count
     }
-}
-
-// The currently selected command is held here if its full cost does not fit the remaining allowance.
-impl World {
-    /* field is declared below through the source definition */
 }
 
 #[cfg(test)]
@@ -869,13 +1046,21 @@ mod tests {
     #[test]
     fn rejects_invalid_limits() {
         assert_eq!(
-            World::new(0, 3, Credits::new(20), Capacity::new(1), Capacity::new(1)).err(),
+            World::new(0, 3, Credits::new(25), Capacity::new(1), Capacity::new(1)).err(),
             Some(SimError::InvalidDimensions)
         );
         assert_eq!(
-            World::new(1, 1, Credits::new(12), Capacity::new(1), Capacity::new(1)).err(),
+            World::new(1, 1, Credits::new(24), Capacity::new(1), Capacity::new(1)).err(),
             Some(SimError::BudgetTooSmall)
         );
+        assert_eq!(
+            World::new(1, 1, Credits::new(25), Capacity::new(1), Capacity::new(257)).err(),
+            Some(SimError::CommandCapacityExceeded)
+        );
+        let costs = CostContract::default();
+        assert_eq!(costs.blast.get(), MAX_QUANTUM_COST);
+        assert!(costs.evaluate.get() <= MAX_QUANTUM_COST);
+        assert!(costs.fixture_cell.get() <= MAX_QUANTUM_COST);
     }
     #[test]
     fn command_queue_rejects_and_coalesces() {
@@ -1041,19 +1226,19 @@ mod tests {
     }
     #[test]
     fn reset_is_incremental_and_charged() {
-        let mut w = world(16, 4, 17, 2, 2);
+        let mut w = world(16, 4, 25, 2, 2);
         for i in 0..64 {
             w.set_material(CellId(i), Material::Stone);
         }
         w.reset().unwrap();
         let first = w.step();
-        assert_eq!(first.reset_cells, 3);
-        assert_eq!(first.charged, 15);
+        assert_eq!(first.reset_cells, 5);
+        assert_eq!(first.charged, 25);
         assert!(first.reset_in_progress);
         assert_eq!(w.cell(0, 0).unwrap().material, Material::Air);
-        assert_eq!(w.cell(3, 0).unwrap().material, Material::Stone);
+        assert_eq!(w.cell(5, 0).unwrap().material, Material::Stone);
         while w.reset_in_progress() {
-            assert!(w.step().charged <= 17);
+            assert!(w.step().charged <= 25);
         }
         assert!(w.cells.iter().all(|cell| cell.material == Material::Air));
     }
@@ -1068,7 +1253,8 @@ mod tests {
         );
         let resources = w.resources();
         assert_eq!(resources.cell_bytes, 2);
-        assert_eq!(resources.pending_bytes, 2 * 4096 * 4096);
+        assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
+        assert_eq!(resources.total_bytes, 84_690_944);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
@@ -1087,7 +1273,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(w.cell(3, 4).unwrap().material, Material::Water);
+        assert!((0..7).any(|x| w.cell(x, 4).unwrap().material == Material::Water));
     }
     #[test]
     fn fire_burns_wood_and_ignites_explosives_and_blast_ignites_wood() {
