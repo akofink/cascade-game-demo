@@ -74,7 +74,7 @@ Camera/UI feedback latency and action-to-first-visible-effect latency are CPU ti
 - A paint effect is visible when the uploaded texture contains the requested material. Ignition of wood is visible when the upload encodes burning wood as palette index 7. Detonation is visible when the uploaded material or burn state differs from the pre-action cell. A chunk upload that happens before the authoritative change does not count. Rejected or no-effect clicks are acknowledged and are not latency samples.
 - The acknowledgment ring is screen-space and is not a material. Pending rings stay up until the upload shows the effect, the command is rejected, or the click had no target.
 - Smoke admits a scripted paint, ignite, and detonate stream plus a 1 px camera nudge every 10 measured frames while DESTROY PERFORMANCE is admitting disturbances. That stream is part of the measured windows, not a separate quiet baseline.
-- Player focus is not linked in this build. `SMOKE_FEEL` reports `focus=unlinked`. The three-policy comparison will include bounded focus after the simulator API is on `main`. Until then the focus restart button stays disabled and the cyan box is the viewport the app will submit, not a claim that the scheduler is prioritizing it.
+- Player focus is linked when the simulator exports `set_focus_enabled`, `Command::FocusViewport`, action commands, and `active_focus_regions`. The overlay draws those simulator regions. FIFO restarts with focus disabled. The smoke runs a third bounded-focus window when that API is present.
 
 ## Release smoke, 2026-10-05, after game-feel changes
 
@@ -90,7 +90,23 @@ Command: `cargo run --release -p cascade-app -- --smoke --world-size 4096 --scre
 | Ignite visible p50 / p95 | 16.82 / 513.59 ms (n=4) | 86.74 / 86.74 ms (n=1) |
 | Detonate visible p50 / p95 (n=4) | 16.73 / 17.00 ms | 33.42 / 59.98 ms |
 
-Bounded frame p99 is 17.61 ms, down from the prior full-size smoke's about 18.8 to 19.6 ms, and still a little over the 16.7 ms presentation target. One ignite sample in the bounded window was about 514 ms; with n=4 that sample is the p95. Traditional frame p99 was 85.82 ms. These are one short run, not three sustained 60-second captures. The bounded-focus column is not in this run.
+Bounded frame p99 is 17.61 ms, down from the prior full-size smoke's about 18.8 to 19.6 ms, and still a little over the 16.7 ms presentation target. One ignite sample in the bounded window was about 514 ms; with n=4 that sample is the p95. Traditional frame p99 was 85.82 ms. These are one short run, not three sustained 60-second captures. The bounded-focus column is not in the run above. A later local smoke that includes the simulator focus branch is below. It is not on `main` until that simulator change merges.
+
+## Three-policy smoke with focus linked
+
+Command: `cargo run --release -p cascade-app -- --smoke --world-size 4096 --screenshot docs/cascade-overload.png` on 2026-10-05 about 17:27 EDT. One-minute load average at start was 2.74; at the end it was 3.35. `SMOKE_RESULT ok`. 1310 presents. Each policy window is 120 frames with DESTROY PERFORMANCE admitting disturbances and a scripted paint, ignite, and detonate plus a 1 px camera nudge every 10 frames.
+
+| Metric | Bounded FIFO | Bounded focus | Traditional |
+|---|---:|---:|---:|
+| Frame interval p99 / max | 17.17 / 32.58 ms | not in the legacy summary; camera p95 17.73 ms | 820.68 / 837.81 ms |
+| Max simulation CPU | 12.25 ms | not in the legacy summary | 1947.87 ms |
+| Pending channels, first to last | 8,406,053 -> 6,144,742 | not separately summarized | 8,406,053 -> 26,060 |
+| Camera/UI p50 / p95 (n=11) | 16.59 / 16.99 ms | 16.95 / 17.73 ms | 67.09 / 753.84 ms |
+| Paint visible p50 / p95 (n=3) | 16.62 / 16.99 ms | 16.95 / 17.09 ms | 80.84 / 83.90 ms |
+| Ignite visible p50 / p95 | 815.65 ms (n=1) | 16.20 ms (n=1) | 753.84 ms (n=1) |
+| Detonate visible p50 / p95 | 16.68 / 1017.21 ms (n=4) | no samples | 67.09 / 372.59 ms (n=4) |
+
+The frame-interval summary is per presented policy window. Bounded focus is the third window; its camera and paint latencies are about one frame. Its detonate actions were admitted, but none produced a visible-effect sample in that window. Traditional simulation CPU reached 1947.87 ms, about 20 times the 87 ms maximum in the pre-focus full-size smoke above, while the one-minute load average was under 3 at the start. That traditional column is reported as adverse. It is not explained by the load gate alone and is not a claim that the focus scheduler made traditional mode that slow. The earlier 85.82 ms traditional p99 remains the quiet pre-focus comparison.
 
 ## Remaining unmet targets
 

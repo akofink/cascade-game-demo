@@ -275,9 +275,10 @@ impl Feel {
                 ActionKind::Paint => material == ack.paint_material,
                 ActionKind::Ignite => {
                     burning > ack.baseline_burning
+                        || (ack.baseline_material == Material::Wood as u8
+                            && (burning > 0 || material != ack.baseline_material))
                         || (ack.baseline_material == Material::Explosive as u8
                             && material != ack.baseline_material)
-                        || (ack.baseline_material == Material::Wood as u8 && burning > 0)
                 }
                 ActionKind::Detonate => {
                     material != ack.baseline_material || burning > ack.baseline_burning
