@@ -14,8 +14,11 @@ Milestone 1 (headless foundation) in progress.
 
 The mechanisms here are not new: sleeping objects, simulation level of detail, significance-driven
 tick rates, capped physics catch-up, and progressive-refinement collision detection all predate this
-project. Cascade explores making a per-update work bound the engine's central invariant, so every
-player-triggerable workload is resumable bounded work under one budget. Closest references:
+project. Prior systems defer (capped catch-up), refine (progressive collision detection), or
+substitute (cheaper proxy simulations) within one subsystem. Cascade explores making a per-update work
+bound a whole-engine contract: player actions can grow pending work without limit, but every
+player-caused workload is resumable work in quanta of bounded cost, under one per-slice budget.
+Closest references:
 
 - P. M. Hubbard, "Approximating Polyhedra with Spheres for Time-Critical Collision Detection,"
   ACM Transactions on Graphics 15(3), 1996.
