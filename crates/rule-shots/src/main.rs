@@ -280,9 +280,11 @@ fn generate(dir: PathBuf) -> Result<(), Box<dyn Error>> {
         paint(&mut water, 23, y, Material::Stone);
     }
     for x in 9..23 {
-        paint(&mut water, x, 18, Material::Stone);
+        if x != 16 {
+            paint(&mut water, x, 18, Material::Stone);
+        }
     }
-    for y in 10..17 {
+    for y in 10..18 {
         for x in 12..20 {
             paint(&mut water, x, y, Material::Water);
         }

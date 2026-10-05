@@ -22,8 +22,8 @@ A successful move clears the source, fills the destination, and wakes cardinal n
 </figure>
 
 <figure class="rule-strip-figure">
-  <img src="rules-images/water-spread.png" alt="Four simulation steps show water falling through a gap into a stone-walled basin and spreading across its floor">
-  <figcaption>Each frame follows another fixed group of simulation slices: water falls through the one-cell opening, then spreads along the basin floor where a neighbor is available.</figcaption>
+  <img src="rules-images/water-spread.png" alt="Four simulation steps show water falling through a one-cell gap in a stone basin floor and spreading through the lower chamber">
+  <figcaption>Each frame follows another fixed group of simulation slices: water falls through the one-cell floor opening, then spreads through the lower chamber where a neighbor is available.</figcaption>
 </figure>
 
 ## Fire and explosives
