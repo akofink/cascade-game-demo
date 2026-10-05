@@ -42,7 +42,7 @@ Drag with the left mouse button to pan; scroll to zoom. Arrow keys and WASD also
 Select a material in the overlay, then Shift-drag to paint (Air erases); each presentation
 iteration admits at most 64 brush descriptors. Right-click ignites wood or explosives; Shift-right-click
 detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
-The overlay selects fixtures, reports preparation progress, adjusts credits (25 to 100,000),
+The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000),
 toggles deferred-cell highlighting, and restarts the selected fixture when switching between
 bounded and traditional scheduling. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
 admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.

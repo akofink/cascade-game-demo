@@ -73,6 +73,8 @@ pub struct DemoMetrics {
 
 pub struct Demo {
     world: World,
+    alternate_world: World,
+    tiny_capacity_active: bool,
     paused: bool,
     policy: Policy,
     selected_fixture: FixtureId,
@@ -95,8 +97,20 @@ impl Demo {
             Capacity::new(cascade_sim::DEFAULT_COMMAND_CAPACITY),
         )
         .map_err(|error| format!("create simulation: {error:?}"))?;
+        let (tiny_ready, tiny_commands) =
+            ScenarioDescriptor::get(FixtureId::TinyCapacity).capacities();
+        let alternate_world = World::new(
+            DEMO_WIDTH,
+            DEMO_HEIGHT,
+            Credits::new(DEFAULT_CREDITS),
+            tiny_ready,
+            tiny_commands,
+        )
+        .map_err(|error| format!("create tiny-capacity simulation: {error:?}"))?;
         Ok(Self {
             world,
+            alternate_world,
+            tiny_capacity_active: false,
             paused: false,
             policy: Policy::Bounded,
             selected_fixture: FixtureId::MixedOverload,
@@ -132,6 +146,10 @@ impl Demo {
     pub fn set_credits(&mut self, credits: u32) -> bool {
         if !(MIN_CREDITS..=MAX_CREDITS).contains(&credits)
             || self.world.set_budget(Credits::new(credits)).is_err()
+            || self
+                .alternate_world
+                .set_budget(Credits::new(credits))
+                .is_err()
         {
             return false;
         }
@@ -148,7 +166,8 @@ impl Demo {
             fixture_progress: self.world.fixture_progress(),
             destroy_held: self.destroy_held,
             disturbance_emitted: self.last_disturbance,
-            resource_bytes: self.world.resources().total_bytes,
+            resource_bytes: self.world.resources().total_bytes
+                + self.alternate_world.resources().total_bytes,
         }
     }
 
@@ -175,12 +194,32 @@ impl Demo {
     }
 
     pub fn start_fixture(&mut self) -> Result<(), String> {
+        let descriptor = ScenarioDescriptor::get(self.selected_fixture);
+        if self.world.reset_in_progress() {
+            return Err("reset is still in progress".to_string());
+        }
+        if self
+            .world
+            .fixture_progress()
+            .is_some_and(|progress| !progress.complete)
+        {
+            self.world.cancel_fixture();
+        }
+        let wants_tiny = descriptor.id == FixtureId::TinyCapacity;
+        if wants_tiny != self.tiny_capacity_active {
+            std::mem::swap(&mut self.world, &mut self.alternate_world);
+            self.tiny_capacity_active = wants_tiny;
+        }
         self.world
-            .start_fixture(ScenarioDescriptor::get(self.selected_fixture))
+            .start_fixture(descriptor)
             .map_err(|error| format!("start fixture: {error:?}"))?;
         self.disturbances = DisturbanceCommandStream::default_for(0x4341_5345_0001);
         self.last_disturbance = 0;
         Ok(())
+    }
+
+    pub fn cancel_fixture(&mut self) -> bool {
+        self.world.cancel_fixture().is_some()
     }
 
     pub fn reset(&mut self) -> Result<(), String> {
@@ -298,6 +337,24 @@ mod tests {
         demo.tick();
         assert!(demo.metrics().slice.charged <= demo.credits());
         assert!(demo.metrics().slice.commands <= 1);
+    }
+
+    #[test]
+    fn fixture_capacity_profiles_are_applied_and_restored() {
+        let mut demo = Demo::new().unwrap();
+        demo.select_fixture(FixtureId::TinyCapacity);
+        demo.start_fixture().unwrap();
+        assert_eq!(demo.world().resources().ready_capacity.get(), 4);
+        demo.cancel_fixture();
+        while demo.world().reset_in_progress() {
+            demo.world_mut().step();
+        }
+        demo.select_fixture(FixtureId::QuietWorld);
+        demo.start_fixture().unwrap();
+        assert_eq!(
+            demo.world().resources().ready_capacity.get(),
+            2 * cascade_sim::DEFAULT_READY_CAPACITY
+        );
     }
 
     #[test]

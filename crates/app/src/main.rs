@@ -246,6 +246,9 @@ impl App {
         if let Some(fixture) = actions.fixture {
             self.demo.select_fixture(fixture);
         }
+        if actions.cancel_fixture {
+            self.demo.cancel_fixture();
+        }
         if actions.load_fixture
             && let Err(error) = self.demo.start_fixture()
         {

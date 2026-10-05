@@ -32,6 +32,7 @@ pub struct OverlayActions {
     pub single_step: bool,
     pub reset: bool,
     pub load_fixture: bool,
+    pub cancel_fixture: bool,
     pub fixture: Option<FixtureId>,
     pub material: Option<MaterialChoice>,
     pub credits: Option<u32>,
@@ -91,9 +92,19 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                         }
                     }
                 });
-            if ui.button("Prepare selected fixture").clicked() {
-                actions.load_fixture = true;
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Prepare selected fixture").clicked() {
+                    actions.load_fixture = true;
+                }
+                if input
+                    .sim
+                    .fixture_progress
+                    .is_some_and(|progress| !progress.complete && !progress.cancelled)
+                    && ui.button("Cancel preparation").clicked()
+                {
+                    actions.cancel_fixture = true;
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.button("Bounded").clicked() {
                     actions.policy = Some(Policy::Bounded);
