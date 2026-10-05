@@ -124,6 +124,10 @@ struct PendingCell {
     blast: u8,
     paint_slot: u8,
 }
+
+// The traditional frontier packs evaluation and blast channels into one byte per cell.
+const CAPTURED_EVAL: u8 = 0x80;
+const CAPTURED_BLAST: u8 = 0x0f;
 impl PendingCell {
     const EVAL_PENDING: u8 = 1;
     const EVAL_QUEUED: u8 = 2;
@@ -146,6 +150,7 @@ pub struct ResourceTable {
     pub cells: usize,
     pub cell_bytes: usize,
     pub pending_bytes: usize,
+    pub captured_frontier_bytes: usize,
     pub ready_bytes: usize,
     pub command_bytes: usize,
     pub chunk_bytes: usize,
@@ -291,6 +296,7 @@ pub struct World {
     rejected_commands: u64,
     coalesced_commands: u64,
     dirty_chunks: Vec<bool>,
+    captured_frontier: Vec<u8>,
     dirty_cursor: usize,
     deferred_command: Option<Command>,
     fixture: Option<fixtures::PreparationCursor>,
@@ -337,7 +343,11 @@ impl World {
             .checked_mul(chunks_y as usize)
             .ok_or(SimError::WorldTooLarge)?;
         let resource_bytes = count
-            .checked_mul(std::mem::size_of::<Cell>() + std::mem::size_of::<PendingCell>())
+            .checked_mul(
+                std::mem::size_of::<Cell>()
+                    + std::mem::size_of::<PendingCell>()
+                    + std::mem::size_of::<u8>(),
+            )
             .and_then(|bytes| {
                 bytes.checked_add(
                     (ready_capacity.0 * 2).checked_mul(std::mem::size_of::<Option<Job>>())?,
@@ -379,6 +389,7 @@ impl World {
             rejected_commands: 0,
             coalesced_commands: 0,
             dirty_chunks: vec![false; chunk_count],
+            captured_frontier: vec![0; count],
             dirty_cursor: 0,
             deferred_command: None,
             fixture: None,
@@ -479,12 +490,14 @@ impl World {
             cells: self.cells.len(),
             cell_bytes: std::mem::size_of::<Cell>(),
             pending_bytes: self.pending.len() * std::mem::size_of::<PendingCell>(),
+            captured_frontier_bytes: self.captured_frontier.len(),
             ready_bytes: (self.eval_ready.slots.len() + self.blast_ready.slots.len())
                 * std::mem::size_of::<Option<Job>>(),
             command_bytes: self.commands.slots.len() * std::mem::size_of::<Option<Command>>(),
             chunk_bytes: self.dirty_chunks.len() * std::mem::size_of::<bool>(),
             total_bytes: self.cells.len() * std::mem::size_of::<Cell>()
                 + self.pending.len() * std::mem::size_of::<PendingCell>()
+                + self.captured_frontier.len()
                 + (self.eval_ready.slots.len() + self.blast_ready.slots.len())
                     * std::mem::size_of::<Option<Job>>()
                 + self.commands.slots.len() * std::mem::size_of::<Option<Command>>()
@@ -742,6 +755,13 @@ impl World {
         if self.pending_count == 0 {
             self.oldest_pending_since = 0;
         }
+        self.execute_evaluate_rule(id);
+    }
+    fn execute_evaluate_captured(&mut self, id: CellId) {
+        self.execute_evaluate_rule(id);
+    }
+    fn execute_evaluate_rule(&mut self, id: CellId) {
+        let i = id.index();
         let material = self.cells[i].material;
         let (x, y) = (id.0 % self.width, id.0 / self.width);
         if material == Material::Sand || material == Material::Water {
@@ -810,17 +830,21 @@ impl World {
         if energy > 0 {
             self.pending_count -= 1;
         }
-        if energy > 0 {
-            self.mark_dirty(id);
-        }
         self.pending[i].blast = 0;
         self.pending[i].set(PendingCell::BLAST_QUEUED, false);
         if self.pending_count == 0 {
             self.oldest_pending_since = 0;
         }
+        self.execute_blast_rule(id, energy);
+    }
+    fn execute_blast_captured(&mut self, id: CellId, energy: u8) {
+        self.execute_blast_rule(id, energy);
+    }
+    fn execute_blast_rule(&mut self, id: CellId, energy: u8) {
         if energy == 0 {
             return;
         }
+        self.mark_dirty(id);
         self.set_material(id, Material::Air);
         for neighbor in self.neighbors(id).into_iter().flatten() {
             let ni = neighbor.index();
@@ -1087,62 +1111,69 @@ impl World {
             slice: self.slice + 1,
             ..SliceMetrics::default()
         };
-        let recovery = usize::from(self.pending_count > self.ready_len());
-        let mut frontier = [
-            self.eval_ready.len(),
-            self.blast_ready.len(),
-            recovery,
-            self.command_len(),
-        ];
-        let mut remaining = frontier.iter().sum::<usize>();
-        while remaining > 0 {
-            let lane = self.lane_cursor % 4;
-            self.lane_cursor = (self.lane_cursor + 1) % 4;
-            metrics.charged += self.costs.selection.0;
-            metrics.selections += 1;
-            if frontier[lane as usize] == 0 {
-                continue;
+        let command_frontier = self.command_len();
+
+        // Move every pending channel into a fixed snapshot before executing any work.
+        // This captures demand beyond both ready rings and keeps generated work for next slice.
+        self.eval_ready.clear();
+        self.blast_ready.clear();
+        for i in 0..self.pending.len() {
+            let pending = self.pending[i];
+            let mut captured = 0;
+            if pending.has(PendingCell::EVAL_PENDING) {
+                captured |= CAPTURED_EVAL;
+                self.pending_count -= 1;
             }
-            frontier[lane as usize] -= 1;
-            remaining -= 1;
-            match lane {
-                0 => {
-                    if let Some(job) = self.eval_ready.pop() {
-                        metrics.charged += self.costs.evaluate.0;
-                        if job.generation == self.generation {
-                            self.pending[job.cell.index()].set(PendingCell::EVAL_QUEUED, false);
-                            self.execute_evaluate(job.cell);
-                            metrics.evaluations += 1;
-                        }
-                    }
-                }
-                1 => {
-                    if let Some(job) = self.blast_ready.pop() {
-                        metrics.charged += self.costs.blast.0;
-                        if job.generation == self.generation {
-                            self.execute_blast(job.cell);
-                            metrics.blasts += 1;
-                        }
-                    }
-                }
-                2 => {
-                    metrics.charged += self.costs.recovery.0;
-                    self.recover_one();
-                    metrics.recoveries += 1;
-                }
-                _ => {
-                    if let Some(command) =
-                        self.deferred_command.take().or_else(|| self.commands.pop())
-                    {
-                        metrics.charged += self.costs.command.0;
-                        let Command::Paint { cell, .. } = command;
-                        self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
-                        self.execute_command(command);
-                        metrics.commands += 1;
-                    }
-                }
+            if pending.blast > 0 {
+                captured |= pending.blast & CAPTURED_BLAST;
+                self.pending_count -= 1;
+            }
+            self.captured_frontier[i] = captured;
+            self.pending[i].set(PendingCell::EVAL_PENDING, false);
+            self.pending[i].blast = 0;
+            self.pending[i].set(PendingCell::EVAL_QUEUED, false);
+            self.pending[i].set(PendingCell::BLAST_QUEUED, false);
+            metrics.charged += self.costs.selection.0 + self.costs.recovery.0;
+            metrics.selections += 1;
+            metrics.recoveries += 1;
+        }
+        if self.pending_count == 0 {
+            self.oldest_pending_since = 0;
+        }
+
+        for i in 0..self.captured_frontier.len() {
+            metrics.charged += self.costs.selection.0 + self.costs.recovery.0;
+            metrics.selections += 1;
+            metrics.recoveries += 1;
+            let captured = std::mem::take(&mut self.captured_frontier[i]);
+            let id = CellId::from_index(i);
+            if captured & CAPTURED_EVAL != 0 {
+                metrics.charged += self.costs.selection.0 + self.costs.evaluate.0;
+                metrics.selections += 1;
+                self.execute_evaluate_captured(id);
+                metrics.evaluations += 1;
+            }
+            let blast = captured & CAPTURED_BLAST;
+            if blast > 0 {
+                metrics.charged += self.costs.selection.0 + self.costs.blast.0;
+                metrics.selections += 1;
+                self.execute_blast_captured(id, blast);
+                metrics.blasts += 1;
             }
         }
+
+        for _ in 0..command_frontier {
+            let Some(command) = self.deferred_command.take().or_else(|| self.commands.pop()) else {
+                break;
+            };
+            metrics.charged += self.costs.selection.0 + self.costs.command.0;
+            metrics.selections += 1;
+            let Command::Paint { cell, .. } = command;
+            self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
+            self.execute_command(command);
+            metrics.commands += 1;
+        }
+
         self.slice = self.slice.saturating_add(1);
         metrics.ready_len = self.ready_len();
         metrics.pending_cells = self.pending_count;
@@ -1485,7 +1516,8 @@ mod tests {
         let resources = w.resources();
         assert_eq!(resources.cell_bytes, 2);
         assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
-        assert_eq!(resources.total_bytes, 84_690_944);
+        assert_eq!(resources.captured_frontier_bytes, 4096 * 4096);
+        assert_eq!(resources.total_bytes, 101_468_160);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
@@ -1533,7 +1565,7 @@ mod tests {
         assert!(blast_world.cell(2, 1).unwrap().burning > 0);
     }
     #[test]
-    fn traditional_policy_drains_only_the_captured_frontier_without_credit_cap() {
+    fn traditional_policy_drains_the_captured_frontier_without_credit_cap() {
         use crate::fixtures::{FixtureId, ScenarioDescriptor};
         let mut w = World::new(
             16,
@@ -1566,6 +1598,7 @@ mod tests {
         }
         let first = w.step();
         assert_eq!(first.commands, 3);
+        assert_eq!(first.recoveries, 2 * 16 * 16);
         assert_eq!(
             first.evaluations, 0,
             "paint wakes join the next traditional frontier"
@@ -1574,14 +1607,53 @@ mod tests {
             first.charged > first.allowed,
             "traditional mode has no slice credit cap"
         );
-        let ready_at_entry = w.ready_len();
+        let pending_at_entry = w
+            .pending
+            .iter()
+            .filter(|pending| pending.has(PendingCell::EVAL_PENDING))
+            .count();
         let second = w.step();
-        assert_eq!(second.evaluations as usize, ready_at_entry);
+        assert_eq!(second.evaluations as usize, pending_at_entry);
         assert!(
             w.ready_len() > 0,
             "work created by evaluations remains for the next update"
         );
     }
+    #[test]
+    fn traditional_captures_pending_work_beyond_ready_rings() {
+        use crate::fixtures::{FixtureId, ScenarioDescriptor};
+        let mut w = World::new(
+            32,
+            32,
+            Credits::new(25),
+            Capacity::new(2),
+            Capacity::new(16),
+        )
+        .unwrap();
+        w.start_fixture_with_policy(
+            ScenarioDescriptor::get(FixtureId::QuietWorld),
+            SchedulerPolicy::Traditional,
+        )
+        .unwrap();
+        while w
+            .fixture_progress()
+            .is_some_and(|progress| !progress.complete)
+        {
+            w.step();
+        }
+        for index in 0..10 {
+            w.mark_cell_for_evaluation(CellId::from_index(index * 3))
+                .unwrap();
+        }
+        assert_eq!(w.eval_ready.len(), 2);
+        assert_eq!(w.pending_count, 10);
+        let metrics = w.step();
+        assert_eq!(metrics.evaluations, 10);
+        assert_eq!(metrics.recoveries, 2 * 32 * 32);
+        assert_eq!(metrics.pending_cells, 0);
+        assert!(metrics.charged > metrics.allowed);
+    }
+
     #[test]
     fn replay_hash_matches() {
         fn run() -> u64 {

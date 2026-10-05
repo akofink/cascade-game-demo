@@ -241,9 +241,9 @@ Run both a finite burst, which must resolve or reach a stable state, and a 60-se
 Provide two scheduler policies over the same world representation, local rules, seed, capacities, coalescing semantics, and renderer:
 
 - **Bounded:** consume no more than the configured slice allowance.
-- **Traditional:** process the entire finite ready frontier captured at the start of the update, without the slice credit cap. Work created during the update joins the next frontier.
+- **Traditional:** process every finite pending evaluation and blast channel found by a full per-cell storage scan at update entry, plus the command count captured at entry, without the slice credit cap. Ready rings are admission accelerators, not the authority for this frontier. Charge and time the full capture and execution scans plus every dispatched channel; newly generated work joins the next update.
 
-Do not drain recursively until quiescence: flowing water or persistent activity may never terminate. The traditional mode illustrates a batch-all-eligible-work policy, not a claim about every conventional engine.
+The traditional policy snapshots and clears captured channels before executing any of them, so work emitted during execution cannot leak into the current frontier. Do not drain recursively until quiescence: flowing water or persistent activity may never terminate. The full scan cost is part of this intentionally expensive batch-all-eligible-work policy, not a claim about every conventional engine.
 
 Restart the same fixture for each run; never compare different live-world histories by merely toggling a flag. For the cleanest baseline, use a preloaded fixture and a single trigger with no camera-dependent priority. Report time to completed work or settling alongside frame latency and rejected/coalesced work. Neither policy gets different visual effects or cheaper physics.
 
