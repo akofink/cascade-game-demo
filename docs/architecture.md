@@ -14,11 +14,12 @@
 | Focus evaluation and blast rings | Same bounded capacity per lane as background rings | Fixed `Option<Job>` slots; overflow falls back to background lanes or pending state |
 | Focus regions | 8 fixed chunk rectangles | Slice-count expiry; O(8) membership check; oldest-expiring region replaced when full |
 | Action records | 256 fixed records | Ring overwrites oldest; stores admission, action-applied, first-effect, and local-settle slice indices |
+| Action-effect index | 32 bytes per logical chunk | Fixed 256-record bitset limits first-effect checks to the target's neighboring chunks; completed actions are removed from the index |
 | Command ring | Capacity 1 through 256; 256 by default | Fixed slots; same-cell paint coalesces in O(1); distinct full commands reject |
 | Dirty-chunk flags | One byte per logical 32x32 chunk | Deduplicated; each drain inspects at most 256 chunks |
 | Reset and fixture cursors | Constant-size cursor and descriptor state | One cell per charged quantum; no world-sized staging buffer |
 
-At 4096x4096 using default queue capacities, the compiled array payload totals exactly 102,276,096 bytes (97.53 MiB), including cells (33,554,432 bytes), pending state (50,331,648 bytes), captured frontier (16,777,216 bytes), four ready-ring arrays (1,572,864 bytes), command slots (2,048 bytes), chunk flags (16,384 bytes), and the fixed action-record ring plus fixed focus metadata. Layouts are `Cell = 2`, `PendingCell = 3`, `Option<Job> = 12`, and `Option<Command> = 8` bytes. This is below the 256 MiB CPU storage limit. Allocator metadata, fixed struct fields, and process RSS are excluded. Constructor validation rejects any configured arrays whose payload would exceed the limit.
+At 4096x4096 using default queue capacities, the compiled array payload totals exactly 102,800,896 bytes (98.04 MiB), including cells (33,554,432 bytes), pending state (50,331,648 bytes), captured frontier (16,777,216 bytes), four ready-ring arrays (1,572,864 bytes), command slots (2,048 bytes), chunk flags (16,384 bytes), the fixed action-record ring, action-effect index (524,288 bytes), execution sample (512 bytes), and fixed focus metadata. Layouts are `Cell = 2`, `PendingCell = 3`, `Option<Job> = 12`, and `Option<Command> = 8` bytes. This is below the 256 MiB CPU storage limit. Allocator metadata, fixed struct fields, and process RSS are excluded. Constructor validation rejects any configured arrays whose payload would exceed the limit.
 
 ## Quantum contracts and accounting
 

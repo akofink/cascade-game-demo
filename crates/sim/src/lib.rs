@@ -160,6 +160,7 @@ pub struct ResourceTable {
     pub ready_bytes: usize,
     pub focus_ready_bytes: usize,
     pub action_record_bytes: usize,
+    pub action_effect_index_bytes: usize,
     pub command_bytes: usize,
     pub chunk_bytes: usize,
     pub visualization_bytes: usize,
@@ -339,6 +340,7 @@ pub struct SliceMetrics {
     pub blasts: u32,
     pub recoveries: u32,
     pub commands: u32,
+    pub action_effect_candidates: u32,
     pub focus_evaluations: u32,
     pub focus_blasts: u32,
     pub background_evaluations: u32,
@@ -376,6 +378,9 @@ pub struct World {
     action_records: Vec<Option<ActionRecord>>,
     action_cursor: usize,
     action_sequence: u64,
+    action_effect_index: Vec<[u64; ACTION_RECORD_CAPACITY / 64]>,
+    pending_action_effect_count: usize,
+    action_effect_candidates_this_slice: u32,
     commands: Ring<Command>,
     generation: Generation,
     budget: Credits,
@@ -396,6 +401,7 @@ pub struct World {
     last_executed_cells: [u32; VISUALIZED_CELLS_PER_SLICE],
     last_executed_len: usize,
     last_executed_count: u32,
+    last_paint_count: u32,
 }
 
 impl World {
@@ -481,6 +487,12 @@ impl World {
             })
             .and_then(|bytes| {
                 bytes.checked_add(
+                    chunk_count
+                        .checked_mul(std::mem::size_of::<[u64; ACTION_RECORD_CAPACITY / 64]>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
                     VISUALIZED_CELLS_PER_SLICE.checked_mul(std::mem::size_of::<u32>())?,
                 )
             })
@@ -508,6 +520,9 @@ impl World {
             action_records: vec![None; ACTION_RECORD_CAPACITY],
             action_cursor: 0,
             action_sequence: 0,
+            action_effect_index: vec![[0; ACTION_RECORD_CAPACITY / 64]; chunk_count],
+            pending_action_effect_count: 0,
+            action_effect_candidates_this_slice: 0,
             commands: Ring::new(command_capacity.0),
             generation: Generation(1),
             budget,
@@ -528,6 +543,7 @@ impl World {
             last_executed_cells: [u32::MAX; VISUALIZED_CELLS_PER_SLICE],
             last_executed_len: 0,
             last_executed_count: 0,
+            last_paint_count: 0,
         })
     }
     pub fn dimensions(&self) -> (u32, u32) {
@@ -553,7 +569,7 @@ impl World {
     pub fn policy(&self) -> SchedulerPolicy {
         self.policy
     }
-    /// Bounded sample of cells executed during the most recent slice.
+    /// The first bounded sample of cells executed during the most recent slice.
     pub fn cell_executed_last(&self, id: CellId) -> bool {
         self.last_executed_cells[..self.last_executed_len].contains(&id.0)
     }
@@ -569,11 +585,7 @@ impl World {
         if self.last_executed_len < VISUALIZED_CELLS_PER_SLICE {
             self.last_executed_cells[self.last_executed_len] = id.0;
             self.last_executed_len += 1;
-        } else {
-            let slot = self.last_executed_count as usize % VISUALIZED_CELLS_PER_SLICE;
-            self.last_executed_cells[slot] = id.0;
         }
-        self.last_executed_count = self.last_executed_count.saturating_add(1);
     }
     pub fn set_focus_enabled(&mut self, enabled: bool) {
         self.focus_enabled = enabled;
@@ -733,6 +745,8 @@ impl World {
                 * std::mem::size_of::<Option<Job>>(),
             action_record_bytes: self.action_records.len()
                 * std::mem::size_of::<Option<ActionRecord>>(),
+            action_effect_index_bytes: self.action_effect_index.len()
+                * std::mem::size_of::<[u64; ACTION_RECORD_CAPACITY / 64]>(),
             command_bytes: self.commands.slots.len() * std::mem::size_of::<Option<Command>>(),
             chunk_bytes: self.dirty_chunks.len() * std::mem::size_of::<bool>(),
             visualization_bytes: VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
@@ -745,6 +759,8 @@ impl World {
                     + self.focus_blast_ready.slots.len())
                     * std::mem::size_of::<Option<Job>>()
                 + self.action_records.len() * std::mem::size_of::<Option<ActionRecord>>()
+                + self.action_effect_index.len()
+                    * std::mem::size_of::<[u64; ACTION_RECORD_CAPACITY / 64]>()
                 + self.commands.slots.len() * std::mem::size_of::<Option<Command>>()
                 + self.dirty_chunks.len() * std::mem::size_of::<bool>()
                 + VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
@@ -1203,7 +1219,34 @@ impl World {
             }
         }
     }
+    fn index_action_effect(&mut self, record_index: usize, target: u32, add: bool) {
+        let x = target % self.width;
+        let y = target / self.width;
+        let min_chunk_x = x.saturating_sub(1) / CHUNK_SIDE;
+        let max_chunk_x = x.saturating_add(1).min(self.width - 1) / CHUNK_SIDE;
+        let min_chunk_y = y.saturating_sub(1) / CHUNK_SIDE;
+        let max_chunk_y = y.saturating_add(1).min(self.height - 1) / CHUNK_SIDE;
+        let word = record_index / 64;
+        let mask = 1_u64 << (record_index % 64);
+        for chunk_y in min_chunk_y..=max_chunk_y {
+            for chunk_x in min_chunk_x..=max_chunk_x {
+                let chunk = (chunk_y * self.chunks_x + chunk_x) as usize;
+                if add {
+                    self.action_effect_index[chunk][word] |= mask;
+                } else {
+                    self.action_effect_index[chunk][word] &= !mask;
+                }
+            }
+        }
+    }
     fn register_action(&mut self, cell: CellId) {
+        if let Some(previous) = self.action_records[self.action_cursor]
+            && previous.action_applied_slice.is_some()
+            && previous.first_effect_slice.is_none()
+        {
+            self.index_action_effect(self.action_cursor, previous.target, false);
+            self.pending_action_effect_count -= 1;
+        }
         self.action_sequence = self.action_sequence.wrapping_add(1).max(1);
         self.action_records[self.action_cursor] = Some(ActionRecord {
             sequence: self.action_sequence,
@@ -1216,17 +1259,33 @@ impl World {
         self.action_cursor = (self.action_cursor + 1) % self.action_records.len();
     }
     fn note_action_effect(&mut self, cell: CellId) {
+        if self.pending_action_effect_count == 0 {
+            return;
+        }
+        let (x, y) = (cell.0 % self.width, cell.0 / self.width);
+        let chunk = ((y / CHUNK_SIDE) * self.chunks_x + x / CHUNK_SIDE) as usize;
+        let mut candidates = self.action_effect_index[chunk];
         let slice = self.slice.saturating_add(1);
-        for record in self.action_records.iter_mut().flatten() {
-            let target = record.target;
-            let (tx, ty) = (target % self.width, target / self.width);
-            let (x, y) = (cell.0 % self.width, cell.0 / self.width);
-            if tx.abs_diff(x) <= 1
-                && ty.abs_diff(y) <= 1
-                && record.action_applied_slice.is_some()
-                && record.first_effect_slice.is_none()
-            {
-                record.first_effect_slice = Some(slice);
+        for (word_index, word) in candidates.iter_mut().enumerate() {
+            while *word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let record_index = word_index * 64 + bit;
+                self.action_effect_candidates_this_slice =
+                    self.action_effect_candidates_this_slice.saturating_add(1);
+                if let Some(mut record) = self.action_records[record_index] {
+                    let (target_x, target_y) =
+                        (record.target % self.width, record.target / self.width);
+                    if record.first_effect_slice.is_none()
+                        && target_x.abs_diff(x) <= 1
+                        && target_y.abs_diff(y) <= 1
+                    {
+                        record.first_effect_slice = Some(slice);
+                        self.action_records[record_index] = Some(record);
+                        self.index_action_effect(record_index, record.target, false);
+                        self.pending_action_effect_count -= 1;
+                    }
+                }
+                *word &= *word - 1;
             }
         }
     }
@@ -1258,9 +1317,15 @@ impl World {
     }
     fn note_action_applied(&mut self, cell: CellId) {
         let slice = self.slice.saturating_add(1);
-        for record in self.action_records.iter_mut().flatten() {
-            if record.target == cell.0 && record.action_applied_slice.is_none() {
+        for index in 0..self.action_records.len() {
+            if let Some(mut record) = self.action_records[index]
+                && record.target == cell.0
+                && record.action_applied_slice.is_none()
+            {
                 record.action_applied_slice = Some(slice);
+                self.action_records[index] = Some(record);
+                self.index_action_effect(index, record.target, true);
+                self.pending_action_effect_count += 1;
             }
         }
     }
@@ -1330,19 +1395,28 @@ impl World {
     }
     /// Run exactly one policy slice. Traditional mode drains only the ready frontier captured at entry.
     pub fn step(&mut self) -> SliceMetrics {
-        if self.policy == SchedulerPolicy::Traditional
+        self.last_executed_len = 0;
+        self.last_executed_count = 0;
+        self.last_paint_count = 0;
+        self.action_effect_candidates_this_slice = 0;
+        let mut metrics = if self.policy == SchedulerPolicy::Traditional
             && self.reset_cursor.is_none()
             && self.fixture.is_none()
             && self.fixture_waiting.is_none()
         {
-            return self.step_traditional();
-        }
-        self.step_bounded()
+            self.step_traditional()
+        } else {
+            self.step_bounded()
+        };
+        self.last_executed_count = metrics
+            .evaluations
+            .saturating_add(metrics.blasts)
+            .saturating_add(self.last_paint_count);
+        metrics.action_effect_candidates = self.action_effect_candidates_this_slice;
+        metrics
     }
     /// Bounded mode charges every probe and quantum before work.
     fn step_bounded(&mut self) -> SliceMetrics {
-        self.last_executed_len = 0;
-        self.last_executed_count = 0;
         let mut m = SliceMetrics {
             allowed: self.budget.0,
             slice: self.slice + 1,
@@ -1555,7 +1629,6 @@ impl World {
                 let i = j.cell.index();
                 match j.kind {
                     JobKind::Evaluate => {
-                        self.record_executed_cell(j.cell);
                         let focused_job = pick_focus;
                         self.pending[i].set(
                             if focused_job {
@@ -1570,6 +1643,7 @@ impl World {
                             self.pending[i].set(PendingCell::EVAL_QUEUED, false);
                         }
                         if self.pending[i].has(PendingCell::EVAL_PENDING) {
+                            self.record_executed_cell(j.cell);
                             self.note_action_effect(j.cell);
                             self.execute_evaluate(j.cell);
                             m.evaluations += 1;
@@ -1581,7 +1655,6 @@ impl World {
                         }
                     }
                     JobKind::Blast => {
-                        self.record_executed_cell(j.cell);
                         let focused_job = pick_focus;
                         self.pending[i].set(
                             if focused_job {
@@ -1596,6 +1669,7 @@ impl World {
                             self.pending[i].set(PendingCell::BLAST_QUEUED, false);
                         }
                         if self.pending[i].blast > 0 {
+                            self.record_executed_cell(j.cell);
                             self.note_action_effect(j.cell);
                             self.execute_blast(j.cell);
                             m.blasts += 1;
@@ -1610,6 +1684,7 @@ impl World {
             } else if let Some(c) = command {
                 if let Command::Paint { cell, .. } = c {
                     self.record_executed_cell(cell);
+                    self.last_paint_count = self.last_paint_count.saturating_add(1);
                     self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
                 }
                 self.execute_command(c);
@@ -1674,8 +1749,6 @@ impl World {
         self.reset_cursor.is_some()
     }
     fn step_traditional(&mut self) -> SliceMetrics {
-        self.last_executed_len = 0;
-        self.last_executed_count = 0;
         let mut metrics = SliceMetrics {
             allowed: self.budget.0,
             slice: self.slice + 1,
@@ -1750,6 +1823,7 @@ impl World {
             metrics.selections += 1;
             if let Command::Paint { cell, .. } = command {
                 self.record_executed_cell(cell);
+                self.last_paint_count = self.last_paint_count.saturating_add(1);
                 self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
             }
             self.execute_command(command);
@@ -2099,6 +2173,58 @@ mod tests {
         assert!(record.action_applied_slice.is_some());
         assert!(record.first_effect_slice.is_some());
         assert!(record.local_settle_slice.is_some());
+        assert_eq!(w.pending_action_effect_count, 0);
+    }
+
+    #[test]
+    fn completed_action_records_do_not_add_traditional_per_cell_probes() {
+        let mut w = World::new_with_policy(
+            256,
+            1,
+            Credits::new(128),
+            Capacity::new(256),
+            Capacity::new(16),
+            SchedulerPolicy::Traditional,
+        )
+        .unwrap();
+        for index in 0..ACTION_RECORD_CAPACITY {
+            let cell = CellId::from_index(index);
+            w.register_action(cell);
+            w.note_action_applied(cell);
+            w.note_action_effect(cell);
+        }
+        assert_eq!(w.pending_action_effect_count, 0);
+        for index in 0..256 {
+            w.mark_cell_for_evaluation(CellId::from_index(index))
+                .unwrap();
+        }
+        let metrics = w.step();
+        assert_eq!(metrics.evaluations, 256);
+        assert_eq!(metrics.action_effect_candidates, 0);
+    }
+
+    #[test]
+    fn action_effect_index_skips_unrelated_chunks_in_traditional_mode() {
+        let mut w = World::new_with_policy(
+            512,
+            512,
+            Credits::new(128),
+            Capacity::new(256),
+            Capacity::new(16),
+            SchedulerPolicy::Traditional,
+        )
+        .unwrap();
+        for index in 0..16 {
+            let target = w.cell_id(index, 0).unwrap();
+            w.register_action(target);
+            w.note_action_applied(target);
+        }
+        let unrelated = w.cell_id(400, 400).unwrap();
+        w.mark_cell_for_evaluation(unrelated).unwrap();
+        let metrics = w.step();
+        assert_eq!(metrics.evaluations, 1);
+        assert_eq!(metrics.action_effect_candidates, 0);
+        assert_eq!(w.pending_action_effect_count, 16);
     }
 
     #[test]
@@ -2223,7 +2349,8 @@ mod tests {
         assert_eq!(resources.cell_bytes, 2);
         assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
         assert_eq!(resources.captured_frontier_bytes, 4096 * 4096);
-        assert_eq!(resources.total_bytes, 102_276_608);
+        assert_eq!(resources.action_effect_index_bytes, 16_384 * 32);
+        assert_eq!(resources.total_bytes, 102_800_896);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
@@ -2239,6 +2366,32 @@ mod tests {
         w.step();
         assert!(!w.cell_executed_last(id));
         assert_eq!(w.visualized_cell_count(), 0);
+    }
+
+    #[test]
+    fn traditional_visualization_caps_cell_writes_and_uses_slice_metrics_for_total() {
+        let mut w = World::new_with_policy(
+            256,
+            1,
+            Credits::new(128),
+            Capacity::new(256),
+            Capacity::new(16),
+            SchedulerPolicy::Traditional,
+        )
+        .unwrap();
+        for index in 0..256 {
+            w.mark_cell_for_evaluation(CellId::from_index(index))
+                .unwrap();
+        }
+        let metrics = w.step();
+        assert_eq!(metrics.evaluations, 256);
+        assert_eq!(w.visualized_cell_count(), VISUALIZED_CELLS_PER_SLICE);
+        assert_eq!(
+            w.executed_quantum_count(),
+            metrics.evaluations + metrics.blasts
+        );
+        assert!(w.cell_executed_last(CellId::from_index(0)));
+        assert!(!w.cell_executed_last(CellId::from_index(255)));
     }
 
     #[test]
