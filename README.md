@@ -10,8 +10,9 @@ Read the [documentation site](https://akofink.com/cascade-game-demo/).
 
 ## Status
 
-The headless simulation core is on main. The native shell renders a placeholder
-material grid and is not driven by the simulation yet.
+The native app runs a 1024 x 1024 `cascade-sim` world, prepares fixtures incrementally,
+and displays the bounded scheduler and upload backlog. The 4096 x 4096 charter world remains
+available to the headless core; the demo starts smaller for interactive responsiveness.
 
 ## Prior art
 
@@ -37,9 +38,16 @@ Closest references:
 cargo run -p cascade-app
 ```
 
-Drag with the left mouse button to pan. Scroll to zoom. Arrow keys and WASD also pan.
-The overlay graphs actual frame intervals and shows upload backlog. **DESTROY PERFORMANCE**
-is visible and not wired yet.
+Drag with the left mouse button to pan; scroll to zoom. Arrow keys and WASD also pan.
+Select a material in the overlay, then Shift-drag to paint (Air erases); each presentation
+iteration admits at most 64 brush descriptors. Right-click ignites wood or explosives; Shift-right-click
+detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
+The overlay selects fixtures, reports preparation progress, adjusts credits (25 to 100,000),
+toggles deferred-cell highlighting, and restarts the selected fixture when switching between
+bounded and traditional scheduling. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
+admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.
+The overlay graphs actual frame intervals and reports scheduler credits, quanta, pending work,
+command coalescing/rejection, and upload staleness.
 
 A native smoke check opens a window, pans, zooms, resizes, and exits:
 

@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cascade_app::{
-    CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord, FrameHistory, MaterialGrid, OverlayInput, PALETTE,
-    PLACEHOLDER_SIZE, PlaceholderSource, SMOKE_SAMPLE_CELL, SurfaceChange, UploadBudget,
-    UploadPlan, UploadScheduler, ViewCommand, apply_command, bytes_per_chunk, frame_uniform,
-    show_overlay, surface_change, zoom_factor,
+    BRUSH_CELLS_PER_FRAME, CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord, DEMO_HEIGHT, DEMO_WIDTH,
+    Demo, FrameHistory, MAX_CHUNKS_PER_FRAME, OverlayActions, OverlayInput, PALETTE, SurfaceChange,
+    UploadBudget, UploadPlan, UploadScheduler, ViewCommand, apply_command, bytes_per_chunk,
+    frame_uniform, show_overlay, surface_change, zoom_factor,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -19,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct Gpu {
     window: Arc<Window>,
@@ -57,14 +57,21 @@ struct Smoke {
     zero_start_reconfigs: u32,
     zero_ok: bool,
     hold_frames: u32,
+    overload_frames: u32,
+    max_pending: usize,
+    max_ready: usize,
+    max_upload_backlog: usize,
+    max_frame_interval_ns: u64,
     failed: Option<String>,
 }
 
 struct App {
     gpu: Option<Gpu>,
     camera: Camera,
-    source: PlaceholderSource,
+    demo: Demo,
+    deferred_overlay: bool,
     uploads: UploadScheduler,
+    dirty_chunks: Vec<(u32, u32)>,
     history: FrameHistory,
     last_present: Option<Instant>,
     clock_origin: Instant,
@@ -72,9 +79,13 @@ struct App {
     submit_cpu_ms: f32,
     last_plan: UploadPlan,
     destroy_presses: u64,
+    destroy_started: bool,
     occluded: bool,
     seeded: bool,
     dragging: bool,
+    painting: bool,
+    shift_down: bool,
+    brush_commands_this_frame: usize,
     last_cursor: Option<(f32, f32)>,
     outdated_handled: bool,
     surface_rebuilds: u32,
@@ -140,19 +151,27 @@ fn parse_args() -> Result<bool, String> {
 
 impl App {
     fn new(smoke: bool) -> Self {
-        let source = match PlaceholderSource::new() {
-            Ok(source) => source,
+        let mut demo = match Demo::new() {
+            Ok(demo) => demo,
             Err(error) => {
-                eprintln!("placeholder grid: {error}");
+                eprintln!("simulation: {error}");
                 std::process::exit(1);
             }
         };
-        let (chunks_x, chunks_y) = source.grid().chunk_extent();
+        if let Err(error) = demo.start_fixture() {
+            eprintln!("initial fixture: {error}");
+            std::process::exit(1);
+        }
+        let (width, height) = demo.dimensions();
+        let chunks_x = width / CHUNK_SIZE;
+        let chunks_y = height / CHUNK_SIZE;
         Self {
             gpu: None,
             camera: Camera::default(),
-            source,
+            demo,
+            deferred_overlay: false,
             uploads: UploadScheduler::new(chunks_x, chunks_y),
+            dirty_chunks: Vec::with_capacity(MAX_CHUNKS_PER_FRAME),
             history: FrameHistory::default(),
             last_present: None,
             clock_origin: Instant::now(),
@@ -160,9 +179,13 @@ impl App {
             submit_cpu_ms: 0.0,
             last_plan: UploadPlan::default(),
             destroy_presses: 0,
+            destroy_started: false,
             occluded: false,
             seeded: false,
             dragging: false,
+            painting: false,
+            shift_down: false,
+            brush_commands_this_frame: 0,
             last_cursor: None,
             outdated_handled: false,
             surface_rebuilds: 0,
@@ -187,6 +210,11 @@ impl App {
                 zero_start_reconfigs: 0,
                 zero_ok: false,
                 hold_frames: 0,
+                overload_frames: 0,
+                max_pending: 0,
+                max_ready: 0,
+                max_upload_backlog: 0,
+                max_frame_interval_ns: 0,
                 failed: None,
             }),
             exit_code: 0,
@@ -201,6 +229,60 @@ impl App {
         self.gpu
             .as_ref()
             .map(|gpu| (gpu.config.width as f32, gpu.config.height as f32))
+    }
+
+    fn apply_overlay_actions(&mut self, actions: OverlayActions) {
+        if actions.toggle_pause {
+            self.demo.toggle_paused();
+        }
+        if actions.single_step {
+            self.demo.single_step();
+        }
+        if actions.reset
+            && let Err(error) = self.demo.reset()
+        {
+            eprintln!("{error}");
+        }
+        if let Some(fixture) = actions.fixture {
+            self.demo.select_fixture(fixture);
+        }
+        if actions.load_fixture
+            && let Err(error) = self.demo.start_fixture()
+        {
+            eprintln!("{error}");
+        }
+        if let Some(material) = actions.material {
+            self.demo.set_selected_material(material);
+        }
+        if let Some(credits) = actions.credits {
+            let _ = self.demo.set_credits(credits);
+        }
+        if let Some(policy) = actions.policy {
+            self.demo.set_policy(policy);
+            if let Err(error) = self.demo.start_fixture() {
+                eprintln!("restart fixture for policy: {error}");
+            }
+        }
+        if let Some(show) = actions.deferred_overlay
+            && self.deferred_overlay != show
+        {
+            self.deferred_overlay = show;
+            self.uploads.mark_all();
+        }
+        self.demo.set_destroy_held(actions.destroy_held);
+        if actions.destroy_held && !self.destroy_started {
+            self.demo
+                .select_fixture(cascade_sim::fixtures::FixtureId::MixedOverload);
+            if let Err(error) = self.demo.start_fixture() {
+                eprintln!("start mixed overload: {error}");
+            }
+            self.destroy_started = true;
+        } else if !actions.destroy_held {
+            self.destroy_started = false;
+        }
+        if actions.destroy_pressed {
+            self.destroy_presses = self.destroy_presses.saturating_add(1);
+        }
     }
 
     fn apply_size(&mut self, requested: (u32, u32)) {
@@ -236,14 +318,19 @@ impl App {
     }
 
     fn upload_dirty(&mut self) {
+        self.brush_commands_this_frame = 0;
         self.uploads.set_clock(self.now_ms());
         if !self.seeded {
             self.uploads.mark_all();
             self.seeded = true;
         }
-        let batch = self.source.tick();
-        for chunk in &batch.chunks[..batch.count] {
-            let _ = self.uploads.mark_dirty(*chunk);
+        self.demo.tick();
+        self.dirty_chunks.clear();
+        self.demo
+            .world_mut()
+            .drain_dirty_chunks(MAX_CHUNKS_PER_FRAME, &mut self.dirty_chunks);
+        for &(x, y) in &self.dirty_chunks {
+            let _ = self.uploads.mark_dirty(ChunkCoord { x, y });
         }
         let started = Instant::now();
         let plan = self
@@ -251,7 +338,13 @@ impl App {
             .plan(bytes_per_chunk(1), UploadBudget::default());
         if let Some(gpu) = self.gpu.as_ref() {
             for chunk in &plan.chunks[..plan.count] {
-                write_chunk(&gpu.queue, &gpu.grid_texture, self.source.grid(), *chunk);
+                write_chunk(
+                    &gpu.queue,
+                    &gpu.grid_texture,
+                    self.demo.world(),
+                    *chunk,
+                    self.deferred_overlay,
+                );
             }
         }
         self.upload_cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -351,7 +444,7 @@ impl App {
             }
         };
 
-        let world = self.source.grid().size();
+        let world = self.demo.dimensions();
         let uniform = frame_uniform(&self.camera, world);
         let mut intervals = [0_u64; 240];
         let interval_count = self.history.copy_intervals_ns(&mut intervals);
@@ -369,6 +462,10 @@ impl App {
             payload_bytes: self.last_plan.payload_bytes,
             surface_reconfigures: gpu.surface_reconfigures,
             destroy_presses: self.destroy_presses,
+            sim: self.demo.metrics(),
+            material: self.demo.selected_material(),
+            credits: self.demo.credits(),
+            deferred_overlay: self.deferred_overlay,
         };
 
         let egui_ctx = gpu.egui_state.egui_ctx().clone();
@@ -384,13 +481,11 @@ impl App {
         );
         gpu.egui_inited = true;
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
-        let mut destroy_clicked = false;
+        let mut actions = OverlayActions::default();
         let mut full_output = egui_ctx.run_ui(raw_input, |_| {
-            show_overlay(&egui_ctx, &overlay, &mut destroy_clicked);
+            show_overlay(&egui_ctx, &overlay, &mut actions);
         });
-        if destroy_clicked {
-            self.destroy_presses += 1;
-        }
+        self.apply_overlay_actions(actions);
         let gpu = self.gpu.as_mut().expect("gpu still present");
         gpu.egui_state
             .handle_platform_output(&gpu.window, full_output.platform_output);
@@ -485,7 +580,32 @@ impl App {
             return;
         };
         smoke.presents += 1;
-        if smoke.presents >= 1 && !smoke.readback_ok && smoke.readback_note.is_empty() {
+        let sim_metrics = self.demo.metrics();
+        smoke.max_pending = smoke.max_pending.max(sim_metrics.slice.pending_cells);
+        smoke.max_ready = smoke.max_ready.max(sim_metrics.slice.ready_len);
+        smoke.max_upload_backlog = smoke.max_upload_backlog.max(self.last_plan.backlog);
+        smoke.max_frame_interval_ns = smoke
+            .max_frame_interval_ns
+            .max(self.history.summary().max_ns);
+        if sim_metrics
+            .fixture_progress
+            .is_some_and(|progress| progress.complete)
+            && smoke.overload_frames < 120
+        {
+            self.demo.set_destroy_held(true);
+            smoke.overload_frames += 1;
+        } else if smoke.overload_frames >= 120 {
+            self.demo.set_destroy_held(false);
+        }
+        if smoke.presents >= 1
+            && !smoke.readback_ok
+            && smoke.readback_note.is_empty()
+            && self
+                .demo
+                .metrics()
+                .fixture_progress
+                .is_some_and(|progress| progress.complete)
+        {
             match self.sample_grid() {
                 Ok(note) => {
                     smoke.readback_ok = true;
@@ -512,7 +632,7 @@ impl App {
             let before = self.camera.cells_per_pixel;
             let origin = self.camera.origin_x;
             let viewport = self.viewport().unwrap_or((1.0, 1.0));
-            let world = self.source.grid().size();
+            let world = self.demo.dimensions();
             apply_command(
                 &mut self.camera,
                 ViewCommand::PanPixels {
@@ -574,6 +694,7 @@ impl App {
             && smoke.uploaded > 0
             && smoke.resize_targets_seen == 2
             && smoke.zero_ok
+            && smoke.overload_frames >= 120
             && smoke.presents >= 20;
         if ready && !smoke.settled_printed {
             smoke.settled_printed = true;
@@ -604,11 +725,11 @@ impl App {
     fn sample_grid(&mut self) -> Result<String, String> {
         let gpu = self.gpu.as_ref().ok_or("gpu missing for sample")?;
         let sample_camera = Camera {
-            origin_x: SMOKE_SAMPLE_CELL.0 as f32,
-            origin_y: SMOKE_SAMPLE_CELL.1 as f32,
+            origin_x: 220.0,
+            origin_y: 220.0,
             cells_per_pixel: 1.0,
         };
-        let uniform = frame_uniform(&sample_camera, self.source.grid().size());
+        let uniform = frame_uniform(&sample_camera, self.demo.dimensions());
         gpu.queue.write_buffer(&gpu.uniform_buf, 0, &uniform);
         let format = gpu.config.format;
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -707,7 +828,7 @@ impl App {
             .all(|(got, want)| got.abs_diff(want) <= 1);
         if !close {
             return Err(format!(
-                "sample pixel {pixel:?} != sand {expected:?} ({format:?}) at {SMOKE_SAMPLE_CELL:?}"
+                "sample pixel {pixel:?} != sand {expected:?} ({format:?}) at (220, 220)"
             ));
         }
         Ok(format!("sample {pixel:?} {format:?}"))
@@ -746,11 +867,25 @@ impl App {
         let Some(viewport) = self.viewport() else {
             return;
         };
-        let world = self.source.grid().size();
+        let world = self.demo.dimensions();
         match event {
             WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = *state == ElementState::Pressed;
                 if *button == MouseButton::Left {
-                    self.dragging = *state == ElementState::Pressed;
+                    self.painting = pressed && self.shift_down;
+                    self.dragging = pressed && !self.shift_down;
+                } else if *button == MouseButton::Right
+                    && pressed
+                    && let Some((px, py)) = self.last_cursor
+                {
+                    let (wx, wy) = self.camera.world_at_pixel(px, py);
+                    if wx >= 0.0 && wy >= 0.0 {
+                        if self.shift_down {
+                            self.demo.detonate_at(wx.floor() as u32, wy.floor() as u32);
+                        } else {
+                            self.demo.ignite_at(wx.floor() as u32, wy.floor() as u32);
+                        }
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -767,6 +902,19 @@ impl App {
                         viewport,
                         world,
                     );
+                }
+                if self.painting && self.brush_commands_this_frame < BRUSH_CELLS_PER_FRAME {
+                    let (wx, wy) = self.camera.world_at_pixel(cursor.0, cursor.1);
+                    if wx >= 0.0 && wy >= 0.0 {
+                        let remaining = BRUSH_CELLS_PER_FRAME - self.brush_commands_this_frame;
+                        self.brush_commands_this_frame += self.demo.submit_brush_disk(
+                            wx.floor() as u32,
+                            wy.floor() as u32,
+                            2,
+                            false,
+                            remaining,
+                        );
+                    }
                 }
                 self.last_cursor = Some(cursor);
             }
@@ -790,8 +938,22 @@ impl App {
                 );
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.logical_key == Key::Named(NamedKey::Shift) {
+                    self.shift_down = event.state == ElementState::Pressed;
+                    return;
+                }
                 if event.state != ElementState::Pressed {
                     return;
+                }
+                match &event.logical_key {
+                    Key::Named(NamedKey::Space) => self.demo.toggle_paused(),
+                    Key::Character(text) if text == "." => self.demo.single_step(),
+                    Key::Character(text) if text.eq_ignore_ascii_case("r") => {
+                        if let Err(error) = self.demo.reset() {
+                            eprintln!("{error}");
+                        }
+                    }
+                    _ => {}
                 }
                 let pan = match &event.logical_key {
                     Key::Named(NamedKey::ArrowLeft) => Some((-32.0, 0.0)),
@@ -826,7 +988,7 @@ impl ApplicationHandler for App {
         match create_gpu(event_loop) {
             Ok(gpu) => {
                 let viewport = (gpu.config.width as f32, gpu.config.height as f32);
-                self.camera.fit(self.source.grid().size(), viewport);
+                self.camera.fit(self.demo.dimensions(), viewport);
                 gpu.window.request_redraw();
                 self.gpu = Some(gpu);
             }
@@ -953,7 +1115,7 @@ fn create_gpu(event_loop: &ActiveEventLoop) -> Result<Gpu, String> {
         cache: None,
     });
 
-    let world = (PLACEHOLDER_SIZE, PLACEHOLDER_SIZE);
+    let world = (DEMO_WIDTH, DEMO_HEIGHT);
     let grid_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("materials"),
         size: wgpu::Extent3d {
@@ -1031,12 +1193,28 @@ fn create_gpu(event_loop: &ActiveEventLoop) -> Result<Gpu, String> {
 fn write_chunk(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
-    grid: &MaterialGrid,
+    world: &cascade_sim::World,
     chunk: ChunkCoord,
+    deferred_overlay: bool,
 ) {
     let mut bytes = [0_u8; CHUNK_CELLS];
-    if !grid.copy_chunk(chunk, &mut bytes) {
-        return;
+    let (width, height) = world.dimensions();
+    for y in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
+            let cell_x = chunk.x * CHUNK_SIZE + x;
+            let cell_y = chunk.y * CHUNK_SIZE + y;
+            if cell_x < width && cell_y < height {
+                bytes[(y * CHUNK_SIZE + x) as usize] =
+                    if deferred_overlay && world.cell_pending(cell_x, cell_y) == Some(true) {
+                        6
+                    } else {
+                        world
+                            .cell(cell_x, cell_y)
+                            .map(|cell| cell.material as u8)
+                            .unwrap_or(0)
+                    };
+            }
+        }
     }
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -1102,7 +1280,7 @@ fn elapsed_ns(previous: Instant, now: Instant) -> u64 {
 
 fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
     println!(
-        "smoke presents={} pan={} zoom={} readback={} ({}) stale={} uploaded={} resizes_seen={} resize_from={:?} resize_mid={:?} zero_ok={} reconfigures={} hold={}",
+        "smoke presents={} pan={} zoom={} readback={} ({}) stale={} uploaded={} resizes_seen={} resize_from={:?} resize_mid={:?} zero_ok={} reconfigures={} overload_frames={} max_pending={} max_ready={} max_upload_backlog={} max_frame_ms={:.2} hold={}",
         smoke.presents,
         smoke.pan_ok,
         smoke.zoom_ok,
@@ -1115,6 +1293,11 @@ fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
         smoke.resize_mid,
         smoke.zero_ok,
         surface_reconfigures,
+        smoke.overload_frames,
+        smoke.max_pending,
+        smoke.max_ready,
+        smoke.max_upload_backlog,
+        smoke.max_frame_interval_ns as f32 / 1_000_000.0,
         smoke.hold_frames,
     );
 }

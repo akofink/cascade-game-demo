@@ -10,6 +10,7 @@ pub const DEFAULT_READY_CAPACITY: usize = 32_768;
 pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
 pub const RULE_VERSION: u32 = 3;
 pub const MAX_QUANTUM_COST: u32 = 24;
+pub const MAX_BUDGET_CREDITS: u32 = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -90,6 +91,7 @@ pub enum SimError {
     InvalidDimensions,
     WorldTooLarge,
     BudgetTooSmall,
+    BudgetTooLarge,
     CapacityZero,
     GenerationExhausted,
     OutOfBounds,
@@ -299,6 +301,9 @@ impl World {
         if budget.0 < 25 {
             return Err(SimError::BudgetTooSmall);
         }
+        if budget.0 > MAX_BUDGET_CREDITS {
+            return Err(SimError::BudgetTooLarge);
+        }
         if ready_capacity.0 == 0 || command_capacity.0 == 0 {
             return Err(SimError::CapacityZero);
         }
@@ -347,6 +352,17 @@ impl World {
     }
     pub fn cost_contract(&self) -> CostContract {
         self.costs
+    }
+    /// Change the bounded slice allowance without changing any queued work.
+    pub fn set_budget(&mut self, budget: Credits) -> Result<(), SimError> {
+        if budget.0 < (self.costs.selection.0 + MAX_QUANTUM_COST) {
+            return Err(SimError::BudgetTooSmall);
+        }
+        if budget.0 > MAX_BUDGET_CREDITS {
+            return Err(SimError::BudgetTooLarge);
+        }
+        self.budget = budget;
+        Ok(())
     }
     pub fn slice_index(&self) -> u64 {
         self.slice
@@ -432,6 +448,12 @@ impl World {
             state: self.pending[id.index()].blast,
             burning: c.burning,
         })
+    }
+    /// Return whether this cell has deferred simulation work, using its fixed pending record.
+    pub fn cell_pending(&self, x: u32, y: u32) -> Option<bool> {
+        let id = self.cell_id(x, y)?;
+        let pending = self.pending[id.index()];
+        Some(pending.has(PendingCell::EVAL_PENDING) || pending.blast > 0)
     }
     pub fn cell_id(&self, x: u32, y: u32) -> Option<CellId> {
         (x < self.width && y < self.height).then_some(CellId(y * self.width + x))
@@ -1043,6 +1065,23 @@ mod tests {
         assert_eq!(w.resources().cells, 1122);
         assert_eq!(w.resources().ready_capacity, Capacity(8));
     }
+    #[test]
+    fn budget_adjustment_preserves_the_minimum_quantum_contract() {
+        let mut w = world(4, 4, 64, 2, 2);
+        assert_eq!(
+            w.set_budget(Credits::new(24)),
+            Err(SimError::BudgetTooSmall)
+        );
+        assert_eq!(w.set_budget(Credits::new(25)), Ok(()));
+        assert_eq!(
+            w.set_budget(Credits::new(MAX_BUDGET_CREDITS + 1)),
+            Err(SimError::BudgetTooLarge)
+        );
+        let metrics = w.step();
+        assert_eq!(metrics.allowed, 25);
+        assert!(metrics.charged <= metrics.allowed);
+    }
+
     #[test]
     fn rejects_invalid_limits() {
         assert_eq!(
