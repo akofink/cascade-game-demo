@@ -59,6 +59,27 @@ pub fn max_credits() -> u32 {
 }
 pub const BRUSH_CELLS_PER_FRAME: usize = 64;
 
+#[derive(Clone, Copy, Debug)]
+struct PlayerRefresh {
+    kind: crate::ActionKind,
+    x: u32,
+    y: u32,
+    material: Material,
+    slices_left: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlayerMark {
+    pub kind: crate::ActionKind,
+    pub x: u32,
+    pub y: u32,
+    pub admitted: bool,
+    pub rejected: bool,
+    pub material: u8,
+    pub burning: u8,
+    pub paint_material: u8,
+}
+
 fn disturbance_stream() -> DisturbanceCommandStream {
     DisturbanceCommandStream::new(
         0x4341_5345_0001,
@@ -69,18 +90,34 @@ fn disturbance_stream() -> DisturbanceCommandStream {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyChoice {
-    Bounded,
+    BoundedFifo,
+    BoundedFocus,
     Traditional,
 }
 impl PolicyChoice {
-    const fn scheduler(self) -> SchedulerPolicy {
+    pub const ALL: [Self; 3] = [Self::BoundedFifo, Self::BoundedFocus, Self::Traditional];
+    pub const fn scheduler(self) -> SchedulerPolicy {
         match self {
-            Self::Bounded => SchedulerPolicy::Bounded,
+            Self::BoundedFifo | Self::BoundedFocus => SchedulerPolicy::Bounded,
             Self::Traditional => SchedulerPolicy::Traditional,
         }
     }
-    const fn name(self) -> &'static str {
-        self.scheduler().name()
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BoundedFifo => "bounded fifo",
+            Self::BoundedFocus => "bounded focus",
+            Self::Traditional => "traditional",
+        }
+    }
+    pub const fn focus_enabled(self) -> bool {
+        matches!(self, Self::BoundedFocus)
+    }
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::BoundedFifo => "FIFO",
+            Self::BoundedFocus => "Focus",
+            Self::Traditional => "Traditional",
+        }
     }
 }
 
@@ -149,7 +186,10 @@ pub struct Demo {
     selected_material: MaterialChoice,
     credits: u32,
     step_once: bool,
-    destroy_held: bool,
+    destroy_latched: bool,
+    destroy_pointer_held: bool,
+    destroy_key_held: bool,
+    refresh: [Option<PlayerRefresh>; 16],
     disturbances: DisturbanceCommandStream,
     last_metrics: SliceMetrics,
     last_disturbance: u64,
@@ -191,13 +231,16 @@ impl Demo {
             world,
             alternate_world,
             tiny_capacity_active: false,
-            policy: PolicyChoice::Bounded,
+            policy: PolicyChoice::BoundedFifo,
             paused: false,
             selected_fixture: FixtureId::MixedOverload,
             selected_material: MaterialChoice::Sand,
             credits: initial_credits,
             step_once: false,
-            destroy_held: false,
+            destroy_latched: false,
+            destroy_pointer_held: false,
+            destroy_key_held: false,
+            refresh: [None; 16],
             disturbances: disturbance_stream(),
             last_metrics: SliceMetrics::default(),
             last_disturbance: 0,
@@ -242,10 +285,11 @@ impl Demo {
             slice: self.last_metrics,
             paused: self.paused,
             policy: self.policy.name(),
+            // `policy` is the player-facing scheduler label, not only the sim enum name.
             selected_fixture: self.selected_fixture,
             fixture_progress: self.world.fixture_progress(),
             reset_in_progress: self.world.reset_in_progress(),
-            destroy_held: self.destroy_held,
+            destroy_held: self.destroy_active(),
             disturbance_emitted: self.last_disturbance,
             resource_bytes: self.world.resources().total_bytes
                 + self.alternate_world.resources().total_bytes,
@@ -262,8 +306,55 @@ impl Demo {
     pub fn single_step(&mut self) {
         self.step_once = true;
     }
+    pub fn destroy_active(&self) -> bool {
+        self.destroy_latched || self.destroy_pointer_held || self.destroy_key_held
+    }
+    pub fn destroy_latched(&self) -> bool {
+        self.destroy_latched
+    }
+    pub fn set_destroy_key_held(&mut self, held: bool) {
+        if held {
+            self.engage_destroy();
+        }
+        self.destroy_key_held = held;
+    }
+    /// Pointer-hold. A completed mixed fixture is not prepared again.
     pub fn set_destroy_held(&mut self, held: bool) {
-        self.destroy_held = held;
+        if held {
+            self.engage_destroy();
+        }
+        self.destroy_pointer_held = held;
+    }
+    pub fn toggle_destroy_latch(&mut self) {
+        if self.destroy_latched {
+            self.destroy_latched = false;
+        } else {
+            self.engage_destroy();
+            self.destroy_latched = true;
+        }
+    }
+    fn mixed_ready(&self) -> bool {
+        self.selected_fixture == FixtureId::MixedOverload
+            && !self.world.reset_in_progress()
+            && self
+                .world
+                .fixture_progress()
+                .is_some_and(|progress| progress.complete && !progress.cancelled)
+    }
+    fn mixed_preparing(&self) -> bool {
+        self.selected_fixture == FixtureId::MixedOverload
+            && (self.world.reset_in_progress()
+                || self
+                    .world
+                    .fixture_progress()
+                    .is_some_and(|progress| !progress.complete && !progress.cancelled))
+    }
+    fn engage_destroy(&mut self) {
+        if self.mixed_ready() || self.mixed_preparing() {
+            return;
+        }
+        self.selected_fixture = FixtureId::MixedOverload;
+        let _ = self.start_fixture();
     }
     pub fn set_policy(&mut self, policy: PolicyChoice) {
         self.policy = policy;
@@ -297,6 +388,7 @@ impl Demo {
         self.world
             .start_fixture_with_policy(descriptor, self.policy.scheduler())
             .map_err(|error| format!("start fixture: {error:?}"))?;
+        crate::focus_bridge::apply_policy(&mut self.world, self.policy.focus_enabled());
         self.disturbances = disturbance_stream();
         self.last_disturbance = 0;
         Ok(())
@@ -368,14 +460,129 @@ impl Demo {
         attempted
     }
 
-    pub fn ignite_at(&mut self, x: u32, y: u32) {
-        if let Some(cell) = self.world.cell_id(x, y) {
-            let _ = self.world.ignite(cell);
-        }
+    pub fn paint_at(&mut self, x: u32, y: u32) -> Option<PlayerMark> {
+        self.paint_material_at(x, y, self.selected_material.material())
     }
-    pub fn detonate_at(&mut self, x: u32, y: u32) {
-        if let Some(cell) = self.world.cell_id(x, y) {
-            let _ = self.world.trigger_blast(cell, 12);
+    pub fn paint_material_at(&mut self, x: u32, y: u32, material: Material) -> Option<PlayerMark> {
+        let cell = self.world.cell_id(x, y)?;
+        let view = self.world.cell(x, y)?;
+        let result = self.world.submit(Command::Paint { cell, material });
+        let admitted = matches!(result, SubmitResult::Accepted | SubmitResult::Coalesced);
+        if admitted {
+            self.remember(crate::ActionKind::Paint, x, y, material);
+        }
+        Some(PlayerMark {
+            kind: crate::ActionKind::Paint,
+            x,
+            y,
+            admitted,
+            rejected: !admitted,
+            material: view.material as u8,
+            burning: view.burning,
+            paint_material: material as u8,
+        })
+    }
+    pub fn ignite_at(&mut self, x: u32, y: u32) -> Option<PlayerMark> {
+        let cell = self.world.cell_id(x, y)?;
+        let view = self.world.cell(x, y)?;
+        let target = matches!(view.material, Material::Wood | Material::Explosive);
+        let already = view.material == Material::Wood && view.burning > 0;
+        let admitted = target && !already && self.world.ignite(cell).is_ok();
+        if admitted {
+            self.remember(crate::ActionKind::Ignite, x, y, view.material);
+        }
+        Some(PlayerMark {
+            kind: crate::ActionKind::Ignite,
+            x,
+            y,
+            admitted,
+            rejected: !admitted,
+            material: view.material as u8,
+            burning: view.burning,
+            paint_material: view.material as u8,
+        })
+    }
+    pub fn detonate_at(&mut self, x: u32, y: u32) -> Option<PlayerMark> {
+        let cell = self.world.cell_id(x, y)?;
+        let view = self.world.cell(x, y)?;
+        let admitted = self.world.trigger_blast(cell, 12).is_ok();
+        if admitted {
+            self.remember(crate::ActionKind::Detonate, x, y, Material::Explosive);
+        }
+        Some(PlayerMark {
+            kind: crate::ActionKind::Detonate,
+            x,
+            y,
+            admitted,
+            rejected: !admitted,
+            material: view.material as u8,
+            burning: view.burning,
+            paint_material: Material::Explosive as u8,
+        })
+    }
+
+    pub fn player_targets(&self, out: &mut [(u32, u32)]) -> usize {
+        let mut count = 0;
+        for item in self.refresh.iter().flatten() {
+            if count == out.len() {
+                break;
+            }
+            out[count] = (item.x, item.y);
+            count += 1;
+        }
+        count
+    }
+
+    fn remember(&mut self, kind: crate::ActionKind, x: u32, y: u32, material: Material) {
+        let refresh = PlayerRefresh {
+            kind,
+            x,
+            y,
+            material,
+            slices_left: 8,
+        };
+        if let Some(slot) = self
+            .refresh
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|item| item.x == x && item.y == y))
+        {
+            *slot = Some(refresh);
+            return;
+        }
+        if let Some(slot) = self.refresh.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(refresh);
+            return;
+        }
+        self.refresh[0] = Some(refresh);
+    }
+
+    /// Re-apply recent player marks after disturbance admission so a random paint cannot
+    /// coalesce the player's command away before the next upload.
+    fn reapply_player_marks(&mut self) {
+        for index in 0..self.refresh.len() {
+            let Some(mut item) = self.refresh[index] else {
+                continue;
+            };
+            let Some(cell) = self.world.cell_id(item.x, item.y) else {
+                self.refresh[index] = None;
+                continue;
+            };
+            match item.kind {
+                crate::ActionKind::Paint => {
+                    let _ = self.world.submit(Command::Paint {
+                        cell,
+                        material: item.material,
+                    });
+                }
+                crate::ActionKind::Ignite => {
+                    let _ = self.world.ignite(cell);
+                }
+                crate::ActionKind::Detonate => {
+                    let _ = self.world.trigger_blast(cell, 12);
+                }
+            }
+            item.slices_left = item.slices_left.saturating_sub(1);
+            self.refresh[index] = (item.slices_left > 0).then_some(item);
         }
     }
 
@@ -387,11 +594,14 @@ impl Demo {
                 .fixture_progress()
                 .is_some_and(|progress| !progress.complete && !progress.cancelled);
         if !self.paused || self.step_once || preparing {
-            if self.destroy_held && !preparing && !self.disturbances.finished() {
+            if self.destroy_active() && !preparing && !self.disturbances.finished() {
                 let batch = self.disturbances.admit_slice(&mut self.world);
                 self.last_disturbance = self
                     .last_disturbance
                     .saturating_add(u64::from(batch.attempted));
+            }
+            if !preparing {
+                self.reapply_player_marks();
             }
             self.last_metrics = self.world.step();
             self.step_once = false;
@@ -453,7 +663,7 @@ mod tests {
     fn policy_switch_restarts_the_same_fixture_with_the_selected_scheduler() {
         let mut demo = Demo::new().unwrap();
         let fixture = demo.metrics().selected_fixture;
-        demo.set_policy(PolicyChoice::Traditional);
+        demo.set_policy(PolicyChoice::Traditional); // comparison restart
         demo.start_fixture().unwrap();
         assert_eq!(demo.world().policy(), SchedulerPolicy::Traditional);
         assert_eq!(demo.metrics().selected_fixture, fixture);
@@ -461,10 +671,41 @@ mod tests {
         while demo.world().reset_in_progress() {
             demo.world_mut().step();
         }
-        demo.set_policy(PolicyChoice::Bounded);
+        demo.set_policy(PolicyChoice::BoundedFifo);
         demo.start_fixture().unwrap();
         assert_eq!(demo.world().policy(), SchedulerPolicy::Bounded);
         assert_eq!(demo.metrics().selected_fixture, fixture);
+    }
+
+    #[test]
+    fn explicit_paint_changes_material_on_the_next_slice() {
+        let mut demo = Demo::new_with_size(64, 64).unwrap();
+        let mark = demo
+            .paint_material_at(8, 8, Material::Stone)
+            .expect("cell exists");
+        assert!(mark.admitted);
+        demo.tick();
+        assert_eq!(demo.world().cell(8, 8).unwrap().material, Material::Stone);
+    }
+
+    #[test]
+    fn destroy_on_a_completed_mixed_fixture_does_not_restart_it() {
+        let mut demo = Demo::new_with_size(32, 32).unwrap();
+        demo.select_fixture(FixtureId::MixedOverload);
+        demo.start_fixture().unwrap();
+        for _ in 0..8 {
+            demo.tick();
+        }
+        assert!(demo.metrics().fixture_progress.unwrap().complete);
+        let generation = demo.world().generation();
+        demo.set_destroy_held(true);
+        assert!(demo.destroy_active());
+        assert_eq!(demo.world().generation(), generation);
+        assert!(demo.metrics().fixture_progress.unwrap().complete);
+        demo.set_destroy_held(false);
+        demo.toggle_destroy_latch();
+        assert!(demo.destroy_latched());
+        assert_eq!(demo.world().generation(), generation);
     }
 
     #[test]
