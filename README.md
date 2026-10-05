@@ -1,8 +1,9 @@
 # Cascade
 
-A small native 2D cellular sandbox built to be overloaded. The simulation runs a fixed
+A small native 2D cellular sandbox built to be overloaded. Its bounded policy runs a fixed
 budget of work credits per update, so piling on explosions, sand, water, and fire makes
-effects resolve more slowly instead of stalling the frame.
+effects resolve more slowly instead of stalling the frame. A deliberately uncapped traditional
+comparison policy processes its full pending frontier and can stall; both behaviors are measured.
 
 See [CHARTER.md](CHARTER.md) for goals, invariants, and milestones.
 
@@ -12,11 +13,11 @@ Read the [documentation site](https://akofink.com/cascade-game-demo/).
 
 The native app starts with a 1024 x 1024 `cascade-sim` world for interactive responsiveness.
 Choose a larger validated square world at startup with `--world-size 4096`. At that size the app
-preallocates both the normal and tiny-capacity simulation profiles (about 161.5 MiB of sim-owned
-CPU arrays combined) and a 16 MiB material texture. Fixture preparation remains incremental.
-The headless core includes complete rules, seeded fixtures, bounded and traditional policies,
-and a benchmark runner. See the [native performance smoke report](docs/performance.md) for measured
-M2 results and limitations.
+preallocates normal and tiny-capacity simulation worlds (about 192.8 MiB of simulation-owned CPU
+arrays combined), a 16 MiB CPU material grid, and a separate 16 MiB GPU texture. Fixture preparation
+remains incremental. The headless core includes complete rules, seeded fixtures, bounded and
+traditional policies, and a benchmark runner. See the [performance evidence](docs/performance.md)
+for corrected headless results and limitations.
 
 ## Prior art
 
@@ -48,7 +49,7 @@ Drag with the left mouse button to pan; scroll to zoom. Arrow keys and WASD also
 Select a material in the overlay, then Shift-drag to paint (Air erases); each presentation
 iteration admits at most 64 brush descriptors. Right-click ignites wood or explosives; Shift-right-click
 detonates. Space pauses/resumes, `.` advances one slice, and `r` begins an incremental reset.
-The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000) with an explicit apply-and-restart action, switches between bounded and traditional scheduling by restarting the same fixture, and toggles deferred-cell highlighting. Traditional mode processes the ready frontier captured at update start without the slice credit cap. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
+The overlay selects fixtures, reports preparation progress, allows cancellation, adjusts credits (25 to 100,000) with an explicit apply-and-restart action, switches between bounded and traditional scheduling by restarting the same fixture, and toggles deferred-cell highlighting. Traditional mode snapshots every per-cell pending evaluation/blast channel at update start and processes that uncapped frontier; the ready rings are not its authority, two full-world scans are charged each slice, and work generated during the slice waits for the next one. Hold **DESTROY PERFORMANCE** to prepare mixed overload and
 admit a seeded capped disturbance stream; release stops new descriptors but leaves admitted work.
 The overlay prominently labels the active scheduler, plots frame intervals beside pending-work
 history, and offers a one-click same-fixture restart under the other policy. It also reports
@@ -86,7 +87,7 @@ cargo run --release -p cascade-bench -- --fixture mixed-overload --policy tradit
 cargo run --release -p cascade-bench -- --fixture mixed-overload --policy bounded --slices 3600 --disturbances 28800 --disturbances-per-slice 8
 ```
 
-Fixtures: `quiet-world`, `explosive-lattice`, `sand-release`, `reservoir-breach`, `burning-forest`, `dirty-world-sweep`, `tiny-capacity`, and `mixed-overload`. Options include `--width`, `--height`, and `--budget`. CSV/JSON records include per-slice credits, selection probes, executed quanta, backlog, elapsed nanoseconds, completion, and disturbance admission counters. Traditional runs intentionally exceed the configured credit allowance when their captured ready frontier requires it.
+Fixtures: `quiet-world`, `explosive-lattice`, `sand-release`, `reservoir-breach`, `burning-forest`, `dirty-world-sweep`, `tiny-capacity`, and `mixed-overload`. Options include `--width`, `--height`, and `--budget`. CSV/JSON records include per-slice credits, selection probes, executed quanta, backlog, elapsed nanoseconds, completion, and disturbance admission counters. Traditional runs intentionally exceed the configured credit allowance while scanning the full pending frontier and processing its captured work.
 
 ### Documentation site
 

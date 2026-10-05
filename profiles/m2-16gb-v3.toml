@@ -1,0 +1,34 @@
+# Reference machine headless candidate, calibrated 2026-10-05 after correcting traditional frontier semantics.
+version = 3
+name = "m2-16gb-headless"
+reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
+credits_per_slice = 1000000
+simulator_max_supported_credits = 10000000
+app_current_max_credits = 100000
+app_current_default_credits = 20000
+ready_capacity_per_lane = 32768
+command_capacity = 256
+calibration_workloads = [
+  "burning-forest-v1 + 64 seeded disturbance commands/slice",
+  "mixed-overload-v1 + 64 seeded disturbance commands/slice",
+]
+calibration_dimensions = [4096, 4096]
+calibration_slices_per_workload_run = 1800
+calibration_repetitions_per_workload = 3
+calibration_samples_per_workload = 5400
+warmup_slices = 120
+calibration_disturbances_per_run = 115200
+calibration_disturbances_per_slice = 64
+capture_source_revision = "07b0d3c"
+capture_rule_version = 4
+worst_workload_p50_ns = 1086125
+worst_workload_p95_ns = 1564250
+worst_workload_p99_ns = 2573875
+worst_observed_slice_ns = 3776291
+slices_over_4ms = 0
+budget_target_ns = 4000000
+status = "headless candidate; app integration must raise its current 100000-credit cap to use it"
+
+# Empirical only. The burning-forest sweep had adverse >4 ms outliers at 800000
+# and 1200000 credits; calibration/validation share static fixture descriptors.
+# Full 60-second and post-correction native interactive validation remain open.

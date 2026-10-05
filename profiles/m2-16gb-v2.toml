@@ -24,7 +24,7 @@ worst_workload_p99_ns = 2590917
 worst_observed_slice_ns = 4107667
 slices_over_4ms = 1
 budget_target_ns = 4000000
-status = "headless selected candidate; app integration must raise its current 100000-credit cap to use it"
+status = "superseded: traditional results used ready-ring-only frontier; see v3"
 
 # Results are empirical. Full 60-second and interactive validation remain outstanding.
 # Calibration command streams are separate from validation command streams, but the

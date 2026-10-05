@@ -1,4 +1,6 @@
-# Full-size headless results v2
+# Full-size headless results v2 (superseded)
+
+**Historical archive only.** This report's traditional runs captured ready-ring lengths and one recovery probe, not the full authoritative per-cell pending frontier. Its traditional timings and bounded-versus-traditional conclusions are superseded by [corrected full-size results v3](headless-v3.md). The v3 build also adds a preallocated frontier snapshot, which changes resource/cache conditions for bounded measurements.
 
 Source revision `5825d77eae4c9b866dd8251c47fcc3e93403a9db`; release `cascade-bench`, Rust/Cargo 1.99.0. All eight section-12 descriptors ran at 4096 x 4096, 1,000,000 credits, 120 warm-up steps, then 300 measured steps, three runs per mode. Mode order alternated B/T, T/B, B/T for each fixture. After warm-up the benchmark re-prepared the fixture, so measurement starts at the descriptor state. Pooled interval sample count is 900 per fixture/mode. Percentiles use nearest lower indexed sample; durations are monotonic wall-clock around `World::step`.
 
