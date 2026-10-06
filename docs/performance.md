@@ -1,5 +1,20 @@
 # Performance evidence
 
+## Default native timing workflow
+
+For unattended native timing captures, build release once before checking the quiet-machine gate, then use the offscreen GPU-texture path (one fresh process per policy):
+
+```sh
+cargo build --release -p cascade-app
+caffeinate -dimsu target/release/cascade-app --offscreen-capture --capture-policy bounded-focus --capture-seconds 60 --world-size 4096
+```
+
+Use `bounded-fifo` and `traditional` for the other policy runs. The offscreen path renders the same 1920 x 1080 grid and overlay passes (with a fixed 2x logical scale matching the reference Mac's 960 x 540 window), advances one normal simulation slice per iteration, and observes the same capped chunk uploads. It paces from a monotonic clock at a fixed 60 Hz target and does not create a window or surface. It never reads the render target back during a capture. Its frame intervals include CPU work and cadence waiting, but **do not measure display presentation, vsync, compositor scheduling, or scanout**. Scripted game-feel values are CPU-side action/upload/render-submission proxies, not visible-action latency.
+
+Use windowed `--capture-policy POLICY --capture-seconds 60` captures when making presentation-level claims. Windowed results remain separate evidence and are not replaced by offscreen values. Paired offscreen and windowed results, including the limits of comparison, are in [native offscreen comparison v1](../benchmarks/results/native-offscreen-v1.md).
+
+Before and after each capture, check the one-minute system load; accept results only when it is below 3 at both checks. Run one capture process at a time, reject and retain a note of attempts that miss the gate, and do not suppress long samples from accepted runs.
+
 ## Current headless profile and status
 
 See [corrected full-size headless results v4](../benchmarks/results/headless-v4.md), [archived headless results v3](../benchmarks/results/headless-v3.md), and [reference profile v3](../profiles/m2-16gb-v3.toml). The 1,000,000-credit/slice setting remains an empirical candidate. The v4 follow-up profiles a same-chunk focus-membership cache on 4096² burning-forest and mixed-overload calibration. Pooled p99 improved from 3.906750 to 2.838709 ms on burning forest and 2.077292 to 1.652375 ms on mixed overload, with no reduction in quanta/slice; however, burning-forest still had 8 samples above 4 ms and a 9.767333 ms maximum among 5,400 slices. The 1M profile was retained, not reduced. These finite wall-clock samples include OS preemption and are not deadline guarantees.
