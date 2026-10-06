@@ -381,6 +381,7 @@ pub struct World {
     action_effect_index: Vec<[u64; ACTION_RECORD_CAPACITY / 64]>,
     pending_action_effect_count: usize,
     action_effect_candidates_this_slice: u32,
+    action_tracking_enabled: bool,
     commands: Ring<Command>,
     generation: Generation,
     budget: Credits,
@@ -523,6 +524,7 @@ impl World {
             action_effect_index: vec![[0; ACTION_RECORD_CAPACITY / 64]; chunk_count],
             pending_action_effect_count: 0,
             action_effect_candidates_this_slice: 0,
+            action_tracking_enabled: true,
             commands: Ring::new(command_capacity.0),
             generation: Generation(1),
             budget,
@@ -1239,7 +1241,22 @@ impl World {
             }
         }
     }
+    /// Enable optional action-latency records used by benchmark tooling.
+    /// Interactive presentation measures its own visible-action latency instead.
+    pub fn set_action_tracking_enabled(&mut self, enabled: bool) {
+        self.action_tracking_enabled = enabled;
+        if !enabled {
+            self.action_records.fill(None);
+            for chunk in &mut self.action_effect_index {
+                chunk.fill(0);
+            }
+            self.pending_action_effect_count = 0;
+        }
+    }
     fn register_action(&mut self, cell: CellId) {
+        if !self.action_tracking_enabled {
+            return;
+        }
         if let Some(previous) = self.action_records[self.action_cursor]
             && previous.action_applied_slice.is_some()
             && previous.first_effect_slice.is_none()
@@ -1259,7 +1276,7 @@ impl World {
         self.action_cursor = (self.action_cursor + 1) % self.action_records.len();
     }
     fn note_action_effect(&mut self, cell: CellId) {
-        if self.pending_action_effect_count == 0 {
+        if !self.action_tracking_enabled || self.pending_action_effect_count == 0 {
             return;
         }
         let (x, y) = (cell.0 % self.width, cell.0 / self.width);
@@ -1290,6 +1307,9 @@ impl World {
         }
     }
     fn update_action_settle(&mut self) {
+        if !self.action_tracking_enabled {
+            return;
+        }
         let slice = self.slice;
         for index in 0..self.action_records.len() {
             let Some(record) = self.action_records[index] else {
@@ -1316,6 +1336,9 @@ impl World {
         }
     }
     fn note_action_applied(&mut self, cell: CellId) {
+        if !self.action_tracking_enabled {
+            return;
+        }
         let slice = self.slice.saturating_add(1);
         for index in 0..self.action_records.len() {
             if let Some(mut record) = self.action_records[index]
@@ -1778,8 +1801,12 @@ impl World {
             self.pending[i].blast = 0;
             self.pending[i].set(PendingCell::EVAL_QUEUED, false);
             self.pending[i].set(PendingCell::BLAST_QUEUED, false);
-            self.pending[i].set(PendingCell::EVAL_FOCUS_QUEUED, false);
-            self.pending[i].set(PendingCell::BLAST_FOCUS_QUEUED, false);
+            if pending.has(PendingCell::EVAL_FOCUS_QUEUED) {
+                self.pending[i].set(PendingCell::EVAL_FOCUS_QUEUED, false);
+            }
+            if pending.has(PendingCell::BLAST_FOCUS_QUEUED) {
+                self.pending[i].set(PendingCell::BLAST_FOCUS_QUEUED, false);
+            }
             metrics.charged += self.costs.selection.0 + self.costs.recovery.0;
             metrics.selections += 1;
             metrics.recoveries += 1;
@@ -1798,7 +1825,9 @@ impl World {
                 self.record_executed_cell(id);
                 metrics.charged += self.costs.selection.0 + self.costs.evaluate.0;
                 metrics.selections += 1;
-                self.note_action_effect(id);
+                if self.action_tracking_enabled {
+                    self.note_action_effect(id);
+                }
                 self.execute_evaluate_captured(id);
                 metrics.evaluations += 1;
                 metrics.background_evaluations += 1;
@@ -1808,7 +1837,9 @@ impl World {
                 self.record_executed_cell(id);
                 metrics.charged += self.costs.selection.0 + self.costs.blast.0;
                 metrics.selections += 1;
-                self.note_action_effect(id);
+                if self.action_tracking_enabled {
+                    self.note_action_effect(id);
+                }
                 self.execute_blast_captured(id, blast);
                 metrics.blasts += 1;
                 metrics.background_blasts += 1;
@@ -2201,6 +2232,31 @@ mod tests {
         let metrics = w.step();
         assert_eq!(metrics.evaluations, 256);
         assert_eq!(metrics.action_effect_candidates, 0);
+    }
+
+    #[test]
+    fn disabled_action_tracking_adds_no_traditional_frontier_work() {
+        let mut w = World::new_with_policy(
+            256,
+            1,
+            Credits::new(128),
+            Capacity::new(256),
+            Capacity::new(16),
+            SchedulerPolicy::Traditional,
+        )
+        .unwrap();
+        w.set_action_tracking_enabled(false);
+        w.set_focus_enabled(false);
+        let id = CellId::from_index(12);
+        w.pending[id.index()].set(PendingCell::EVAL_FOCUS_QUEUED, true);
+        w.register_action(id);
+        w.note_action_applied(id);
+        assert_eq!(w.action_records().count(), 0);
+        let metrics = w.step();
+        assert_eq!(metrics.recoveries, 512);
+        assert_eq!(metrics.selections, 512);
+        assert_eq!(metrics.action_effect_candidates, 0);
+        assert!(!w.pending[id.index()].has(PendingCell::EVAL_FOCUS_QUEUED));
     }
 
     #[test]

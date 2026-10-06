@@ -26,6 +26,14 @@ use winit::window::{Window, WindowId};
 
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const FRAME_SAMPLES: usize = 240;
+const SMOKE_POLICY_FRAMES: u32 = 120;
+const CAPTURE_INTERVAL_CAPACITY: usize = 16_384;
+
+#[derive(Clone, Copy)]
+struct CaptureConfig {
+    policy: PolicyChoice,
+    seconds: u64,
+}
 
 struct ScreenshotReadback {
     buffer: wgpu::Buffer,
@@ -66,6 +74,8 @@ struct PolicySmoke {
     max_sim_cpu_ms: f32,
     max_frame_interval_ns: u64,
     p99_frame_interval_ns: u64,
+    capture_intervals_ns: Vec<u64>,
+    capture_interval_drops: u64,
 }
 
 struct Smoke {
@@ -96,6 +106,8 @@ struct Smoke {
     traditional_armed: bool,
     focus_armed: bool,
     failed: Option<String>,
+    capture: Option<CaptureConfig>,
+    capture_started: Option<Instant>,
 }
 
 struct App {
@@ -128,6 +140,7 @@ struct App {
     brush_commands_this_frame: usize,
     last_cursor: Option<(f32, f32)>,
     last_paint_cell: Option<(i32, i32)>,
+    scripted_ignite_target: Option<(u32, u32)>,
     feel: Feel,
     last_viewport: Option<FocusRect>,
     viewport_submit_age: u32,
@@ -144,7 +157,7 @@ struct App {
 }
 
 fn main() {
-    let (smoke, world_size, screenshot_path) = match parse_args() {
+    let (smoke, world_size, screenshot_path, capture) = match parse_args() {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
@@ -159,7 +172,7 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(smoke, world_size, screenshot_path);
+    let mut app = App::new(smoke, world_size, screenshot_path, capture);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("event loop stopped: {error}");
         std::process::exit(1);
@@ -179,10 +192,12 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     builder.build()
 }
 
-fn parse_args() -> Result<(bool, u32, Option<PathBuf>), String> {
+fn parse_args() -> Result<(bool, u32, Option<PathBuf>, Option<CaptureConfig>), String> {
     let mut smoke = false;
     let mut world_size = DEMO_WIDTH;
     let mut screenshot_path = None;
+    let mut capture_policy = None;
+    let mut capture_seconds = 60_u64;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut index = 0;
     while index < args.len() {
@@ -191,6 +206,34 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>), String> {
             "--screenshot" => {
                 let value = args.get(index + 1).ok_or("missing path for --screenshot")?;
                 screenshot_path = Some(PathBuf::from(value));
+                index += 1;
+            }
+            "--capture-policy" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --capture-policy")?;
+                capture_policy =
+                    Some(match value.as_str() {
+                        "bounded-fifo" => PolicyChoice::BoundedFifo,
+                        "bounded-focus" => PolicyChoice::BoundedFocus,
+                        "traditional" => PolicyChoice::Traditional,
+                        _ => return Err(
+                            "capture policy must be bounded-fifo, bounded-focus, or traditional"
+                                .into(),
+                        ),
+                    });
+                index += 1;
+            }
+            "--capture-seconds" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --capture-seconds")?;
+                capture_seconds = value
+                    .parse()
+                    .map_err(|_| "capture seconds must be an integer")?;
+                if !(1..=60).contains(&capture_seconds) {
+                    return Err("capture seconds must be in 1..=60".into());
+                }
                 index += 1;
             }
             "--world-size" => {
@@ -210,7 +253,7 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>), String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "cascade-app [--smoke] [--world-size N] [--screenshot PATH]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. Drag to pan. Scroll to zoom. --smoke prepares the mixed fixture, checks a sampled pixel, exercises pan/zoom/resize, and runs paired bounded/traditional overloads before exit. --screenshot writes a PNG from GPU readback after the measured smoke frames and requires --smoke.",
+                    "cascade-app [--smoke] [--world-size N] [--screenshot PATH] [--capture-policy POLICY --capture-seconds N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. --smoke runs the native three-policy check. --capture-policy runs one 4096x4096 mixed-overload policy for the requested wall duration. --screenshot writes a PNG from GPU readback after the measured smoke frames.",
                     cascade_app::MAX_WORLD_AXIS
                 );
                 std::process::exit(0);
@@ -222,11 +265,28 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>), String> {
     if screenshot_path.is_some() && !smoke {
         return Err("--screenshot requires --smoke".to_string());
     }
-    Ok((smoke, world_size, screenshot_path))
+    if capture_policy.is_some() && screenshot_path.is_some() {
+        return Err("--screenshot cannot be combined with --capture-policy".to_string());
+    }
+    let capture = capture_policy.map(|policy| CaptureConfig {
+        policy,
+        seconds: capture_seconds,
+    });
+    Ok((
+        smoke || capture.is_some(),
+        world_size,
+        screenshot_path,
+        capture,
+    ))
 }
 
 impl App {
-    fn new(smoke: bool, world_size: u32, screenshot_path: Option<PathBuf>) -> Self {
+    fn new(
+        smoke: bool,
+        world_size: u32,
+        screenshot_path: Option<PathBuf>,
+        capture: Option<CaptureConfig>,
+    ) -> Self {
         let mut demo = match Demo::new_with_size(world_size, world_size) {
             Ok(demo) => demo,
             Err(error) => {
@@ -234,12 +294,53 @@ impl App {
                 std::process::exit(1);
             }
         };
-        if !smoke && focus_linked() {
+        if let Some(capture) = capture {
+            demo.set_policy(capture.policy);
+        } else if !smoke && focus_linked() {
             demo.set_policy(PolicyChoice::BoundedFocus);
         }
         if let Err(error) = demo.start_fixture() {
             eprintln!("initial fixture: {error}");
             std::process::exit(1);
+        }
+        let mut smoke_state = smoke.then(|| Smoke {
+            started: Instant::now(),
+            ready_printed: false,
+            settled_printed: false,
+            presents: 0,
+            saw_stale: false,
+            uploaded: 0,
+            pan_ok: false,
+            zoom_ok: false,
+            readback_ok: false,
+            readback_note: String::new(),
+            resize_targets_seen: 0,
+            resize_from: (0, 0),
+            resize_mid: (0, 0),
+            zero_frames: 0,
+            zero_start_reconfigs: 0,
+            zero_ok: false,
+            hold_frames: 0,
+            result_printed: false,
+            bounded: PolicySmoke::default(),
+            traditional: PolicySmoke::default(),
+            focus: PolicySmoke::default(),
+            traditional_started: false,
+            focus_started: false,
+            bounded_armed: false,
+            traditional_armed: false,
+            focus_armed: false,
+            failed: None,
+            capture,
+            capture_started: None,
+        });
+        if let (Some(config), Some(smoke)) = (capture, smoke_state.as_mut()) {
+            let run = match config.policy {
+                PolicyChoice::BoundedFifo => &mut smoke.bounded,
+                PolicyChoice::BoundedFocus => &mut smoke.focus,
+                PolicyChoice::Traditional => &mut smoke.traditional,
+            };
+            run.capture_intervals_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
         }
         let (width, height) = demo.dimensions();
         let chunks_x = width / CHUNK_SIZE;
@@ -274,6 +375,7 @@ impl App {
             brush_commands_this_frame: 0,
             last_cursor: None,
             last_paint_cell: None,
+            scripted_ignite_target: None,
             feel: Feel::new(chunks_x, chunks_y),
             last_viewport: None,
             viewport_submit_age: 0,
@@ -282,35 +384,7 @@ impl App {
             skip_timeout: 0,
             skip_occluded: 0,
             skip_outdated: 0,
-            smoke: smoke.then(|| Smoke {
-                started: Instant::now(),
-                ready_printed: false,
-                settled_printed: false,
-                presents: 0,
-                saw_stale: false,
-                uploaded: 0,
-                pan_ok: false,
-                zoom_ok: false,
-                readback_ok: false,
-                readback_note: String::new(),
-                resize_targets_seen: 0,
-                resize_from: (0, 0),
-                resize_mid: (0, 0),
-                zero_frames: 0,
-                zero_start_reconfigs: 0,
-                zero_ok: false,
-                hold_frames: 0,
-                result_printed: false,
-                bounded: PolicySmoke::default(),
-                traditional: PolicySmoke::default(),
-                focus: PolicySmoke::default(),
-                traditional_started: false,
-                focus_started: false,
-                bounded_armed: false,
-                traditional_armed: false,
-                focus_armed: false,
-                failed: None,
-            }),
+            smoke: smoke_state,
             screenshot_path,
             screenshot_resize_requested: false,
             screenshot_written: false,
@@ -880,7 +954,22 @@ impl App {
 
         let now = Instant::now();
         if let Some(previous) = self.last_present {
-            self.history.record_interval(elapsed_ns(previous, now));
+            let interval = elapsed_ns(previous, now);
+            self.history.record_interval(interval);
+            if let Some(smoke) = self.smoke.as_mut()
+                && let (Some(config), Some(_started)) = (smoke.capture, smoke.capture_started)
+            {
+                let run = match config.policy {
+                    PolicyChoice::BoundedFifo => &mut smoke.bounded,
+                    PolicyChoice::BoundedFocus => &mut smoke.focus,
+                    PolicyChoice::Traditional => &mut smoke.traditional,
+                };
+                if run.capture_intervals_ns.len() < CAPTURE_INTERVAL_CAPACITY {
+                    run.capture_intervals_ns.push(interval);
+                } else {
+                    run.capture_interval_drops = run.capture_interval_drops.saturating_add(1);
+                }
+            }
         }
         self.last_present = Some(now);
         self.after_present(event_loop);
@@ -899,6 +988,11 @@ impl App {
             "bounded focus" => "bounded-focus",
             _ => "bounded-fifo",
         };
+        if let Some(capture) = smoke.capture {
+            self.capture_frame(event_loop, &mut smoke, capture, policy_label, sim_metrics);
+            self.smoke = Some(smoke);
+            return;
+        }
         let run = match policy_label {
             "traditional" => &mut smoke.traditional,
             "bounded-focus" => &mut smoke.focus,
@@ -906,7 +1000,7 @@ impl App {
         };
         let mut script_this_frame = false;
         let mut script_step = 0;
-        if (1..120).contains(&run.frames) {
+        if (1..SMOKE_POLICY_FRAMES).contains(&run.frames) {
             run.last_pending = sim_metrics.slice.pending_cells;
             run.max_pending = run
                 .max_pending
@@ -922,9 +1016,14 @@ impl App {
             run.max_frame_interval_ns = run.max_frame_interval_ns.max(summary.max_ns);
             run.p99_frame_interval_ns = summary.p99_ns;
             run.frames += 1;
-            script_this_frame = run.frames.is_multiple_of(10) && run.frames < 120;
-            script_step = run.frames / 10;
-            if run.frames == 120 {
+            script_this_frame = run.frames < SMOKE_POLICY_FRAMES;
+            script_step = run.frames;
+            if run.frames == SMOKE_POLICY_FRAMES {
+                if !has_minimum_action_samples(&self.feel) {
+                    smoke.failed = Some(format!(
+                        "{policy_label} action stream sample counts below 30 per action type"
+                    ));
+                }
                 print_feel(policy_label, &self.feel);
                 let last_window = policy_label == "bounded-focus"
                     || (policy_label == "traditional" && !focus_linked());
@@ -953,7 +1052,10 @@ impl App {
             self.demo.set_destroy_held(true);
             smoke.bounded.frames = 1;
         }
-        if smoke.bounded_armed && smoke.bounded.frames >= 120 && !smoke.traditional_started {
+        if smoke.bounded_armed
+            && smoke.bounded.frames >= SMOKE_POLICY_FRAMES
+            && !smoke.traditional_started
+        {
             self.demo.set_destroy_held(false);
             self.demo.set_policy(cascade_app::PolicyChoice::Traditional);
             if let Err(error) = self.demo.start_fixture() {
@@ -982,7 +1084,8 @@ impl App {
             self.demo.set_destroy_held(true);
             smoke.traditional.frames = 1;
         }
-        if smoke.traditional.frames >= 120 && focus_linked() && !smoke.focus_started {
+        if smoke.traditional.frames >= SMOKE_POLICY_FRAMES && focus_linked() && !smoke.focus_started
+        {
             self.demo.set_destroy_held(false);
             self.demo.set_policy(PolicyChoice::BoundedFocus);
             if let Err(error) = self.demo.start_fixture() {
@@ -1121,9 +1224,9 @@ impl App {
             && smoke.uploaded > 0
             && smoke.resize_targets_seen == 2
             && smoke.zero_ok
-            && smoke.bounded.frames >= 120
-            && smoke.traditional.frames >= 120
-            && (!focus_linked() || smoke.focus.frames >= 120)
+            && smoke.bounded.frames >= SMOKE_POLICY_FRAMES
+            && smoke.traditional.frames >= SMOKE_POLICY_FRAMES
+            && (!focus_linked() || smoke.focus.frames >= SMOKE_POLICY_FRAMES)
             && smoke.presents >= 20;
         if ready && !smoke.settled_printed {
             smoke.settled_printed = true;
@@ -1151,6 +1254,103 @@ impl App {
             return;
         }
         if finish {
+            self.exit_code = 0;
+            event_loop.exit();
+        }
+    }
+
+    fn capture_frame(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        smoke: &mut Smoke,
+        capture: CaptureConfig,
+        policy_label: &str,
+        sim_metrics: cascade_app::DemoMetrics,
+    ) {
+        if self.occluded {
+            self.fail(
+                event_loop,
+                "sustained capture aborted: native window is occluded".into(),
+            );
+            return;
+        }
+        if smoke.result_printed {
+            return;
+        }
+        if smoke.capture_started.is_none() {
+            let fixture_complete = sim_metrics
+                .fixture_progress
+                .is_some_and(|progress| progress.complete);
+            let render_size = self
+                .gpu
+                .as_ref()
+                .map(|gpu| gpu.configured_size)
+                .unwrap_or((0, 0));
+            if fixture_complete && smoke.presents >= 10 && smoke.uploaded > 0 {
+                if render_size != (1920, 1080) {
+                    smoke.failed = Some(format!(
+                        "sustained capture requires a 1920x1080 surface, got {}x{}",
+                        render_size.0, render_size.1
+                    ));
+                    self.exit_code = 1;
+                    event_loop.exit();
+                    return;
+                }
+                self.demo.set_destroy_held(true);
+                self.feel.clear_latencies();
+                self.history = FrameHistory::default();
+                self.last_present = None;
+                let run = match capture.policy {
+                    PolicyChoice::BoundedFifo => &mut smoke.bounded,
+                    PolicyChoice::BoundedFocus => &mut smoke.focus,
+                    PolicyChoice::Traditional => &mut smoke.traditional,
+                };
+                run.first_pending = sim_metrics.slice.pending_cells;
+                run.last_pending = sim_metrics.slice.pending_cells;
+                smoke.capture_started = Some(Instant::now());
+                println!(
+                    "SMOKE_CAPTURE_STARTED policy={policy_label} seconds={} render={}x{} load_gate=external",
+                    capture.seconds, render_size.0, render_size.1
+                );
+            }
+            return;
+        }
+
+        let run = match capture.policy {
+            PolicyChoice::BoundedFifo => &mut smoke.bounded,
+            PolicyChoice::BoundedFocus => &mut smoke.focus,
+            PolicyChoice::Traditional => &mut smoke.traditional,
+        };
+        run.frames = run.frames.saturating_add(1);
+        run.last_pending = sim_metrics.slice.pending_cells;
+        run.max_pending = run
+            .max_pending
+            .max(sim_metrics.slice.pending_cells)
+            .max(self.pre_step_pending);
+        run.max_ready = run
+            .max_ready
+            .max(sim_metrics.slice.ready_len)
+            .max(self.pre_step_ready);
+        run.max_upload_backlog = run.max_upload_backlog.max(self.last_plan.backlog);
+        run.max_sim_cpu_ms = run.max_sim_cpu_ms.max(self.sim_cpu_ms);
+        self.scripted_player_action(run.frames);
+        if smoke.capture_started.is_some_and(|started| {
+            started.elapsed() >= std::time::Duration::from_secs(capture.seconds)
+        }) {
+            if !has_minimum_action_samples(&self.feel) {
+                smoke.failed = Some(format!(
+                    "{policy_label} action stream sample counts below 30 per action type"
+                ));
+                self.exit_code = 1;
+                event_loop.exit();
+                return;
+            }
+            self.demo.set_destroy_held(false);
+            print_feel(policy_label, &self.feel);
+            print_capture(policy_label, run);
+            println!("SMOKE_RESULT ok");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            smoke.result_printed = true;
             self.exit_code = 0;
             event_loop.exit();
         }
@@ -1500,46 +1700,53 @@ impl App {
 
     fn scripted_player_action(&mut self, step: u32) {
         let (width, height) = self.demo.dimensions();
+        let action_index = step / 3;
         let mark = match step % 3 {
-            0 => self
-                .demo
-                .paint_material_at(width / 8, height / 8, cascade_sim::Material::Stone),
-            1 => self.scripted_ignite(width, height),
-            _ => self.demo.detonate_at(width / 8 + 32, height / 8 + 32),
+            0 if self.scripted_ignite_target.is_none() => {
+                let x = width / 8 + action_index % 64;
+                let y = height / 8 + action_index / 64;
+                let mark = self
+                    .demo
+                    .paint_material_at(x, y, cascade_sim::Material::Wood);
+                if mark.is_some_and(|mark| mark.admitted) {
+                    self.scripted_ignite_target = Some((x, y));
+                }
+                mark
+            }
+            0 => None,
+            1 => self.scripted_ignite_target.take().and_then(|(x, y)| {
+                let cell = self.demo.world().cell_id(x, y)?;
+                let result = self
+                    .demo
+                    .world_mut()
+                    .submit(cascade_sim::Command::Ignite { cell });
+                let admitted = matches!(
+                    result,
+                    cascade_sim::SubmitResult::Accepted | cascade_sim::SubmitResult::Coalesced
+                );
+                Some(PlayerMark {
+                    kind: ActionKind::Ignite,
+                    x,
+                    y,
+                    admitted,
+                    rejected: !admitted,
+                    material: cascade_sim::Material::Wood as u8,
+                    burning: 0,
+                    paint_material: cascade_sim::Material::Wood as u8,
+                })
+            }),
+            _ => {
+                let x = width / 2 + ((action_index % 32) + 1) * 4;
+                let y = height / 2 + ((action_index / 32) + 1) * 4;
+                self.demo.detonate_at(x, y)
+            }
         };
         if let Some(mark) = mark {
-            println!(
-                "SMOKE_ACTION step={step} kind={} admitted={} rejected={} at={},{} baseline={}",
-                mark.kind.name(),
-                mark.admitted,
-                mark.rejected,
-                mark.x,
-                mark.y,
-                mark.material
-            );
             self.note_mark(mark);
         }
         if let Some(viewport) = self.viewport() {
             self.pan_pixels(1.0, 0.0, viewport, (width, height));
         }
-    }
-
-    fn scripted_ignite(&mut self, width: u32, height: u32) -> Option<PlayerMark> {
-        let x0 = width / 8;
-        let y0 = height / 2 + height / 8;
-        for dy in 0..8 {
-            for dx in 0..8 {
-                let x = x0 + dx;
-                let y = y0 + dy;
-                let wood = self.demo.world().cell(x, y).is_some_and(|cell| {
-                    cell.material == cascade_sim::Material::Wood && cell.burning == 0
-                });
-                if wood {
-                    return self.demo.ignite_at(x, y);
-                }
-            }
-        }
-        self.demo.ignite_at(x0, y0)
     }
 
     fn pointer_action(&mut self, detonate: bool) {
@@ -1703,6 +1910,9 @@ impl ApplicationHandler for App {
             event_loop,
             self.demo.dimensions(),
             self.screenshot_path.is_some(),
+            self.smoke
+                .as_ref()
+                .is_some_and(|smoke| smoke.capture.is_some()),
         ) {
             Ok(gpu) => {
                 let viewport = (gpu.config.width as f32, gpu.config.height as f32);
@@ -1732,10 +1942,16 @@ fn create_gpu(
     event_loop: &ActiveEventLoop,
     world: (u32, u32),
     capture_surface: bool,
+    sustained_capture: bool,
 ) -> Result<Gpu, String> {
+    let logical_size = if sustained_capture {
+        winit::dpi::LogicalSize::new(960.0, 540.0)
+    } else {
+        winit::dpi::LogicalSize::new(1280.0, 720.0)
+    };
     let attributes = Window::default_attributes()
         .with_title("Cascade")
-        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+        .with_inner_size(logical_size);
     let window = Arc::new(
         event_loop
             .create_window(attributes)
@@ -2118,6 +2334,12 @@ fn elapsed_ns(previous: Instant, now: Instant) -> u64 {
     u64::try_from(now.saturating_duration_since(previous).as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn has_minimum_action_samples(feel: &Feel) -> bool {
+    feel.paint_summary().samples >= 30
+        && feel.ignite_summary().samples >= 30
+        && feel.detonate_summary().samples >= 30
+}
+
 fn print_feel(label: &str, feel: &Feel) {
     let camera = feel.camera_summary();
     let paint = feel.paint_summary();
@@ -2140,6 +2362,33 @@ fn print_feel(label: &str, feel: &Feel) {
         detonate.p95_ns as f32 / 1_000_000.0,
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn print_capture(label: &str, run: &PolicySmoke) {
+    let mut intervals = run.capture_intervals_ns.clone();
+    intervals.sort_unstable();
+    let percentile = |percent: usize| {
+        if intervals.is_empty() {
+            0
+        } else {
+            let rank = (percent * intervals.len()).div_ceil(100).max(1);
+            intervals[rank - 1]
+        }
+    };
+    let over_33_3_ms = intervals.iter().filter(|&&ns| ns > 33_333_333).count();
+    println!(
+        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_pending={} max_upload_backlog={}",
+        intervals.len(),
+        percentile(50) as f64 / 1_000_000.0,
+        percentile(95) as f64 / 1_000_000.0,
+        percentile(99) as f64 / 1_000_000.0,
+        intervals.last().copied().unwrap_or(0) as f64 / 1_000_000.0,
+        over_33_3_ms,
+        run.capture_interval_drops,
+        run.max_sim_cpu_ms,
+        run.max_pending,
+        run.max_upload_backlog,
+    );
 }
 
 fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
