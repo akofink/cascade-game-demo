@@ -209,7 +209,7 @@ impl Demo {
             return Err("world dimensions must be multiples of 32 in 32..=4096".to_string());
         }
         let initial_credits = default_credits();
-        let world = World::new(
+        let mut world = World::new(
             width,
             height,
             Credits::new(initial_credits),
@@ -217,9 +217,10 @@ impl Demo {
             Capacity::new(cascade_sim::DEFAULT_COMMAND_CAPACITY),
         )
         .map_err(|error| format!("create simulation: {error:?}"))?;
+        world.set_action_tracking_enabled(false);
         let (tiny_ready, tiny_commands) =
             ScenarioDescriptor::get(FixtureId::TinyCapacity).capacities();
-        let alternate_world = World::new(
+        let mut alternate_world = World::new(
             width,
             height,
             Credits::new(initial_credits),
@@ -227,6 +228,7 @@ impl Demo {
             tiny_commands,
         )
         .map_err(|error| format!("create tiny-capacity simulation: {error:?}"))?;
+        alternate_world.set_action_tracking_enabled(false);
         Ok(Self {
             world,
             alternate_world,

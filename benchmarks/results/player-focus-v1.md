@@ -1,6 +1,6 @@
 # Player-action focus comparison v1
 
-Status: three quiet-host full-size headless repetitions accepted. The post-fix native smoke also completed twice on main; bounded-focus native detonate still has no visible-effect samples. Native frame and action observations are separate from the headless results below.
+Status: three quiet-host full-size headless repetitions accepted. The native smoke sampling gap has since been fixed. The follow-up three-policy, 60-second native results are in [native sustained capture v1](native-sustained-v1.md). Native frame and action observations are separate from the headless results below.
 
 ## Reproduction
 
@@ -50,25 +50,14 @@ Per-action distributions are medians of each repetition's nearest-rank percentil
 
 All three repetitions produced identical final hashes and deterministic work/backlog counts for each policy. The action-effect index examined 8,510 candidates in traditional mode over the full run instead of probing every action record for every simulation cell. The regression tests also assert zero candidates for completed actions and unrelated traditional chunks.
 
-## Native smoke follow-up
+## Historical native smoke follow-up
 
-Two release-mode native `--smoke --world-size 4096` runs on main revision `3016f6f` completed with `SMOKE_RESULT ok`; the recorded 1-minute load changed from 2.4 to 2.7. The detailed second run reported:
+Two release-mode native `--smoke --world-size 4096` runs on main revision `3016f6f` completed with `SMOKE_RESULT ok`, but the bounded-focus window had no detonate samples and all action counts were too small for stable percentiles. This point-in-time native result is superseded by [native sustained capture v1](native-sustained-v1.md), which reports the corrected script and three 60-second repetitions at 1920 x 1080.
 
-| Metric | Bounded FIFO | Bounded focus | Traditional |
-| --- | ---: | ---: | ---: |
-| Frame interval p99 / max | 17.98 / 17.99 ms | not reported | 136.68 / 136.85 ms |
-| Maximum simulation CPU | 4.08 ms | not reported | 146.25 ms |
-| Camera p50 / p95 | 16.61 / 17.74 ms | 16.42 / 17.10 ms | 67.25 / 136.67 ms |
-| Paint visible p50 / p95 | 16.30 / 16.75 ms | 16.09 / 16.51 ms | 66.62 / 66.63 ms |
-| Ignite visible | 815.82 ms (n=1) | 17.04 ms (n=1) | 136.67 ms (n=1) |
-| Detonate visible p50 / p95 | 17.75 / 1019.28 ms (n=4) | no samples | 67.15 / 92.66 ms (n=4) |
-
-Traditional frame p99 of 136.68 ms is substantially below the prior 820.68 ms regression, though still about 1.6x the pre-focus 80-86 ms range. This is one detailed 120-frame-per-policy run; action percentiles with n=1 or n=4 are descriptive only, not stable estimates. The bounded-focus native detonate gap is an app smoke scripting issue, tracked in [issue #26](https://github.com/akofink/cascade-game-demo/issues/26); no app code was changed for this simulator follow-up.
-
-Code-path inspection found no bounded focus-lane selection in traditional mode: `World::step` dispatches directly to `step_traditional`. Traditional still calls `update_action_settle` over the fixed 256-record ring each slice. While any applied action awaits first effect, every captured evaluation/blast also calls `note_action_effect`; the chunk index bounds candidate comparisons but does not eliminate that per-work-item chunk lookup. These are plausible contributors to the residual 1.6x cost, but this smoke does not isolate their contribution and no causal attribution is claimed.
+The residual investigation disabled unused simulator action tracking in the native app, guarded focus-flag clearing, added a traditional scan/work regression test, and replaced the smoke action stream with paired paint/ignite and distinct detonation targets. Headless benchmark action tracking remains enabled by default.
 
 ## Interpretation and limits
 
 Under this headless workload, bounded focus records first effects and local settle for paint, ignite, and detonate with p95 values below 2.8 ms. Traditional action-to-first-effect p95 is about 133 ms in this batch-all workload. These are simulator timestamps, not native frame intervals or display presentation latency, and they do not directly replace the previously observed native traditional p99.
 
-A post-fix native smoke did not complete with a valid `SMOKE_RESULT`: direct launch reported all frames occluded and zero presents; a separate LaunchServices attempt produced no usable summary. No native frame p99 is claimed. The simulator/action-record fix and deterministic headless regression guard are verified, but the renderer-level p99 comparison remains outstanding. The benchmark does not measure camera/UI acknowledgment latency, display scanout, or memory high-water marks.
+These headless simulator timestamps remain separate from the native frame intervals and presentation feedback in [native sustained capture v1](native-sustained-v1.md). The headless benchmark does not measure camera/UI acknowledgment latency, display scanout, or memory high-water marks.
