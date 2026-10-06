@@ -72,6 +72,20 @@ struct PolicySmoke {
     max_ready: usize,
     max_upload_backlog: usize,
     max_sim_cpu_ms: f32,
+    max_sim_slice: cascade_sim::SliceMetrics,
+    total_evaluations: u64,
+    total_blasts: u64,
+    total_recoveries: u64,
+    total_commands: u64,
+    total_selections: u64,
+    max_upload_cpu_ms: f32,
+    max_submit_cpu_ms: f32,
+    slow_frame_count: u32,
+    slow_frame_max_ns: u64,
+    slow_frame_sim_cpu_ms: f32,
+    slow_frame_upload_cpu_ms: f32,
+    slow_frame_submit_cpu_ms: f32,
+    slow_frame_slice: cascade_sim::SliceMetrics,
     max_frame_interval_ns: u64,
     p99_frame_interval_ns: u64,
     capture_intervals_ns: Vec<u64>,
@@ -126,6 +140,7 @@ struct App {
     pre_step_ready: usize,
     upload_cpu_ms: f32,
     submit_cpu_ms: f32,
+    last_frame_interval_ns: u64,
     last_plan: UploadPlan,
     destroy_presses: u64,
     destroy_press_at: Option<Instant>,
@@ -361,6 +376,7 @@ impl App {
             pre_step_ready: 0,
             upload_cpu_ms: 0.0,
             submit_cpu_ms: 0.0,
+            last_frame_interval_ns: 0,
             last_plan: UploadPlan::default(),
             destroy_presses: 0,
             destroy_press_at: None,
@@ -955,6 +971,7 @@ impl App {
         let now = Instant::now();
         if let Some(previous) = self.last_present {
             let interval = elapsed_ns(previous, now);
+            self.last_frame_interval_ns = interval;
             self.history.record_interval(interval);
             if let Some(smoke) = self.smoke.as_mut()
                 && let (Some(config), Some(_started)) = (smoke.capture, smoke.capture_started)
@@ -1332,7 +1349,27 @@ impl App {
             .max(sim_metrics.slice.ready_len)
             .max(self.pre_step_ready);
         run.max_upload_backlog = run.max_upload_backlog.max(self.last_plan.backlog);
-        run.max_sim_cpu_ms = run.max_sim_cpu_ms.max(self.sim_cpu_ms);
+        if self.sim_cpu_ms > run.max_sim_cpu_ms {
+            run.max_sim_cpu_ms = self.sim_cpu_ms;
+            run.max_sim_slice = sim_metrics.slice;
+        }
+        run.total_evaluations += sim_metrics.slice.evaluations as u64;
+        run.total_blasts += sim_metrics.slice.blasts as u64;
+        run.total_recoveries += sim_metrics.slice.recoveries as u64;
+        run.total_commands += sim_metrics.slice.commands as u64;
+        run.total_selections += sim_metrics.slice.selections as u64;
+        run.max_upload_cpu_ms = run.max_upload_cpu_ms.max(self.upload_cpu_ms);
+        run.max_submit_cpu_ms = run.max_submit_cpu_ms.max(self.submit_cpu_ms);
+        if self.last_frame_interval_ns > 33_333_333 {
+            run.slow_frame_count = run.slow_frame_count.saturating_add(1);
+            if self.last_frame_interval_ns > run.slow_frame_max_ns {
+                run.slow_frame_max_ns = self.last_frame_interval_ns;
+                run.slow_frame_sim_cpu_ms = self.sim_cpu_ms;
+                run.slow_frame_upload_cpu_ms = self.upload_cpu_ms;
+                run.slow_frame_submit_cpu_ms = self.submit_cpu_ms;
+                run.slow_frame_slice = sim_metrics.slice;
+            }
+        }
         self.scripted_player_action(run.frames);
         if smoke.capture_started.is_some_and(|started| {
             started.elapsed() >= std::time::Duration::from_secs(capture.seconds)
@@ -2377,7 +2414,7 @@ fn print_capture(label: &str, run: &PolicySmoke) {
     };
     let over_33_3_ms = intervals.iter().filter(|&&ns| ns > 33_333_333).count();
     println!(
-        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_pending={} max_upload_backlog={}",
+        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
         intervals.len(),
         percentile(50) as f64 / 1_000_000.0,
         percentile(95) as f64 / 1_000_000.0,
@@ -2386,6 +2423,28 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         over_33_3_ms,
         run.capture_interval_drops,
         run.max_sim_cpu_ms,
+        run.max_sim_slice.evaluations,
+        run.max_sim_slice.blasts,
+        run.max_sim_slice.recoveries,
+        run.max_sim_slice.commands,
+        run.max_sim_slice.selections,
+        run.total_evaluations,
+        run.total_blasts,
+        run.total_recoveries,
+        run.total_commands,
+        run.total_selections,
+        run.max_upload_cpu_ms,
+        run.max_submit_cpu_ms,
+        run.slow_frame_count,
+        run.slow_frame_max_ns as f64 / 1_000_000.0,
+        run.slow_frame_sim_cpu_ms,
+        run.slow_frame_upload_cpu_ms,
+        run.slow_frame_submit_cpu_ms,
+        run.slow_frame_slice.evaluations,
+        run.slow_frame_slice.blasts,
+        run.slow_frame_slice.recoveries,
+        run.slow_frame_slice.commands,
+        run.slow_frame_slice.selections,
         run.max_pending,
         run.max_upload_backlog,
     );
