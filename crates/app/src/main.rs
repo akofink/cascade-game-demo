@@ -24,6 +24,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+mod offscreen;
+
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const FRAME_SAMPLES: usize = 240;
 const SMOKE_POLICY_FRAMES: u32 = 120;
@@ -33,6 +35,14 @@ const CAPTURE_INTERVAL_CAPACITY: usize = 16_384;
 struct CaptureConfig {
     policy: PolicyChoice,
     seconds: u64,
+}
+
+struct CliArgs {
+    smoke: bool,
+    world_size: u32,
+    screenshot_path: Option<PathBuf>,
+    capture: Option<CaptureConfig>,
+    offscreen_capture: bool,
 }
 
 struct ScreenshotReadback {
@@ -172,13 +182,23 @@ struct App {
 }
 
 fn main() {
-    let (smoke, world_size, screenshot_path, capture) = match parse_args() {
+    let args = match parse_args() {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
         }
     };
+    if args.offscreen_capture {
+        let capture = args
+            .capture
+            .expect("offscreen capture requires a capture policy");
+        if let Err(error) = offscreen::run(capture.policy, capture.seconds, args.world_size) {
+            eprintln!("offscreen capture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let event_loop = match build_event_loop() {
         Ok(loop_) => loop_,
         Err(error) => {
@@ -187,7 +207,12 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(smoke, world_size, screenshot_path, capture);
+    let mut app = App::new(
+        args.smoke,
+        args.world_size,
+        args.screenshot_path,
+        args.capture,
+    );
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("event loop stopped: {error}");
         std::process::exit(1);
@@ -207,8 +232,9 @@ fn build_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     builder.build()
 }
 
-fn parse_args() -> Result<(bool, u32, Option<PathBuf>, Option<CaptureConfig>), String> {
+fn parse_args() -> Result<CliArgs, String> {
     let mut smoke = false;
+    let mut offscreen_capture = false;
     let mut world_size = DEMO_WIDTH;
     let mut screenshot_path = None;
     let mut capture_policy = None;
@@ -218,6 +244,7 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>, Option<CaptureConfig>), S
     while index < args.len() {
         match args[index].as_str() {
             "--smoke" => smoke = true,
+            "--offscreen-capture" => offscreen_capture = true,
             "--screenshot" => {
                 let value = args.get(index + 1).ok_or("missing path for --screenshot")?;
                 screenshot_path = Some(PathBuf::from(value));
@@ -268,7 +295,7 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>, Option<CaptureConfig>), S
             }
             "--help" | "-h" => {
                 println!(
-                    "cascade-app [--smoke] [--world-size N] [--screenshot PATH] [--capture-policy POLICY --capture-seconds N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. --smoke runs the native three-policy check. --capture-policy runs one 4096x4096 mixed-overload policy for the requested wall duration. --screenshot writes a PNG from GPU readback after the measured smoke frames.",
+                    "cascade-app [--smoke] [--offscreen-capture --capture-policy POLICY --capture-seconds N] [--world-size N] [--screenshot PATH] [--capture-policy POLICY --capture-seconds N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. --smoke runs the native three-policy check. --capture-policy runs one windowed 4096x4096 mixed-overload policy for the requested wall duration. --offscreen-capture runs the same policy into a fixed 1920x1080 GPU texture without a window or surface. --screenshot writes a PNG from GPU readback after the measured smoke frames.",
                     cascade_app::MAX_WORLD_AXIS
                 );
                 std::process::exit(0);
@@ -276,6 +303,12 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>, Option<CaptureConfig>), S
             other => return Err(format!("unknown argument: {other}")),
         }
         index += 1;
+    }
+    if offscreen_capture && capture_policy.is_none() {
+        return Err("--offscreen-capture requires --capture-policy".to_string());
+    }
+    if offscreen_capture && screenshot_path.is_some() {
+        return Err("--offscreen-capture does not perform readback or screenshots".to_string());
     }
     if screenshot_path.is_some() && !smoke {
         return Err("--screenshot requires --smoke".to_string());
@@ -287,12 +320,13 @@ fn parse_args() -> Result<(bool, u32, Option<PathBuf>, Option<CaptureConfig>), S
         policy,
         seconds: capture_seconds,
     });
-    Ok((
-        smoke || capture.is_some(),
+    Ok(CliArgs {
+        smoke: smoke || capture.is_some(),
         world_size,
         screenshot_path,
         capture,
-    ))
+        offscreen_capture,
+    })
 }
 
 impl App {
@@ -774,6 +808,7 @@ impl App {
             pending_actions: self.feel.pending_count(),
             focus_linked: focus_linked(),
             focus_enabled: self.demo.policy().focus_enabled(),
+            offscreen_capture: false,
             story,
         };
 
