@@ -154,6 +154,7 @@ impl PendingCell {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceTable {
     pub cells: usize,
+    pub focus_cache_bytes: usize,
     pub cell_bytes: usize,
     pub pending_bytes: usize,
     pub captured_frontier_bytes: usize,
@@ -201,6 +202,11 @@ enum JobKind {
     Blast,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+struct FocusCacheEntry {
+    epoch: u64,
+    focused: bool,
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct FocusRegion {
     min_x: u32,
@@ -373,6 +379,8 @@ pub struct World {
     focus_eval_ready: Ring<Job>,
     focus_blast_ready: Ring<Job>,
     focus_regions: [FocusRegion; FOCUS_REGION_CAPACITY],
+    focus_cache: Vec<FocusCacheEntry>,
+    focus_epoch: u64,
     focus_enabled: bool,
     shares: ServiceShares,
     action_records: Vec<Option<ActionRecord>>,
@@ -493,6 +501,9 @@ impl World {
                 )
             })
             .and_then(|bytes| {
+                bytes.checked_add(chunk_count.checked_mul(std::mem::size_of::<FocusCacheEntry>())?)
+            })
+            .and_then(|bytes| {
                 bytes.checked_add(
                     VISUALIZED_CELLS_PER_SLICE.checked_mul(std::mem::size_of::<u32>())?,
                 )
@@ -516,6 +527,8 @@ impl World {
             focus_eval_ready: Ring::new(ready_capacity.0),
             focus_blast_ready: Ring::new(ready_capacity.0),
             focus_regions: [FocusRegion::default(); FOCUS_REGION_CAPACITY],
+            focus_cache: vec![FocusCacheEntry::default(); chunk_count],
+            focus_epoch: 1,
             focus_enabled: true,
             shares: ServiceShares::default(),
             action_records: vec![None; ACTION_RECORD_CAPACITY],
@@ -590,7 +603,10 @@ impl World {
         }
     }
     pub fn set_focus_enabled(&mut self, enabled: bool) {
-        self.focus_enabled = enabled;
+        if self.focus_enabled != enabled {
+            self.focus_enabled = enabled;
+            self.invalidate_focus_cache();
+        }
     }
     pub fn set_service_shares(&mut self, shares: ServiceShares) -> Result<(), SimError> {
         if shares.focus_percent == 0
@@ -635,14 +651,33 @@ impl World {
         let y = id.0 / self.width;
         (x / CHUNK_SIDE, y / CHUNK_SIDE)
     }
-    fn is_focused(&self, id: CellId) -> bool {
+    fn invalidate_focus_cache(&mut self) {
+        if self.focus_epoch == u64::MAX {
+            self.focus_cache.fill(FocusCacheEntry::default());
+            self.focus_epoch = 1;
+        } else {
+            self.focus_epoch += 1;
+        }
+    }
+    fn is_focused(&mut self, id: CellId) -> bool {
         if !self.focus_enabled {
             return false;
         }
         let (x, y) = self.chunk_xy(id);
-        self.focus_regions
+        let index = (y * self.chunks_x + x) as usize;
+        let cached = self.focus_cache[index];
+        if cached.epoch == self.focus_epoch {
+            return cached.focused;
+        }
+        let focused = self
+            .focus_regions
             .iter()
-            .any(|r| r.contains(x, y, self.slice))
+            .any(|region| region.contains(x, y, self.slice));
+        self.focus_cache[index] = FocusCacheEntry {
+            epoch: self.focus_epoch,
+            focused,
+        };
+        focused
     }
     fn focus_cell(&mut self, id: CellId, lifetime: u16) {
         if !self.focus_enabled {
@@ -668,6 +703,7 @@ impl World {
                     .map_or(0, |(i, _)| i)
             });
         self.focus_regions[slot] = region;
+        self.invalidate_focus_cache();
         // Recovery promotes deferred channels incrementally; no chunk/world scan occurs here.
     }
     pub fn slice_index(&self) -> u64 {
@@ -740,6 +776,7 @@ impl World {
             cell_bytes: std::mem::size_of::<Cell>(),
             pending_bytes: self.pending.len() * std::mem::size_of::<PendingCell>(),
             captured_frontier_bytes: self.captured_frontier.len(),
+            focus_cache_bytes: self.focus_cache.len() * std::mem::size_of::<FocusCacheEntry>(),
             ready_bytes: (self.eval_ready.slots.len() + self.blast_ready.slots.len())
                 * std::mem::size_of::<Option<Job>>(),
             focus_ready_bytes: (self.focus_eval_ready.slots.len()
@@ -765,6 +802,7 @@ impl World {
                     * std::mem::size_of::<[u64; ACTION_RECORD_CAPACITY / 64]>()
                 + self.commands.slots.len() * std::mem::size_of::<Option<Command>>()
                 + self.dirty_chunks.len() * std::mem::size_of::<bool>()
+                + self.focus_cache.len() * std::mem::size_of::<FocusCacheEntry>()
                 + VISUALIZED_CELLS_PER_SLICE * std::mem::size_of::<u32>(),
             ready_capacity: Capacity(self.eval_ready.slots.len() + self.blast_ready.slots.len()),
             focus_ready_capacity: Capacity(
@@ -973,8 +1011,11 @@ impl World {
         }
     }
     fn try_queue(&mut self, id: CellId, kind: JobKind) {
-        let i = id.index();
         let focused = self.is_focused(id);
+        self.try_queue_in_lane(id, kind, focused);
+    }
+    fn try_queue_in_lane(&mut self, id: CellId, kind: JobKind, focused: bool) {
+        let i = id.index();
         let queued_flag = match (kind, focused) {
             (JobKind::Evaluate, true) => PendingCell::EVAL_FOCUS_QUEUED,
             (JobKind::Blast, true) => PendingCell::BLAST_FOCUS_QUEUED,
@@ -1188,8 +1229,11 @@ impl World {
         let i = self.recovery_cursor;
         self.recovery_cursor = (i + 1) % self.cells.len();
         let id = CellId(i as u32);
-        if self.pending[i].has(PendingCell::EVAL_PENDING) {
-            if self.is_focused(id) && !self.pending[i].has(PendingCell::EVAL_FOCUS_QUEUED) {
+        let has_evaluation = self.pending[i].has(PendingCell::EVAL_PENDING);
+        let has_blast = self.pending[i].blast > 0;
+        let focused = (has_evaluation || has_blast) && self.is_focused(id);
+        if has_evaluation {
+            if focused && !self.pending[i].has(PendingCell::EVAL_FOCUS_QUEUED) {
                 let job = Job {
                     cell: id,
                     kind: JobKind::Evaluate,
@@ -1201,11 +1245,11 @@ impl World {
             } else if !self.pending[i].has(PendingCell::EVAL_QUEUED)
                 && !self.pending[i].has(PendingCell::EVAL_FOCUS_QUEUED)
             {
-                self.try_queue(id, JobKind::Evaluate);
+                self.try_queue_in_lane(id, JobKind::Evaluate, focused);
             }
         }
-        if self.pending[i].blast > 0 {
-            if self.is_focused(id) && !self.pending[i].has(PendingCell::BLAST_FOCUS_QUEUED) {
+        if has_blast {
+            if focused && !self.pending[i].has(PendingCell::BLAST_FOCUS_QUEUED) {
                 let job = Job {
                     cell: id,
                     kind: JobKind::Blast,
@@ -1217,7 +1261,7 @@ impl World {
             } else if !self.pending[i].has(PendingCell::BLAST_QUEUED)
                 && !self.pending[i].has(PendingCell::BLAST_FOCUS_QUEUED)
             {
-                self.try_queue(id, JobKind::Blast);
+                self.try_queue_in_lane(id, JobKind::Blast, focused);
             }
         }
     }
@@ -1378,6 +1422,7 @@ impl World {
                     .map_or(0, |(i, _)| i)
             });
         self.focus_regions[slot] = region;
+        self.invalidate_focus_cache();
     }
     fn execute_command(&mut self, command: Command) {
         match command {
@@ -1418,6 +1463,7 @@ impl World {
     }
     /// Run exactly one policy slice. Traditional mode drains only the ready frontier captured at entry.
     pub fn step(&mut self) -> SliceMetrics {
+        self.invalidate_focus_cache();
         self.last_executed_len = 0;
         self.last_executed_count = 0;
         self.last_paint_count = 0;
@@ -1746,6 +1792,7 @@ impl World {
         self.focus_eval_ready.clear();
         self.focus_blast_ready.clear();
         self.focus_regions = [FocusRegion::default(); FOCUS_REGION_CAPACITY];
+        self.invalidate_focus_cache();
         self.commands.clear();
         self.pending_count = 0;
         self.oldest_pending_since = 0;
@@ -2158,6 +2205,9 @@ mod tests {
         );
         assert_eq!(view.remaining_slices, 3);
         assert!(w.is_focused(CellId(0)));
+        let cached = w.focus_cache[0];
+        assert!(w.is_focused(CellId(1)));
+        assert_eq!(w.focus_cache[0], cached, "same-chunk result is reused");
         w.step();
         assert!(w.is_focused(CellId(0)));
         w.step();
@@ -2171,11 +2221,17 @@ mod tests {
         let mut w = world(64, 64, 256, 64, 8);
         let id = CellId(10 * 64 + 10);
         w.mark_cell_for_evaluation(id).unwrap();
+        w.pending[id.index()].blast = 3;
+        w.pending_count += 1;
+        w.mark_pending(id, false);
+        w.try_queue(id, JobKind::Blast);
         assert!(w.pending[id.index()].has(PendingCell::EVAL_QUEUED));
+        assert!(w.pending[id.index()].has(PendingCell::BLAST_QUEUED));
         w.set_focus_region(0, 0, 1, 1, 10);
         w.recovery_cursor = id.index();
         w.recover_one();
         assert!(w.pending[id.index()].has(PendingCell::EVAL_FOCUS_QUEUED));
+        assert!(w.pending[id.index()].has(PendingCell::BLAST_FOCUS_QUEUED));
         for _ in 0..20 {
             w.step();
         }
@@ -2405,8 +2461,12 @@ mod tests {
         assert_eq!(resources.cell_bytes, 2);
         assert_eq!(resources.pending_bytes, 3 * 4096 * 4096);
         assert_eq!(resources.captured_frontier_bytes, 4096 * 4096);
+        assert_eq!(
+            resources.focus_cache_bytes,
+            16_384 * std::mem::size_of::<FocusCacheEntry>()
+        );
         assert_eq!(resources.action_effect_index_bytes, 16_384 * 32);
-        assert_eq!(resources.total_bytes, 102_800_896);
+        assert_eq!(resources.total_bytes, 103_063_040);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]

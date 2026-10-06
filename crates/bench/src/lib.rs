@@ -62,6 +62,10 @@ pub struct BenchRow {
     pub credits_allowed: u32,
     pub credits_used: u32,
     pub selection_probes: u32,
+    pub evaluations: u32,
+    pub blasts: u32,
+    pub recoveries: u32,
+    pub commands: u32,
     pub executed_quanta: u32,
     pub backlog: usize,
     pub ready_jobs: usize,
@@ -212,7 +216,7 @@ pub fn run<W: Write>(
     match format {
         OutputFormat::Csv => writeln!(
             output,
-            "fixture,fixture_version,seed,policy,width,height,budget,slice,credits_allowed,credits_used,selection_probes,executed_quanta,completed_work_quanta,elapsed_wall_ns,preparation_slices,preparation_wall_ns,warmup_slices,warmup_wall_ns,backlog,ready_jobs,pending_channels,command_backlog,disturbance_attempted,disturbance_accepted,disturbance_coalesced,disturbance_rejected,slice_cpu_ns,complete"
+            "fixture,fixture_version,seed,policy,width,height,budget,slice,credits_allowed,credits_used,selection_probes,evaluations,blasts,recoveries,commands,executed_quanta,completed_work_quanta,elapsed_wall_ns,preparation_slices,preparation_wall_ns,warmup_slices,warmup_wall_ns,backlog,ready_jobs,pending_channels,command_backlog,disturbance_attempted,disturbance_accepted,disturbance_coalesced,disturbance_rejected,slice_cpu_ns,complete"
         )?,
         OutputFormat::Json => write!(
             output,
@@ -356,6 +360,10 @@ fn make_row(
         credits_allowed: metrics.allowed,
         credits_used: metrics.charged,
         selection_probes: metrics.selections,
+        evaluations: metrics.evaluations,
+        blasts: metrics.blasts,
+        recoveries: metrics.recoveries,
+        commands: metrics.commands,
         executed_quanta: metrics.evaluations
             + metrics.blasts
             + metrics.recoveries
@@ -390,7 +398,7 @@ fn write_csv_row<W: Write>(
 ) -> io::Result<()> {
     writeln!(
         output,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         fixture.name(),
         fixture.version,
         fixture.seed,
@@ -402,6 +410,10 @@ fn write_csv_row<W: Write>(
         row.credits_allowed,
         row.credits_used,
         row.selection_probes,
+        row.evaluations,
+        row.blasts,
+        row.recoveries,
+        row.commands,
         row.executed_quanta,
         row.completed_work_quanta,
         row.elapsed_wall_ns,
@@ -425,11 +437,15 @@ fn write_csv_row<W: Write>(
 fn write_json_row<W: Write>(output: &mut W, row: BenchRow) -> io::Result<()> {
     write!(
         output,
-        "{{\"slice\":{},\"credits_allowed\":{},\"credits_used\":{},\"selection_probes\":{},\"executed_quanta\":{},\"completed_work_quanta\":{},\"elapsed_wall_ns\":{},\"preparation_slices\":{},\"preparation_wall_ns\":{},\"warmup_slices\":{},\"warmup_wall_ns\":{},\"backlog\":{},\"ready_jobs\":{},\"pending_channels\":{},\"command_backlog\":{},\"disturbance_attempted\":{},\"disturbance_accepted\":{},\"disturbance_coalesced\":{},\"disturbance_rejected\":{},\"slice_cpu_ns\":{},\"complete\":{}}}",
+        "{{\"slice\":{},\"credits_allowed\":{},\"credits_used\":{},\"selection_probes\":{},\"evaluations\":{},\"blasts\":{},\"recoveries\":{},\"commands\":{},\"executed_quanta\":{},\"completed_work_quanta\":{},\"elapsed_wall_ns\":{},\"preparation_slices\":{},\"preparation_wall_ns\":{},\"warmup_slices\":{},\"warmup_wall_ns\":{},\"backlog\":{},\"ready_jobs\":{},\"pending_channels\":{},\"command_backlog\":{},\"disturbance_attempted\":{},\"disturbance_accepted\":{},\"disturbance_coalesced\":{},\"disturbance_rejected\":{},\"slice_cpu_ns\":{},\"complete\":{}}}",
         row.slice,
         row.credits_allowed,
         row.credits_used,
         row.selection_probes,
+        row.evaluations,
+        row.blasts,
+        row.recoveries,
+        row.commands,
         row.executed_quanta,
         row.completed_work_quanta,
         row.elapsed_wall_ns,
@@ -553,9 +569,9 @@ mod tests {
         let warm_output = String::from_utf8(warm_output).unwrap();
         let cold_rows: Vec<_> = cold_output.lines().collect();
         let warm_rows: Vec<_> = warm_output.lines().collect();
-        assert_eq!(warm_rows[0].split(',').count(), 28);
-        assert_eq!(warm_rows[1].split(',').count(), 28);
-        for column in [11, 18] {
+        assert_eq!(warm_rows[0].split(',').count(), 32);
+        assert_eq!(warm_rows[1].split(',').count(), 32);
+        for column in [16, 23] {
             assert_eq!(
                 cold_rows[1].split(',').nth(column),
                 warm_rows[1].split(',').nth(column)
