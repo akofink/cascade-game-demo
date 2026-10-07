@@ -4,7 +4,7 @@
 
 The row-major world has a closed boundary. Out-of-range neighbors do not exist. Cell IDs are zero-based validated indices. Rule order and neighbor order are stable: up, left, right, down. Local updates are asynchronous scheduler quanta, not global ticks. A dormant cell receives no recurring evaluation; movement, ignition, blasts, and accepted edits wake a fixed cardinal neighborhood.
 
-Materials are Air, Stone, Wood, Sand, Explosive, and Water. Stone is fixed until changed by an explicit edit. Burning is a cell-state countdown on wood, not an additional material. Cell reads preserve the existing `state` byte for pending blast energy and add `burning` as an additive state field.
+Materials are Air, Stone, Wood, Sand, Explosive, and Water. Stone is fixed until changed by an explicit edit. Burning is a cell-state countdown on wood, not an additional material. Cell reads preserve the existing `state` byte for pending blast energy and expose burning only for wood. The cell's existing byte unused by non-burning materials stores horizontal water-flow direction, so this rule adds no per-cell storage.
 
 <link rel="stylesheet" href="rules-images/rules.css">
 
@@ -12,7 +12,7 @@ Materials are Air, Stone, Wood, Sand, Explosive, and Water. Stone is fixed until
 
 ## Granular and water movement
 
-Sand and water inspect the cell directly below. If it is Air, the material moves there atomically. Sand otherwise remains dormant. Water otherwise tries one horizontal neighbor; initial direction is selected by `(x + y) mod 2`, and it tries the opposite direction if blocked. The closed boundary prevents escape. This intentionally simple local spreading rule may oscillate and is not a pressure-fluid model.
+Sand and water inspect the cell directly below. If it is Air, the material moves there atomically. Sand otherwise remains dormant. Water otherwise tries one horizontal neighbor; initial direction is selected by `(x + y) mod 2`. After a horizontal move, water retains that direction, including when it falls, and does not reverse if the direction is blocked. This prevents adjacent asynchronous slices from bouncing a water cell between two positions. The closed boundary prevents escape. This intentionally simple, directionally biased local spreading rule is not a pressure-fluid model.
 
 A successful move clears the source, fills the destination, and wakes cardinal neighbors of both cells. Sand and water counts are conserved by simulation movement. Explicit paint/reset can change counts. Each evaluation inspects a fixed bounded neighborhood, and no rule searches an unbounded column or region.
 
@@ -81,4 +81,4 @@ The scheduler's focus share applies only while focus work is ready. The configur
 
 Each admitted target action writes a fixed-ring record with its admission slice and the slice its command is applied. First effect is the earliest subsequent executed evaluation or blast rule quantum touching the target cell or one of its eight immediate neighbors; the command quantum that admits/installs the action is not counted as a simulation effect. Local settle is the first slice after first effect where no evaluation or blast channel remains in that 3x3 cell neighborhood. Records are overwritten oldest-first at capacity; action latency is slice-based, not wall-clock simulation time.
 
-The rules version is `RULE_VERSION = 6`. Determinism is guaranteed only for the same executable/rules, world dimensions, admitted operation order, capacities, policy, focus configuration, and slice schedule. Bounded mode spends at most its allowance. Traditional mode snapshots the per-cell pending evaluation and blast channels plus the command count at update start, processes that entire captured frontier without the credit cap, and leaves work created during the update for the next one. It charges and times both full-world scans and never recursively drains to quiescence.
+The rules version is `RULE_VERSION = 7`. Determinism is guaranteed only for the same executable/rules, world dimensions, admitted operation order, capacities, policy, focus configuration, and slice schedule. Bounded mode spends at most its allowance. Traditional mode snapshots the per-cell pending evaluation and blast channels plus the command count at update start, processes that entire captured frontier without the credit cap, and leaves work created during the update for the next one. It charges and times both full-world scans and never recursively drains to quiescence.

@@ -4,6 +4,11 @@ version = 3
 name = "m2-16gb-headless"
 reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
 credits_per_slice = 1000000
+selection_probe_credits = 1
+evaluation_credits = 24
+blast_credits = 24
+recovery_probe_credits = 20
+command_credits = 12
 simulator_max_supported_credits = 10000000
 app_current_max_credits = 1000000
 app_current_default_credits = 1000000
@@ -35,6 +40,7 @@ calibration_disturbances_per_run = 115200
 calibration_disturbances_per_slice = 64
 capture_source_revision = "66b2b22"
 capture_rule_version = 4
+current_rule_version = 7
 worst_workload_p50_ns = 1503000
 worst_workload_p95_ns = 2262000
 worst_workload_p99_ns = 2838709
@@ -45,7 +51,7 @@ native_windowed_capture_revision = "dc237d2"
 native_windowed_bounded_fifo_p99_ms = [18.096, 17.944, 18.000]
 native_windowed_bounded_fifo_max_sim_cpu_ms = [5.287, 5.188, 5.410]
 native_windowed_bounded_fifo_max_upload_cpu_ms = [3.468, 3.729, 3.538]
-status = "headless candidate; 1M credits retained; FIFO frame p99 met in 3 post-fix captures; observed slice maxima exceed 4 ms"
+status = "1M credits retained; recovery probes repriced to 20 credits; 72,000-slice burst still has pending work; current rule version 7; bounded slice maxima remain under investigation"
 
 # Calibration and held-out validation descriptor roles are disjoint; see scenario TOML metadata.
 # Historical calibration/validation streams shared descriptors, so those captures are not

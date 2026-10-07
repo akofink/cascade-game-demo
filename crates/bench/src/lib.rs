@@ -72,6 +72,10 @@ pub struct BenchRow {
     pub pending_channels: usize,
     pub command_backlog: usize,
     pub slice_cpu_ns: u128,
+    pub evaluation_ns: u64,
+    pub blast_ns: u64,
+    pub recovery_ns: u64,
+    pub command_ns: u64,
     pub elapsed_wall_ns: u128,
     pub completed_work_quanta: u64,
     pub preparation_slices: u64,
@@ -100,7 +104,10 @@ pub struct BenchSummary {
     pub measured_wall_ns: u128,
     pub first_completion_slice: Option<u64>,
     pub completion_wall_ns: Option<u128>,
+    pub stable_window_start_slice: Option<u64>,
+    pub stable_window_wall_ns: Option<u128>,
     pub completed_work_quanta: u64,
+    pub pending_channels_by_material: [usize; 6],
     pub final_hash: u64,
     pub complete: bool,
 }
@@ -216,7 +223,7 @@ pub fn run<W: Write>(
     match format {
         OutputFormat::Csv => writeln!(
             output,
-            "fixture,fixture_version,seed,policy,width,height,budget,slice,credits_allowed,credits_used,selection_probes,evaluations,blasts,recoveries,commands,executed_quanta,completed_work_quanta,elapsed_wall_ns,preparation_slices,preparation_wall_ns,warmup_slices,warmup_wall_ns,backlog,ready_jobs,pending_channels,command_backlog,disturbance_attempted,disturbance_accepted,disturbance_coalesced,disturbance_rejected,slice_cpu_ns,complete"
+            "fixture,fixture_version,seed,policy,width,height,budget,slice,credits_allowed,credits_used,selection_probes,evaluations,blasts,recoveries,commands,executed_quanta,completed_work_quanta,elapsed_wall_ns,preparation_slices,preparation_wall_ns,warmup_slices,warmup_wall_ns,backlog,ready_jobs,pending_channels,command_backlog,disturbance_attempted,disturbance_accepted,disturbance_coalesced,disturbance_rejected,slice_cpu_ns,evaluation_ns,blast_ns,recovery_ns,command_ns,complete"
         )?,
         OutputFormat::Json => write!(
             output,
@@ -244,6 +251,9 @@ pub fn run<W: Write>(
     let measured_started = Instant::now();
     let mut first_completion_slice = None;
     let mut completion_wall_ns = None;
+    let mut quiet_streak = 0u64;
+    let mut stable_window_start_slice = None;
+    let mut stable_window_wall_ns = None;
     let mut disturbance_stream = DisturbanceCommandStream::new(
         config.fixture.seed ^ 0xd157_0b00_0000_0001,
         config.disturbances,
@@ -285,6 +295,20 @@ pub fn run<W: Write>(
             first_completion_slice = Some(slice);
             completion_wall_ns = Some(elapsed_wall_ns);
         }
+        let no_pending_work = disturbance_stream.finished()
+            && metrics.pending_cells == 0
+            && metrics.ready_len == 0
+            && world.command_len() == 0
+            && !metrics.fixture_in_progress;
+        if no_pending_work {
+            quiet_streak += 1;
+            if quiet_streak == 60 {
+                stable_window_start_slice = Some(slice - 59);
+                stable_window_wall_ns = Some(elapsed_wall_ns);
+            }
+        } else {
+            quiet_streak = 0;
+        }
         match format {
             OutputFormat::Csv => write_csv_row(output, config.fixture, config.policy, config, row)?,
             OutputFormat::Json => {
@@ -307,14 +331,24 @@ pub fn run<W: Write>(
     let final_hash = hasher.finish();
     let complete =
         disturbance_stream.finished() && world.pending_channels() == 0 && world.command_len() == 0;
+    let pending_channels_by_material = world.pending_channels_by_material();
     if format == OutputFormat::Json {
         let first_completion_slice_json =
             first_completion_slice.map_or_else(|| "null".to_string(), |value| value.to_string());
         let completion_wall_ns_json =
             completion_wall_ns.map_or_else(|| "null".to_string(), |value| value.to_string());
+        let stable_window_start_json =
+            stable_window_start_slice.map_or_else(|| "null".to_string(), |value| value.to_string());
+        let stable_window_wall_json =
+            stable_window_wall_ns.map_or_else(|| "null".to_string(), |value| value.to_string());
+        let pending_by_material_json = pending_channels_by_material
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         writeln!(
             output,
-            ",\"measured_wall_ns\":{measured_wall_ns},\"completed_work_quanta\":{completed_work_quanta},\"first_completion_slice\":{first_completion_slice_json},\"completion_wall_ns\":{completion_wall_ns_json},\"final_hash\":\"{final_hash:016x}\",\"complete\":{complete}}}"
+            ",\"measured_wall_ns\":{measured_wall_ns},\"completed_work_quanta\":{completed_work_quanta},\"first_completion_slice\":{first_completion_slice_json},\"completion_wall_ns\":{completion_wall_ns_json},\"stable_window_start_slice\":{stable_window_start_json},\"stable_window_wall_ns\":{stable_window_wall_json},\"pending_channels_by_material\":[{pending_by_material_json}],\"final_hash\":\"{final_hash:016x}\",\"complete\":{complete}}}"
         )?;
     }
     Ok(BenchSummary {
@@ -331,7 +365,10 @@ pub fn run<W: Write>(
         measured_wall_ns,
         first_completion_slice,
         completion_wall_ns,
+        stable_window_start_slice,
+        stable_window_wall_ns,
         completed_work_quanta,
+        pending_channels_by_material,
         final_hash,
         complete,
     })
@@ -375,6 +412,10 @@ fn make_row(
         pending_channels: metrics.pending_cells,
         command_backlog,
         slice_cpu_ns,
+        evaluation_ns: metrics.evaluation_ns,
+        blast_ns: metrics.blast_ns,
+        recovery_ns: metrics.recovery_ns,
+        command_ns: metrics.command_ns,
         elapsed_wall_ns,
         completed_work_quanta,
         preparation_slices,
@@ -398,7 +439,7 @@ fn write_csv_row<W: Write>(
 ) -> io::Result<()> {
     writeln!(
         output,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         fixture.name(),
         fixture.version,
         fixture.seed,
@@ -430,6 +471,10 @@ fn write_csv_row<W: Write>(
         row.disturbance_coalesced,
         row.disturbance_rejected,
         row.slice_cpu_ns,
+        row.evaluation_ns,
+        row.blast_ns,
+        row.recovery_ns,
+        row.command_ns,
         row.complete
     )
 }
@@ -437,7 +482,7 @@ fn write_csv_row<W: Write>(
 fn write_json_row<W: Write>(output: &mut W, row: BenchRow) -> io::Result<()> {
     write!(
         output,
-        "{{\"slice\":{},\"credits_allowed\":{},\"credits_used\":{},\"selection_probes\":{},\"evaluations\":{},\"blasts\":{},\"recoveries\":{},\"commands\":{},\"executed_quanta\":{},\"completed_work_quanta\":{},\"elapsed_wall_ns\":{},\"preparation_slices\":{},\"preparation_wall_ns\":{},\"warmup_slices\":{},\"warmup_wall_ns\":{},\"backlog\":{},\"ready_jobs\":{},\"pending_channels\":{},\"command_backlog\":{},\"disturbance_attempted\":{},\"disturbance_accepted\":{},\"disturbance_coalesced\":{},\"disturbance_rejected\":{},\"slice_cpu_ns\":{},\"complete\":{}}}",
+        "{{\"slice\":{},\"credits_allowed\":{},\"credits_used\":{},\"selection_probes\":{},\"evaluations\":{},\"blasts\":{},\"recoveries\":{},\"commands\":{},\"executed_quanta\":{},\"completed_work_quanta\":{},\"elapsed_wall_ns\":{},\"preparation_slices\":{},\"preparation_wall_ns\":{},\"warmup_slices\":{},\"warmup_wall_ns\":{},\"backlog\":{},\"ready_jobs\":{},\"pending_channels\":{},\"command_backlog\":{},\"disturbance_attempted\":{},\"disturbance_accepted\":{},\"disturbance_coalesced\":{},\"disturbance_rejected\":{},\"slice_cpu_ns\":{},\"evaluation_ns\":{},\"blast_ns\":{},\"recovery_ns\":{},\"command_ns\":{},\"complete\":{}}}",
         row.slice,
         row.credits_allowed,
         row.credits_used,
@@ -462,6 +507,10 @@ fn write_json_row<W: Write>(output: &mut W, row: BenchRow) -> io::Result<()> {
         row.disturbance_coalesced,
         row.disturbance_rejected,
         row.slice_cpu_ns,
+        row.evaluation_ns,
+        row.blast_ns,
+        row.recovery_ns,
+        row.command_ns,
         row.complete
     )
 }
@@ -569,14 +618,42 @@ mod tests {
         let warm_output = String::from_utf8(warm_output).unwrap();
         let cold_rows: Vec<_> = cold_output.lines().collect();
         let warm_rows: Vec<_> = warm_output.lines().collect();
-        assert_eq!(warm_rows[0].split(',').count(), 32);
-        assert_eq!(warm_rows[1].split(',').count(), 32);
+        assert_eq!(warm_rows[0].split(',').count(), 36);
+        assert_eq!(warm_rows[1].split(',').count(), 36);
         for column in [16, 23] {
             assert_eq!(
                 cold_rows[1].split(',').nth(column),
                 warm_rows[1].split(',').nth(column)
             );
         }
+    }
+
+    #[test]
+    fn stable_state_requires_sixty_quiet_slices_after_input_ends() {
+        let config = BenchConfig {
+            fixture: ScenarioDescriptor::get(FixtureId::QuietWorld),
+            width: 8,
+            height: 8,
+            slices: 59,
+            ..BenchConfig::default()
+        };
+        let mut short_output = Vec::new();
+        let short = run(config, OutputFormat::Csv, &mut short_output).unwrap();
+        assert_eq!(short.stable_window_start_slice, None);
+        assert_eq!(short.stable_window_wall_ns, None);
+
+        let mut long_output = Vec::new();
+        let long = run(
+            BenchConfig {
+                slices: 60,
+                ..config
+            },
+            OutputFormat::Csv,
+            &mut long_output,
+        )
+        .unwrap();
+        assert_eq!(long.stable_window_start_slice, Some(1));
+        assert!(long.stable_window_wall_ns.is_some());
     }
 
     #[test]
