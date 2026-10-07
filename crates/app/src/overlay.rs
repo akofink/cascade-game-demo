@@ -36,6 +36,7 @@ pub struct OverlayInput<'a> {
     pub pending_actions: usize,
     pub focus_linked: bool,
     pub focus_enabled: bool,
+    pub offscreen_capture: bool,
     pub story: &'static str,
 }
 
@@ -127,10 +128,17 @@ pub fn show_overlay(ctx: &egui::Context, input: &OverlayInput<'_>, actions: &mut
                 input.sim.disturbance_emitted
             ));
             ui.separator();
-            ui.label(format_latency("camera / UI", input.camera_latency));
-            ui.label(format_latency("paint visible", input.paint_latency));
-            ui.label(format_latency("ignite visible", input.ignite_latency));
-            ui.label(format_latency("detonate visible", input.detonate_latency));
+            if input.offscreen_capture {
+                ui.label(format_latency("scripted camera / UI proxy", input.camera_latency));
+                ui.label(format_latency("paint upload / render proxy", input.paint_latency));
+                ui.label(format_latency("ignite upload / render proxy", input.ignite_latency));
+                ui.label(format_latency("detonate upload / render proxy", input.detonate_latency));
+            } else {
+                ui.label(format_latency("camera / UI", input.camera_latency));
+                ui.label(format_latency("paint visible", input.paint_latency));
+                ui.label(format_latency("ignite visible", input.ignite_latency));
+                ui.label(format_latency("detonate visible", input.detonate_latency));
+            }
             if input.summary.samples == 0 {
                 ui.label("frame intervals: waiting");
             } else {
