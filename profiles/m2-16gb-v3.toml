@@ -17,6 +17,15 @@ calibration_workloads = [
   "burning-forest-v1 + 64 seeded disturbance commands/slice",
   "mixed-overload-v1 + 64 seeded disturbance commands/slice",
 ]
+calibration_descriptors = ["burning-forest-v1", "mixed-overload-v1"]
+held_out_validation_descriptors = [
+  "quiet-world-v1",
+  "explosive-lattice-v1",
+  "sand-release-v1",
+  "reservoir-breach-v1",
+  "dirty-world-sweep-v1",
+  "tiny-capacity-v1",
+]
 calibration_dimensions = [4096, 4096]
 calibration_slices_per_workload_run = 1800
 calibration_repetitions_per_workload = 3
@@ -34,6 +43,6 @@ slices_over_4ms = 0
 budget_target_ns = 4000000
 status = "headless candidate; app default and cap are profile-backed"
 
-# Empirical only. The burning-forest sweep had adverse >4 ms outliers at 800000
-# and 1200000 credits; calibration/validation share static fixture descriptors.
-# Full 60-second and post-correction native interactive validation remain open.
+# Calibration and held-out validation descriptor roles are disjoint; see scenario TOML metadata.
+# Historical calibration/validation streams shared descriptors, so those captures are not
+# held-out evidence. Full 60-second and post-correction native interactive validation remain open.

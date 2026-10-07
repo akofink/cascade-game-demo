@@ -174,6 +174,7 @@ pub struct DemoMetrics {
     pub disturbance_emitted: u64,
     pub resource_bytes: usize,
     pub ready_capacity: usize,
+    pub hot_path_allocation_calls: Option<usize>,
 }
 
 pub struct Demo {
@@ -193,6 +194,7 @@ pub struct Demo {
     disturbances: DisturbanceCommandStream,
     last_metrics: SliceMetrics,
     last_disturbance: u64,
+    last_hot_path_allocation_calls: Option<usize>,
 }
 
 impl Demo {
@@ -246,6 +248,7 @@ impl Demo {
             disturbances: disturbance_stream(),
             last_metrics: SliceMetrics::default(),
             last_disturbance: 0,
+            last_hot_path_allocation_calls: None,
         })
     }
 
@@ -296,6 +299,7 @@ impl Demo {
             resource_bytes: self.world.resources().total_bytes
                 + self.alternate_world.resources().total_bytes,
             ready_capacity: self.world.resources().ready_capacity.get(),
+            hot_path_allocation_calls: self.last_hot_path_allocation_calls,
         }
     }
 
@@ -607,6 +611,7 @@ impl Demo {
 
     /// Advance no more than one scheduler slice per presentation iteration.
     pub fn tick(&mut self) {
+        self.last_hot_path_allocation_calls = None;
         let preparing = self.world.reset_in_progress()
             || self
                 .world
@@ -622,7 +627,11 @@ impl Demo {
             if !preparing {
                 self.reapply_player_marks();
             }
+            let allocations_before = crate::allocation_count();
             self.last_metrics = self.world.step();
+            self.last_hot_path_allocation_calls = crate::allocation_count()
+                .zip(allocations_before)
+                .map(|(after, before)| after.saturating_sub(before));
             self.step_once = false;
         }
     }

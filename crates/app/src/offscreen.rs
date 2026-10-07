@@ -167,6 +167,7 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
             intervals_ns: &intervals[..interval_count],
             pending_samples: &pending[..pending_count],
             sim_cpu_ms,
+            hot_path_allocations: demo.metrics().hot_path_allocation_calls,
             upload_cpu_ms,
             submit_cpu_ms: last_submit_cpu_ms,
             backlog: last_plan.backlog,

@@ -1,3 +1,4 @@
 id = "burning-forest"
 version = 1
 seed = 1128354565
+benchmark_role = "calibration"

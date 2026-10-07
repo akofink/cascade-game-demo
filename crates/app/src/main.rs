@@ -787,6 +787,7 @@ impl App {
             intervals_ns: &intervals[..interval_count],
             pending_samples: &pending_samples[..pending_count],
             sim_cpu_ms: self.sim_cpu_ms,
+            hot_path_allocations: self.demo.metrics().hot_path_allocation_calls,
             upload_cpu_ms: self.upload_cpu_ms,
             submit_cpu_ms: self.submit_cpu_ms,
             backlog: self.last_plan.backlog,

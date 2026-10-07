@@ -1,3 +1,4 @@
 id = "explosive-lattice"
 version = 1
 seed = 1128354562
+benchmark_role = "held-out-validation"

@@ -6,8 +6,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+allocation-diagnostics = ["dep:stats_alloc"]
+
 [dependencies]
 cascade-sim = { path = "../sim" }
+stats_alloc = { version = "0.1.10", optional = true }
 egui = "0.36.2"
 egui-wgpu = "0.36.2"
 egui-winit = "0.36.2"
