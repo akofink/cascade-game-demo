@@ -2501,7 +2501,7 @@ fn print_capture(label: &str, run: &PolicySmoke) {
     };
     let over_33_3_ms = intervals.iter().filter(|&&ns| ns > 33_333_333).count();
     println!(
-        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
+        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_sim_credits={}/{} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
         intervals.len(),
         percentile(50) as f64 / 1_000_000.0,
         percentile(95) as f64 / 1_000_000.0,
@@ -2510,6 +2510,8 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         over_33_3_ms,
         run.capture_interval_drops,
         run.max_sim_cpu_ms,
+        run.max_sim_slice.charged,
+        run.max_sim_slice.allowed,
         run.max_sim_slice.evaluations,
         run.max_sim_slice.blasts,
         run.max_sim_slice.recoveries,
