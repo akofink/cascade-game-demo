@@ -5,6 +5,8 @@ pub mod fixtures;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 #[cfg(feature = "quantum-timing")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "quantum-timing")]
 use std::time::Instant;
 
 pub const CHUNK_SIDE: u32 = 32;
@@ -15,11 +17,27 @@ pub const ACTION_RECORD_CAPACITY: usize = 256;
 pub const PLAYER_ACTION_FOCUS_LIFETIME_SLICES: u16 = 8;
 pub const RULE_VERSION: u32 = 7;
 pub const MAX_QUANTUM_COST: u32 = 24;
+pub const SELECTION_PROBE_COST: u32 = 1;
+pub const MINIMUM_SLICE_CREDITS: u32 = MAX_QUANTUM_COST + SELECTION_PROBE_COST;
 pub const MAX_BUDGET_CREDITS: u32 = 10_000_000;
 pub const APPLICATION_CPU_STORAGE_LIMIT: usize = 256 * 1024 * 1024;
 const VISUALIZED_CELLS_PER_SLICE: usize = 128;
 #[cfg(feature = "quantum-timing")]
-const QUANTUM_TIMING_SAMPLE_INTERVAL: u32 = 8;
+const QUANTUM_TIMING_SAMPLE_INTERVAL: u64 = 8;
+#[cfg(feature = "quantum-timing")]
+static EVALUATION_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "quantum-timing")]
+static BLAST_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "quantum-timing")]
+static RECOVERY_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "quantum-timing")]
+static COMMAND_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "quantum-timing")]
+static SELECTION_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "quantum-timing")]
+fn should_sample_quantum(sequence: &AtomicU64) -> bool {
+    sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % QUANTUM_TIMING_SAMPLE_INTERVAL == 0
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -189,7 +207,7 @@ pub struct CostContract {
 impl Default for CostContract {
     fn default() -> Self {
         Self {
-            selection: Credits(1),
+            selection: Credits(SELECTION_PROBE_COST),
             evaluate: Credits(24),
             blast: Credits(24),
             recovery: Credits(20),
@@ -207,10 +225,8 @@ enum JobKind {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-struct FocusCacheEntry {
-    epoch: u64,
-    focused: bool,
-}
+#[repr(transparent)]
+struct FocusCacheEntry(u32);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct FocusRegion {
     min_x: u32,
@@ -256,11 +272,12 @@ pub struct ServiceShares {
 impl Default for ServiceShares {
     fn default() -> Self {
         Self {
-            focus_percent: 50,
+            focus_percent: 5,
             background_min_percent: 20,
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct Job {
     cell: CellId,
@@ -353,7 +370,12 @@ pub struct SliceMetrics {
     pub action_effect_candidates: u32,
     pub evaluation_ns: u64,
     pub blast_ns: u64,
+    pub selection_ns: u64,
     pub recovery_ns: u64,
+    pub focus_evaluation_ns: u64,
+    pub background_evaluation_ns: u64,
+    pub focus_blast_ns: u64,
+    pub background_blast_ns: u64,
     pub command_ns: u64,
     pub focus_evaluations: u32,
     pub focus_blasts: u32,
@@ -374,6 +396,8 @@ pub struct SliceMetrics {
 /// Fixed-layout simulation world. Total storage is exposed by [`World::resources`].
 pub struct World {
     width: u32,
+    width_mask: u32,
+    width_shift: u32,
     height: u32,
     chunks_x: u32,
     chunks_y: u32,
@@ -388,8 +412,9 @@ pub struct World {
     focus_blast_ready: Ring<Job>,
     focus_regions: [FocusRegion; FOCUS_REGION_CAPACITY],
     focus_cache: Vec<FocusCacheEntry>,
-    focus_epoch: u64,
+    focus_epoch: u32,
     focus_enabled: bool,
+    has_active_focus: bool,
     shares: ServiceShares,
     action_records: Vec<Option<ActionRecord>>,
     action_cursor: usize,
@@ -455,7 +480,7 @@ impl World {
         if count > u32::MAX as usize {
             return Err(SimError::WorldTooLarge);
         }
-        if budget.0 < 25 {
+        if budget.0 < MINIMUM_SLICE_CREDITS {
             return Err(SimError::BudgetTooSmall);
         }
         if budget.0 > MAX_BUDGET_CREDITS {
@@ -522,6 +547,12 @@ impl World {
         }
         Ok(Self {
             width,
+            width_mask: if width.is_power_of_two() {
+                width - 1
+            } else {
+                0
+            },
+            width_shift: width.trailing_zeros(),
             height,
             chunks_x,
             chunks_y,
@@ -538,6 +569,7 @@ impl World {
             focus_cache: vec![FocusCacheEntry::default(); chunk_count],
             focus_epoch: 1,
             focus_enabled: true,
+            has_active_focus: false,
             shares: ServiceShares::default(),
             action_records: vec![None; ACTION_RECORD_CAPACITY],
             action_cursor: 0,
@@ -580,7 +612,7 @@ impl World {
     }
     /// Change the bounded slice allowance without changing any queued work.
     pub fn set_budget(&mut self, budget: Credits) -> Result<(), SimError> {
-        if budget.0 < (self.costs.selection.0 + MAX_QUANTUM_COST) {
+        if budget.0 < MINIMUM_SLICE_CREDITS {
             return Err(SimError::BudgetTooSmall);
         }
         if budget.0 > MAX_BUDGET_CREDITS {
@@ -654,13 +686,20 @@ impl World {
             .find(|record| record.sequence == sequence)
             .copied()
     }
+    #[inline]
+    fn cell_xy(&self, id: CellId) -> (u32, u32) {
+        if self.width_mask != 0 {
+            (id.0 & self.width_mask, id.0 >> self.width_shift)
+        } else {
+            (id.0 % self.width, id.0 / self.width)
+        }
+    }
     fn chunk_xy(&self, id: CellId) -> (u32, u32) {
-        let x = id.0 % self.width;
-        let y = id.0 / self.width;
+        let (x, y) = self.cell_xy(id);
         (x / CHUNK_SIDE, y / CHUNK_SIDE)
     }
     fn invalidate_focus_cache(&mut self) {
-        if self.focus_epoch == u64::MAX {
+        if self.focus_epoch == u32::MAX >> 1 {
             self.focus_cache.fill(FocusCacheEntry::default());
             self.focus_epoch = 1;
         } else {
@@ -668,24 +707,47 @@ impl World {
         }
     }
     fn is_focused(&mut self, id: CellId) -> bool {
-        if !self.focus_enabled {
+        if !self.focus_enabled || !self.has_active_focus {
             return false;
         }
         let (x, y) = self.chunk_xy(id);
         let index = (y * self.chunks_x + x) as usize;
-        let cached = self.focus_cache[index];
-        if cached.epoch == self.focus_epoch {
-            return cached.focused;
+        let cached = self.focus_cache[index].0;
+        if cached >> 1 == self.focus_epoch {
+            return cached & 1 != 0;
         }
         let focused = self
             .focus_regions
             .iter()
             .any(|region| region.contains(x, y, self.slice));
-        self.focus_cache[index] = FocusCacheEntry {
-            epoch: self.focus_epoch,
-            focused,
-        };
+        self.focus_cache[index] = FocusCacheEntry((self.focus_epoch << 1) | u32::from(focused));
         focused
+    }
+    fn store_focus_region(&mut self, region: FocusRegion) {
+        if let Some(existing) = self.focus_regions.iter_mut().find(|current| {
+            current.expires_after > self.slice
+                && current.min_x == region.min_x
+                && current.min_y == region.min_y
+                && current.max_x == region.max_x
+                && current.max_y == region.max_y
+        }) {
+            existing.expires_after = existing.expires_after.max(region.expires_after);
+            return;
+        }
+        let slot = self
+            .focus_regions
+            .iter()
+            .position(|current| current.expires_after <= self.slice)
+            .unwrap_or_else(|| {
+                self.focus_regions
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, current)| current.expires_after)
+                    .map_or(0, |(index, _)| index)
+            });
+        self.focus_regions[slot] = region;
+        self.has_active_focus = true;
+        self.invalidate_focus_cache();
     }
     fn focus_cell(&mut self, id: CellId, lifetime: u16) {
         if !self.focus_enabled {
@@ -699,19 +761,7 @@ impl World {
             max_y: (y + 2).min(self.chunks_y),
             expires_after: self.slice.saturating_add(lifetime.max(1) as u64 + 1),
         };
-        let slot = self
-            .focus_regions
-            .iter()
-            .position(|r| r.expires_after <= self.slice)
-            .unwrap_or_else(|| {
-                self.focus_regions
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| r.expires_after)
-                    .map_or(0, |(i, _)| i)
-            });
-        self.focus_regions[slot] = region;
-        self.invalidate_focus_cache();
+        self.store_focus_region(region);
         // Recovery promotes deferred channels incrementally; no chunk/world scan occurs here.
     }
     pub fn slice_index(&self) -> u64 {
@@ -1088,8 +1138,8 @@ impl World {
         }
     }
     fn mark_dirty(&mut self, id: CellId) {
-        let chunk =
-            (id.0 / self.width) / CHUNK_SIDE * self.chunks_x + (id.0 % self.width) / CHUNK_SIDE;
+        let (x, y) = self.cell_xy(id);
+        let chunk = (y / CHUNK_SIDE) * self.chunks_x + x / CHUNK_SIDE;
         self.dirty_chunks[chunk as usize] = true;
     }
     pub(crate) fn prepare_fixture_cell(
@@ -1146,8 +1196,8 @@ impl World {
     fn execute_evaluate_rule(&mut self, id: CellId) {
         let i = id.index();
         let material = self.cells[i].material;
-        let (x, y) = (id.0 % self.width, id.0 / self.width);
         if material == Material::Sand || material == Material::Water {
+            let (x, y) = self.cell_xy(id);
             let flow_direction = self.cells[i].burning;
             let below = (y + 1 < self.height).then_some(CellId(id.0 + self.width));
             if let Some(below) = below.filter(|b| self.cells[b.index()].material == Material::Air) {
@@ -1210,7 +1260,7 @@ impl World {
         }
     }
     fn neighbors(&self, id: CellId) -> [Option<CellId>; 4] {
-        let (x, y) = (id.0 % self.width, id.0 / self.width);
+        let (x, y) = self.cell_xy(id);
         [
             (y > 0).then(|| CellId(id.0 - self.width)),
             (x > 0).then(|| CellId(id.0 - 1)),
@@ -1359,7 +1409,7 @@ impl World {
         if !self.action_tracking_enabled || self.pending_action_effect_count == 0 {
             return;
         }
-        let (x, y) = (cell.0 % self.width, cell.0 / self.width);
+        let (x, y) = self.cell_xy(cell);
         let chunk = ((y / CHUNK_SIDE) * self.chunks_x + x / CHUNK_SIDE) as usize;
         let mut candidates = self.action_effect_index[chunk];
         let slice = self.slice.saturating_add(1);
@@ -1446,19 +1496,7 @@ impl World {
         if region.min_x >= region.max_x || region.min_y >= region.max_y {
             return;
         }
-        let slot = self
-            .focus_regions
-            .iter()
-            .position(|r| r.expires_after <= self.slice)
-            .unwrap_or_else(|| {
-                self.focus_regions
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| r.expires_after)
-                    .map_or(0, |(i, _)| i)
-            });
-        self.focus_regions[slot] = region;
-        self.invalidate_focus_cache();
+        self.store_focus_region(region);
     }
     fn execute_command(&mut self, command: Command) {
         match command {
@@ -1499,7 +1537,6 @@ impl World {
     }
     /// Run exactly one policy slice. Traditional mode drains only the ready frontier captured at entry.
     pub fn step(&mut self) -> SliceMetrics {
-        self.invalidate_focus_cache();
         self.last_executed_len = 0;
         self.last_executed_count = 0;
         self.last_paint_count = 0;
@@ -1513,6 +1550,17 @@ impl World {
         } else {
             self.step_bounded()
         };
+        if self
+            .focus_regions
+            .iter()
+            .any(|region| region.expires_after == self.slice)
+        {
+            self.has_active_focus = self
+                .focus_regions
+                .iter()
+                .any(|region| region.expires_after > self.slice);
+            self.invalidate_focus_cache();
+        }
         self.last_executed_count = metrics
             .evaluations
             .saturating_add(metrics.blasts)
@@ -1604,19 +1652,27 @@ impl World {
             remaining -= self.costs.selection.0;
             m.charged += self.costs.selection.0;
             m.selections += 1;
+            #[cfg(feature = "quantum-timing")]
+            let selection_started =
+                should_sample_quantum(&SELECTION_TIMING_SEQUENCE).then(Instant::now);
             let phase = self.lane_cursor;
-            self.lane_cursor = (self.lane_cursor + 1) % 100;
-            let focus_eval = self.focus_enabled && self.focus_eval_ready.len() > 0;
-            let focus_blast = self.focus_enabled && self.focus_blast_ready.len() > 0;
+            self.lane_cursor += 1;
+            if self.lane_cursor == 100 {
+                self.lane_cursor = 0;
+            }
+            let focus_eval_available = self.focus_eval_ready.len() > 0;
+            let focus_blast_available = self.focus_blast_ready.len() > 0;
+            let focus_eval = self.focus_enabled && focus_eval_available;
+            let focus_blast = self.focus_enabled && focus_blast_available;
+            let background_eval =
+                self.eval_ready.len() > 0 || (!self.focus_enabled && focus_eval_available);
+            let background_blast =
+                self.blast_ready.len() > 0 || (!self.focus_enabled && focus_blast_available);
+            let recovery_demand = self.pending_count > 0;
+            let command_demand = self.command_len() > 0;
             let focus_demand = focus_eval || focus_blast;
-            let background_eval = self.eval_ready.len() > 0
-                || (!self.focus_enabled && self.focus_eval_ready.len() > 0);
-            let background_blast = self.blast_ready.len() > 0
-                || (!self.focus_enabled && self.focus_blast_ready.len() > 0);
-            let background_demand = background_eval
-                || background_blast
-                || self.pending_count > 0
-                || self.command_len() > 0;
+            let background_demand =
+                background_eval || background_blast || recovery_demand || command_demand;
             let minimum_background_turn = (background_eval || background_blast)
                 && phase >= self.shares.focus_percent
                 && (phase as u16)
@@ -1644,8 +1700,8 @@ impl World {
                 let demanded = [
                     background_eval,
                     background_blast,
-                    self.pending_count > 0,
-                    self.command_len() > 0,
+                    recovery_demand,
+                    command_demand,
                 ];
                 (0..4)
                     .map(|offset| (phase as usize % 4 + offset) % 4)
@@ -1664,36 +1720,44 @@ impl World {
                         (Some(self.costs.blast.0), Some(j), None)
                     }),
                 2 => {
-                    let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
-                    let job = if background_first {
-                        self.eval_ready
-                            .pop()
-                            .or_else(|| self.focus_eval_ready.pop())
+                    let job = if !focus_eval_available {
+                        self.eval_ready.pop()
                     } else {
-                        self.focus_eval_ready
-                            .pop()
-                            .or_else(|| self.eval_ready.pop())
+                        let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
+                        if background_first {
+                            self.eval_ready
+                                .pop()
+                                .or_else(|| self.focus_eval_ready.pop())
+                        } else {
+                            self.focus_eval_ready
+                                .pop()
+                                .or_else(|| self.eval_ready.pop())
+                        }
                     };
                     job.map_or((None, None, None), |j| {
                         (Some(self.costs.evaluate.0), Some(j), None)
                     })
                 }
                 3 => {
-                    let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
-                    let job = if background_first {
-                        self.blast_ready
-                            .pop()
-                            .or_else(|| self.focus_blast_ready.pop())
+                    let job = if !focus_blast_available {
+                        self.blast_ready.pop()
                     } else {
-                        self.focus_blast_ready
-                            .pop()
-                            .or_else(|| self.blast_ready.pop())
+                        let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
+                        if background_first {
+                            self.blast_ready
+                                .pop()
+                                .or_else(|| self.focus_blast_ready.pop())
+                        } else {
+                            self.focus_blast_ready
+                                .pop()
+                                .or_else(|| self.blast_ready.pop())
+                        }
                     };
                     job.map_or((None, None, None), |j| {
                         (Some(self.costs.blast.0), Some(j), None)
                     })
                 }
-                4 if self.pending_count > 0 => (Some(self.costs.recovery.0), None, None),
+                4 if recovery_demand => (Some(self.costs.recovery.0), None, None),
                 4 => (None, None, None),
                 _ => {
                     let c = self.deferred_command.take().or_else(|| self.commands.pop());
@@ -1702,6 +1766,12 @@ impl World {
                     })
                 }
             };
+            #[cfg(feature = "quantum-timing")]
+            if let Some(started) = selection_started {
+                m.selection_ns = m.selection_ns.saturating_add(
+                    started.elapsed().as_nanos() as u64 * QUANTUM_TIMING_SAMPLE_INTERVAL,
+                );
+            }
             let Some(cost) = cost else {
                 empty_lanes += 1;
                 if empty_lanes >= 4 {
@@ -1751,16 +1821,21 @@ impl World {
                             self.record_executed_cell(j.cell);
                             self.note_action_effect(j.cell);
                             #[cfg(feature = "quantum-timing")]
-                            let started = (m.evaluations + 1)
-                                .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
+                            let started = should_sample_quantum(&EVALUATION_TIMING_SEQUENCE)
                                 .then(Instant::now);
                             self.execute_evaluate(j.cell);
                             #[cfg(feature = "quantum-timing")]
                             if let Some(started) = started {
-                                m.evaluation_ns = m.evaluation_ns.saturating_add(
-                                    started.elapsed().as_nanos() as u64
-                                        * QUANTUM_TIMING_SAMPLE_INTERVAL as u64,
-                                );
+                                let elapsed = started.elapsed().as_nanos() as u64
+                                    * QUANTUM_TIMING_SAMPLE_INTERVAL as u64;
+                                m.evaluation_ns = m.evaluation_ns.saturating_add(elapsed);
+                                if focused_job {
+                                    m.focus_evaluation_ns =
+                                        m.focus_evaluation_ns.saturating_add(elapsed);
+                                } else {
+                                    m.background_evaluation_ns =
+                                        m.background_evaluation_ns.saturating_add(elapsed);
+                                }
                             }
                             m.evaluations += 1;
                             if focused_job {
@@ -1788,16 +1863,20 @@ impl World {
                             self.record_executed_cell(j.cell);
                             self.note_action_effect(j.cell);
                             #[cfg(feature = "quantum-timing")]
-                            let started = (m.blasts + 1)
-                                .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
-                                .then(Instant::now);
+                            let started =
+                                should_sample_quantum(&BLAST_TIMING_SEQUENCE).then(Instant::now);
                             self.execute_blast(j.cell);
                             #[cfg(feature = "quantum-timing")]
                             if let Some(started) = started {
-                                m.blast_ns = m.blast_ns.saturating_add(
-                                    started.elapsed().as_nanos() as u64
-                                        * QUANTUM_TIMING_SAMPLE_INTERVAL as u64,
-                                );
+                                let elapsed = started.elapsed().as_nanos() as u64
+                                    * QUANTUM_TIMING_SAMPLE_INTERVAL as u64;
+                                m.blast_ns = m.blast_ns.saturating_add(elapsed);
+                                if focused_job {
+                                    m.focus_blast_ns = m.focus_blast_ns.saturating_add(elapsed);
+                                } else {
+                                    m.background_blast_ns =
+                                        m.background_blast_ns.saturating_add(elapsed);
+                                }
                             }
                             m.blasts += 1;
                             if focused_job {
@@ -1815,9 +1894,7 @@ impl World {
                     self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
                 }
                 #[cfg(feature = "quantum-timing")]
-                let started = (m.commands + 1)
-                    .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
-                    .then(Instant::now);
+                let started = should_sample_quantum(&COMMAND_TIMING_SEQUENCE).then(Instant::now);
                 self.execute_command(c);
                 #[cfg(feature = "quantum-timing")]
                 if let Some(started) = started {
@@ -1828,9 +1905,7 @@ impl World {
                 m.commands += 1;
             } else {
                 #[cfg(feature = "quantum-timing")]
-                let started = (m.recoveries + 1)
-                    .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
-                    .then(Instant::now);
+                let started = should_sample_quantum(&RECOVERY_TIMING_SEQUENCE).then(Instant::now);
                 self.recover_one();
                 #[cfg(feature = "quantum-timing")]
                 if let Some(started) = started {
@@ -1870,6 +1945,7 @@ impl World {
         self.focus_eval_ready.clear();
         self.focus_blast_ready.clear();
         self.focus_regions = [FocusRegion::default(); FOCUS_REGION_CAPACITY];
+        self.has_active_focus = false;
         self.invalidate_focus_cache();
         self.commands.clear();
         self.pending_count = 0;
@@ -2172,7 +2248,14 @@ mod tests {
             Some(SimError::BudgetTooSmall)
         );
         assert_eq!(
-            World::new(1, 1, Credits::new(25), Capacity::new(1), Capacity::new(257)).err(),
+            World::new(
+                1,
+                1,
+                Credits::new(MINIMUM_SLICE_CREDITS),
+                Capacity::new(1),
+                Capacity::new(257),
+            )
+            .err(),
             Some(SimError::CommandCapacityExceeded)
         );
         assert_eq!(
@@ -2198,6 +2281,7 @@ mod tests {
             Some(SimError::ResourceLimitExceeded)
         );
         let costs = CostContract::default();
+        assert_eq!(costs.selection.get(), SELECTION_PROBE_COST);
         assert_eq!(costs.blast.get(), MAX_QUANTUM_COST);
         assert!(costs.evaluate.get() <= MAX_QUANTUM_COST);
         assert!(costs.fixture_cell.get() <= MAX_QUANTUM_COST);
@@ -2298,6 +2382,23 @@ mod tests {
             background * 100 >= (background + focus) * 20,
             "background share must meet its configured minimum: background={background}, focus={focus}"
         );
+    }
+
+    #[test]
+    fn repeated_focus_region_refresh_reuses_slot_and_membership_cache() {
+        let mut world = world(64, 64, 128, 16, 8);
+        assert!(!world.is_focused(CellId(0)));
+        world.set_focus_region(0, 0, 1, 1, 8);
+        assert!(world.is_focused(CellId(0)));
+        let cached = world.focus_cache[0];
+        world.set_focus_region(0, 0, 1, 1, 16);
+        assert_eq!(world.active_focus_regions().count(), 1);
+        assert_eq!(world.focus_cache[0], cached);
+        for _ in 0..8 {
+            world.step();
+        }
+        assert_eq!(world.focus_cache[0], cached);
+        assert!(world.is_focused(CellId(0)));
     }
 
     #[test]
@@ -2592,8 +2693,9 @@ mod tests {
             resources.focus_cache_bytes,
             16_384 * std::mem::size_of::<FocusCacheEntry>()
         );
+        assert_eq!(resources.focus_cache_bytes, 16_384 * 4);
         assert_eq!(resources.action_effect_index_bytes, 16_384 * 32);
-        assert_eq!(resources.total_bytes, 103_063_040);
+        assert_eq!(resources.total_bytes, 102_866_432);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
