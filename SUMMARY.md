@@ -11,6 +11,7 @@
   - [Native offscreen comparison v1](benchmarks/results/native-offscreen-v1.md)
   - [Native all-fixture offscreen acceptance v1](benchmarks/results/native-acceptance-offscreen-v1.md)
   - [Native all-fixture windowed acceptance v1](benchmarks/results/native-acceptance-v1.md)
+  - [Native windowed heavy-fixture follow-up v1](benchmarks/results/windowed-heavy-fixtures-v1.md)
   - [Native sustained capture v2](benchmarks/results/native-sustained-v2.md)
   - [Metal GPU allocation high-water v1](benchmarks/results/metal-memory-v1.md)
   - [Native sustained capture v1](benchmarks/results/native-sustained-v1.md)
