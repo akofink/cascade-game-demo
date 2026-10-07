@@ -73,7 +73,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     let summary = run(config, format, &mut output)?;
     if format == OutputFormat::Csv {
         eprintln!(
-            "final_hash={:016x} complete={} preparation_slices={} preparation_wall_ns={} warmup_slices={} warmup_wall_ns={} measured_slices={} measured_wall_ns={} completed_work_quanta={} first_completion_slice={:?} completion_wall_ns={:?}",
+            "final_hash={:016x} complete={} preparation_slices={} preparation_wall_ns={} warmup_slices={} warmup_wall_ns={} measured_slices={} measured_wall_ns={} completed_work_quanta={} first_completion_slice={:?} completion_wall_ns={:?} stable_window_start_slice={:?} stable_window_wall_ns={:?} pending_channels_by_material={:?}",
             summary.final_hash,
             summary.complete,
             summary.preparation_slices,
@@ -84,7 +84,10 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
             summary.measured_wall_ns,
             summary.completed_work_quanta,
             summary.first_completion_slice,
-            summary.completion_wall_ns
+            summary.completion_wall_ns,
+            summary.stable_window_start_slice,
+            summary.stable_window_wall_ns,
+            summary.pending_channels_by_material
         );
     }
     Ok(())

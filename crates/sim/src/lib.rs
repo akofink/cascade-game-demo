@@ -4,6 +4,8 @@ pub mod fixtures;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "quantum-timing")]
+use std::time::Instant;
 
 pub const CHUNK_SIDE: u32 = 32;
 pub const DEFAULT_READY_CAPACITY: usize = 32_768;
@@ -11,11 +13,13 @@ pub const DEFAULT_COMMAND_CAPACITY: usize = 256;
 pub const FOCUS_REGION_CAPACITY: usize = 8;
 pub const ACTION_RECORD_CAPACITY: usize = 256;
 pub const PLAYER_ACTION_FOCUS_LIFETIME_SLICES: u16 = 8;
-pub const RULE_VERSION: u32 = 6;
+pub const RULE_VERSION: u32 = 7;
 pub const MAX_QUANTUM_COST: u32 = 24;
 pub const MAX_BUDGET_CREDITS: u32 = 10_000_000;
 pub const APPLICATION_CPU_STORAGE_LIMIT: usize = 256 * 1024 * 1024;
 const VISUALIZED_CELLS_PER_SLICE: usize = 128;
+#[cfg(feature = "quantum-timing")]
+const QUANTUM_TIMING_SAMPLE_INTERVAL: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -188,7 +192,7 @@ impl Default for CostContract {
             selection: Credits(1),
             evaluate: Credits(24),
             blast: Credits(24),
-            recovery: Credits(4),
+            recovery: Credits(20),
             command: Credits(12),
             reset_cell: Credits(4),
             fixture_cell: Credits(crate::fixtures::FIXTURE_CELL_COST),
@@ -347,6 +351,10 @@ pub struct SliceMetrics {
     pub recoveries: u32,
     pub commands: u32,
     pub action_effect_candidates: u32,
+    pub evaluation_ns: u64,
+    pub blast_ns: u64,
+    pub recovery_ns: u64,
+    pub command_ns: u64,
     pub focus_evaluations: u32,
     pub focus_blasts: u32,
     pub background_evaluations: u32,
@@ -818,7 +826,11 @@ impl World {
         Some(CellView {
             material: c.material,
             state: self.pending[id.index()].blast,
-            burning: c.burning,
+            burning: if c.material == Material::Wood {
+                c.burning
+            } else {
+                0
+            },
         })
     }
     /// Return whether this cell has deferred simulation work, using its fixed pending record.
@@ -1011,6 +1023,19 @@ impl World {
         }
     }
     fn try_queue(&mut self, id: CellId, kind: JobKind) {
+        let pending = self.pending[id.index()];
+        let already_queued = match kind {
+            JobKind::Evaluate => {
+                pending.has(PendingCell::EVAL_QUEUED) || pending.has(PendingCell::EVAL_FOCUS_QUEUED)
+            }
+            JobKind::Blast => {
+                pending.has(PendingCell::BLAST_QUEUED)
+                    || pending.has(PendingCell::BLAST_FOCUS_QUEUED)
+            }
+        };
+        if already_queued {
+            return;
+        }
         let focused = self.is_focused(id);
         self.try_queue_in_lane(id, kind, focused);
     }
@@ -1123,25 +1148,36 @@ impl World {
         let material = self.cells[i].material;
         let (x, y) = (id.0 % self.width, id.0 / self.width);
         if material == Material::Sand || material == Material::Water {
+            let flow_direction = self.cells[i].burning;
             let below = (y + 1 < self.height).then_some(CellId(id.0 + self.width));
             if let Some(below) = below.filter(|b| self.cells[b.index()].material == Material::Air) {
                 self.set_material(below, material);
+                if material == Material::Water {
+                    self.cells[below.index()].burning = flow_direction;
+                }
                 self.set_material(id, Material::Air);
                 self.wake_neighbors(id);
                 self.wake_neighbors(below);
                 return;
             }
             if material == Material::Water {
-                let first_left = (x.wrapping_add(y) & 1) == 0;
                 let neighbors = self.neighbors(id);
-                let sides = if first_left {
-                    [neighbors[1], neighbors[2]]
-                } else {
-                    [neighbors[2], neighbors[1]]
+                let (first_direction, second_direction) = match flow_direction {
+                    1 => (1, None),
+                    2 => (2, None),
+                    _ if (x.wrapping_add(y) & 1) == 0 => (1, Some(2)),
+                    _ => (2, Some(1)),
                 };
-                for side in sides.into_iter().flatten() {
-                    if self.cells[side.index()].material == Material::Air {
+                for direction in [Some(first_direction), second_direction]
+                    .into_iter()
+                    .flatten()
+                {
+                    let side = neighbors[direction];
+                    if let Some(side) = side
+                        && self.cells[side.index()].material == Material::Air
+                    {
                         self.set_material(side, Material::Water);
+                        self.cells[side.index()].burning = direction as u8;
                         self.set_material(id, Material::Air);
                         self.wake_neighbors(id);
                         self.wake_neighbors(side);
@@ -1714,7 +1750,18 @@ impl World {
                         if self.pending[i].has(PendingCell::EVAL_PENDING) {
                             self.record_executed_cell(j.cell);
                             self.note_action_effect(j.cell);
+                            #[cfg(feature = "quantum-timing")]
+                            let started = (m.evaluations + 1)
+                                .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
+                                .then(Instant::now);
                             self.execute_evaluate(j.cell);
+                            #[cfg(feature = "quantum-timing")]
+                            if let Some(started) = started {
+                                m.evaluation_ns = m.evaluation_ns.saturating_add(
+                                    started.elapsed().as_nanos() as u64
+                                        * QUANTUM_TIMING_SAMPLE_INTERVAL as u64,
+                                );
+                            }
                             m.evaluations += 1;
                             if focused_job {
                                 m.focus_evaluations += 1;
@@ -1740,7 +1787,18 @@ impl World {
                         if self.pending[i].blast > 0 {
                             self.record_executed_cell(j.cell);
                             self.note_action_effect(j.cell);
+                            #[cfg(feature = "quantum-timing")]
+                            let started = (m.blasts + 1)
+                                .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
+                                .then(Instant::now);
                             self.execute_blast(j.cell);
+                            #[cfg(feature = "quantum-timing")]
+                            if let Some(started) = started {
+                                m.blast_ns = m.blast_ns.saturating_add(
+                                    started.elapsed().as_nanos() as u64
+                                        * QUANTUM_TIMING_SAMPLE_INTERVAL as u64,
+                                );
+                            }
                             m.blasts += 1;
                             if focused_job {
                                 m.focus_blasts += 1;
@@ -1756,10 +1814,30 @@ impl World {
                     self.last_paint_count = self.last_paint_count.saturating_add(1);
                     self.pending[cell.index()].set(PendingCell::PAINT_QUEUED, false);
                 }
+                #[cfg(feature = "quantum-timing")]
+                let started = (m.commands + 1)
+                    .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
+                    .then(Instant::now);
                 self.execute_command(c);
+                #[cfg(feature = "quantum-timing")]
+                if let Some(started) = started {
+                    m.command_ns = m.command_ns.saturating_add(
+                        started.elapsed().as_nanos() as u64 * QUANTUM_TIMING_SAMPLE_INTERVAL as u64,
+                    );
+                }
                 m.commands += 1;
             } else {
+                #[cfg(feature = "quantum-timing")]
+                let started = (m.recoveries + 1)
+                    .is_multiple_of(QUANTUM_TIMING_SAMPLE_INTERVAL)
+                    .then(Instant::now);
                 self.recover_one();
+                #[cfg(feature = "quantum-timing")]
+                if let Some(started) = started {
+                    m.recovery_ns = m.recovery_ns.saturating_add(
+                        started.elapsed().as_nanos() as u64 * QUANTUM_TIMING_SAMPLE_INTERVAL as u64,
+                    );
+                }
                 m.recoveries += 1;
             }
         }
@@ -1978,6 +2056,19 @@ impl World {
     pub fn pending_channels(&self) -> usize {
         self.pending_count
     }
+    /// Count pending evaluation and blast channels by the material at each cell.
+    pub fn pending_channels_by_material(&self) -> [usize; 6] {
+        let mut counts = [0; 6];
+        for (cell, pending) in self.cells.iter().zip(&self.pending) {
+            if pending.has(PendingCell::EVAL_PENDING) {
+                counts[cell.material as usize] += 1;
+            }
+            if pending.blast > 0 {
+                counts[cell.material as usize] += 1;
+            }
+        }
+        counts
+    }
 }
 
 #[cfg(test)]
@@ -1996,6 +2087,42 @@ mod tests {
         assert_eq!(w.resources().ready_capacity, Capacity(8));
         assert_eq!(w.resources().focus_ready_capacity, Capacity(8));
     }
+    #[test]
+    fn water_settles_after_horizontal_flow_without_bouncing() {
+        let mut world = World::new(
+            3,
+            2,
+            Credits::new(1_000),
+            Capacity::new(16),
+            Capacity::new(16),
+        )
+        .unwrap();
+        for x in 0..3 {
+            world
+                .prepare_fixture_cell(world.cell_id(x, 1).unwrap(), Material::Stone, 0, 0, false)
+                .unwrap();
+        }
+        world
+            .prepare_fixture_cell(world.cell_id(1, 0).unwrap(), Material::Water, 0, 0, true)
+            .unwrap();
+        for _ in 0..8 {
+            world.step();
+        }
+        let settled_position = (0..3)
+            .find(|x| world.cell(*x, 0).unwrap().material == Material::Water)
+            .unwrap();
+        for _ in 0..60 {
+            let metrics = world.step();
+            assert_eq!(metrics.pending_cells, 0);
+            assert_eq!(
+                (0..3)
+                    .find(|x| world.cell(*x, 0).unwrap().material == Material::Water)
+                    .unwrap(),
+                settled_position
+            );
+        }
+    }
+
     #[test]
     fn quiet_bounded_world_does_not_scan_recovery_without_pending_work() {
         let mut w = world(64, 64, 4_096, 64, 16);
