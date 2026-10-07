@@ -34,11 +34,19 @@ def load_one() -> float:
     return os.getloadavg()[0]
 
 
-def parse_capture(text: str) -> dict[str, str] | None:
-    line = next((line for line in text.splitlines() if line.startswith("SMOKE_CAPTURE ")), None)
+def parse_record(text: str, prefix: str) -> dict[str, str] | None:
+    line = next((line for line in text.splitlines() if line.startswith(prefix)), None)
     if line is None:
         return None
     return dict(re.findall(r"([a-zA-Z0-9_]+)=([^ ]+)", line))
+
+
+def parse_capture(text: str) -> dict[str, str] | None:
+    return parse_record(text, "SMOKE_CAPTURE ")
+
+
+def parse_feel(text: str) -> dict[str, str] | None:
+    return parse_record(text, "SMOKE_FEEL ")
 
 
 def fmt_load(value: float | None) -> str:
@@ -94,6 +102,16 @@ def write_report(path: pathlib.Path, revision: str, attempts: list[dict], starte
                 f"{'met' if slice_target else 'unmet' if target_runs else 'incomplete'} | "
                 f"{'reported' if disclosure else 'incomplete'} |"
             )
+    lines += ["", "## Interaction feedback samples", "", "These CPU-side event/action-to-visible-upload p95 values use the app's documented method. Counts below 30 are descriptive only; quiet-world intentionally has no scripted interaction samples.", "", "| Fixture | Policy | Rep | Camera n / p95 ms | Paint n / p95 ms | Ignite n / p95 ms | Detonate n / p95 ms |", "|---|---|---:|---:|---:|---:|---:|"]
+    for item in accepted:
+        feel = item.get("feel", {})
+        lines.append(
+            f"| {item['fixture']} | {item['policy']} | {item['rep']} | "
+            f"{feel.get('camera_n', 'n/a')} / {feel.get('camera_p95_ms', 'n/a')} | "
+            f"{feel.get('paint_n', 'n/a')} / {feel.get('paint_p95_ms', 'n/a')} | "
+            f"{feel.get('ignite_n', 'n/a')} / {feel.get('ignite_p95_ms', 'n/a')} | "
+            f"{feel.get('detonate_n', 'n/a')} / {feel.get('detonate_p95_ms', 'n/a')} |"
+        )
     lines += ["", "## Rejected attempts", ""]
     if rejected:
         lines += ["| Fixture | Policy | Rep | Attempt | Load before/after | Reason | Log |", "|---|---|---:|---:|---:|---|---|"]
@@ -108,7 +126,7 @@ def write_report(path: pathlib.Path, revision: str, attempts: list[dict], starte
         "",
         "## Interpretation and limits",
         "",
-        "Frame intervals are native windowed event-loop intervals; they include presentation pacing and are not GPU duration. Slice CPU values are monotonic wall-time samples around the app's simulation dispatch, not thread CPU time. Quiet-world captures disable scripted disturbances and player actions. Other fixtures retain the app's scripted sustained-overload stream. The load gate does not exclude all OS/driver interference.",
+        "Frame intervals are native windowed event-loop intervals; they include presentation pacing and are not GPU duration. Slice CPU values are monotonic wall-time samples around the app's simulation dispatch, not thread CPU time. Fixture captures do not add external disturbances or player actions, except mixed-overload, which uses the app's scripted sustained-overload action stream to exercise focus latency. The load gate does not exclude all OS/driver interference.",
         "",
         "Raw per-attempt logs are retained locally under `benchmarks/tmp/` and are not committed.",
         "",
@@ -184,13 +202,15 @@ def main() -> int:
                 base["load_after"] = fmt_load(after)
                 text = log_path.read_text(encoding="utf-8", errors="replace")
                 metrics = parse_capture(text)
+                feel = parse_feel(text)
                 starts = [line for line in text.splitlines() if line.startswith("SMOKE_CAPTURE_STARTED ")]
+                feel_lines = [line for line in text.splitlines() if line.startswith("SMOKE_FEEL ")]
                 reasons = []
                 if before >= LOAD_LIMIT or after >= LOAD_LIMIT:
                     reasons.append("one-minute load gate failed")
                 if result.returncode != 0 or "SMOKE_RESULT ok" not in text:
                     reasons.append(f"app failed (exit {result.returncode} or no SMOKE_RESULT ok)")
-                if metrics is None or len(starts) != 1:
+                if metrics is None or len(starts) != 1 or feel is None or len(feel_lines) != 1:
                     reasons.append("missing or ambiguous capture telemetry")
                 elif (
                     metrics.get("frames") != str(args.seconds * 60)
@@ -198,6 +218,7 @@ def main() -> int:
                     or int(metrics.get("sim_samples", "0")) < int(metrics.get("frames", "0"))
                     or int(metrics.get("sim_samples", "0")) > int(metrics.get("frames", "0")) + 1
                     or metrics.get("policy") != policy
+                    or feel.get("policy") != policy
                     or not any(
                         f"fixture={fixture} " in line
                         and f"seconds={args.seconds} " in line
@@ -214,7 +235,7 @@ def main() -> int:
                         print("Stopping after a non-load capture failure; inspect the retained log and fix the cause before retrying.", file=sys.stderr)
                         return 1
                 else:
-                    base.update(status="accepted", reason="", metrics=metrics)
+                    base.update(status="accepted", reason="", metrics=metrics, feel=feel)
                     attempts.append(base)
                     print(f"ACCEPT {fixture}/{policy} rep={rep} load={before:.2f}/{after:.2f} p99={metrics['p99_ms']} ms", flush=True)
                 write_report(output, revision, attempts, started)

@@ -16,6 +16,8 @@ class AcceptanceSuiteTests(unittest.TestCase):
         )
         self.assertEqual(parse_capture(line)["p99_ms"], "18.123")
         self.assertEqual(parse_capture(line)["sim_samples"], "3600")
+        feel = "SMOKE_FEEL policy=bounded-focus camera_n=240 camera_p95_ms=18.2 paint_n=30 paint_p95_ms=19.0 ignite_n=30 ignite_p95_ms=20.0 detonate_n=30 detonate_p95_ms=21.0"
+        self.assertEqual(suite.parse_feel(feel)["detonate_p95_ms"], "21.0")
 
     def test_runner_accepts_complete_functional_sample_and_writes_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -24,6 +26,7 @@ class AcceptanceSuiteTests(unittest.TestCase):
             fake_app.write_text(
                 "#!/bin/sh\n"
                 "echo 'SMOKE_CAPTURE_STARTED policy=bounded-fifo fixture=quiet-world seconds=1 render=1920x1080 load_gate=external'\n"
+                "echo 'SMOKE_FEEL policy=bounded-fifo camera_n=0 camera_p50_ms=0 camera_p95_ms=0 paint_n=0 paint_p50_ms=0 paint_p95_ms=0 ignite_n=0 ignite_p50_ms=0 ignite_p95_ms=0 detonate_n=0 detonate_p50_ms=0 detonate_p95_ms=0'\n"
                 "echo 'SMOKE_CAPTURE policy=bounded-fifo frames=60 p99_ms=18.123 max_ms=19.000 over_33_3_ms=0 interval_drops=0 sim_p99_ms=2.500 sim_samples=61 max_sim_cpu_ms=3.000'\n"
                 "echo 'SMOKE_RESULT ok'\n",
                 encoding="utf-8",
@@ -40,6 +43,8 @@ class AcceptanceSuiteTests(unittest.TestCase):
             text = report.read_text(encoding="utf-8")
             self.assertIn("1/72 accepted captures", text)
             self.assertIn("quiet-world | bounded-fifo | 1 | 1.00/1.00", text)
+            self.assertIn("## Interaction feedback samples", text)
+            self.assertIn("quiet-world | bounded-fifo | 1 | 0 / 0", text)
 
     def test_report_keeps_rejected_attempt_and_marks_incomplete(self):
         attempts = [
