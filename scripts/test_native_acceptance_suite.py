@@ -19,6 +19,18 @@ class AcceptanceSuiteTests(unittest.TestCase):
         feel = "SMOKE_FEEL policy=bounded-focus camera_n=240 camera_p95_ms=18.2 paint_n=30 paint_p95_ms=19.0 ignite_n=30 ignite_p95_ms=20.0 detonate_n=30 detonate_p95_ms=21.0"
         self.assertEqual(suite.parse_feel(feel)["detonate_p95_ms"], "21.0")
 
+    def test_validator_accepts_actual_low_frame_count_for_complete_timed_capture(self):
+        text = "\n".join([
+            "SMOKE_CAPTURE_STARTED policy=traditional fixture=quiet-world seconds=60 render=1920x1080 load_gate=external",
+            "SMOKE_FEEL policy=traditional focus=linked camera_n=0 camera_p50_ms=0 camera_p95_ms=0 paint_n=0 paint_p50_ms=0 paint_p95_ms=0 ignite_n=0 ignite_p50_ms=0 ignite_p95_ms=0 detonate_n=0 detonate_p50_ms=0 detonate_p95_ms=0",
+            "SMOKE_CAPTURE policy=traditional frames=1190 p50_ms=50 p95_ms=50.2 p99_ms=66.646 max_ms=67.612 over_33_3_ms=1190 interval_drops=0 sim_p99_ms=48.878 sim_samples=1191 max_sim_cpu_ms=68.663",
+            "SMOKE_RESULT ok",
+        ])
+        metrics, feel, reasons = suite.validate_capture(text, "quiet-world", "traditional", 60)
+        self.assertEqual(metrics["frames"], "1190")
+        self.assertEqual(feel["policy"], "traditional")
+        self.assertEqual(reasons, [])
+
     def test_runner_accepts_complete_functional_sample_and_writes_report(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -27,7 +39,7 @@ class AcceptanceSuiteTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 "echo 'SMOKE_CAPTURE_STARTED policy=bounded-fifo fixture=quiet-world seconds=1 render=1920x1080 load_gate=external'\n"
                 "echo 'SMOKE_FEEL policy=bounded-fifo camera_n=0 camera_p50_ms=0 camera_p95_ms=0 paint_n=0 paint_p50_ms=0 paint_p95_ms=0 ignite_n=0 ignite_p50_ms=0 ignite_p95_ms=0 detonate_n=0 detonate_p50_ms=0 detonate_p95_ms=0'\n"
-                "echo 'SMOKE_CAPTURE policy=bounded-fifo frames=60 p99_ms=18.123 max_ms=19.000 over_33_3_ms=0 interval_drops=0 sim_p99_ms=2.500 sim_samples=61 max_sim_cpu_ms=3.000'\n"
+                "echo 'SMOKE_CAPTURE policy=bounded-fifo frames=42 p99_ms=18.123 max_ms=19.000 over_33_3_ms=0 interval_drops=0 sim_p99_ms=2.500 sim_samples=43 max_sim_cpu_ms=3.000'\n"
                 "echo 'SMOKE_RESULT ok'\n",
                 encoding="utf-8",
             )
@@ -45,6 +57,33 @@ class AcceptanceSuiteTests(unittest.TestCase):
             self.assertIn("quiet-world | bounded-fifo | 1 | 1.00/1.00", text)
             self.assertIn("## Interaction feedback samples", text)
             self.assertIn("quiet-world | bounded-fifo | 1 | 0 / 0", text)
+
+    def test_resume_reclassifies_retained_complete_capture_without_recapture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.lock").write_bytes((suite.ROOT / "Cargo.lock").read_bytes())
+            log_path = root / "benchmarks/tmp/native-acceptance/run.log"
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text("\n".join([
+                "SMOKE_CAPTURE_STARTED policy=traditional fixture=quiet-world seconds=60 render=1920x1080 load_gate=external",
+                "SMOKE_FEEL policy=traditional focus=linked camera_n=0 camera_p50_ms=0 camera_p95_ms=0 paint_n=0 paint_p50_ms=0 paint_p95_ms=0 ignite_n=0 ignite_p50_ms=0 ignite_p95_ms=0 detonate_n=0 detonate_p50_ms=0 detonate_p95_ms=0",
+                "SMOKE_CAPTURE policy=traditional frames=1190 p50_ms=50 p95_ms=50.2 p99_ms=66.646 max_ms=67.612 over_33_3_ms=1190 interval_drops=0 sim_p99_ms=48.878 sim_samples=1191 max_sim_cpu_ms=68.663",
+                "SMOKE_RESULT ok",
+            ]), encoding="utf-8")
+            attempt = dict(
+                fixture="quiet-world", policy="traditional", rep=1, attempt=1,
+                load_before="2.40", load_after="2.66", status="rejected",
+                reason="capture duration, fixture, policy, or sample completeness mismatch",
+                log=str(log_path.relative_to(root)),
+            )
+            report = root / "report.md"
+            with patch.object(suite, "ROOT", root):
+                write_report(report, "d05cb91", [attempt], "2026-10-06T23:54:00-04:00")
+                revision, started, attempts, notes = suite.load_report_attempts(report)
+            self.assertEqual(revision, "d05cb91")
+            self.assertEqual(attempts[0]["status"], "accepted")
+            self.assertEqual(attempts[0]["metrics"]["frames"], "1190")
+            self.assertIn("no recapture was made", notes[0])
 
     def test_report_keeps_rejected_attempt_and_marks_incomplete(self):
         attempts = [
