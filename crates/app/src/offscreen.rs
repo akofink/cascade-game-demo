@@ -96,7 +96,7 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
             let _ = uploads.mark_dirty(ChunkCoord { x, y });
         }
         let upload_started = Instant::now();
-        let last_plan = uploads.plan(bytes_per_chunk(1), UploadBudget::default());
+        let last_plan = uploads.plan(bytes_per_chunk(1), upload_budget());
         let mut exempt = [(0_u32, 0_u32); 64];
         let exempt_len = feel.exempt_cells(&mut exempt);
         for chunk in &last_plan.chunks[..last_plan.count] {
@@ -114,9 +114,9 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
             uploaded_coords[index] = (chunk.x, chunk.y);
         }
         let mut uploaded_count = last_plan.count;
-        let mut targets = [(0_u32, 0_u32); 16];
+        let mut targets = [(0_u32, 0_u32); MAX_PRIORITY_UPLOADS];
         let target_len = demo.player_targets(&mut targets);
-        for &(x, y) in &targets[..target_len] {
+        for &(x, y) in &targets[..target_len.min(MAX_PRIORITY_UPLOADS)] {
             let coord = (x / CHUNK_SIZE, y / CHUNK_SIZE);
             if last_plan.chunks[..last_plan.count]
                 .iter()
@@ -342,6 +342,24 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
             run_frames.total_commands += sim_metrics.slice.commands as u64;
             run_frames.total_selections += sim_metrics.slice.selections as u64;
             run_frames.max_upload_cpu_ms = run_frames.max_upload_cpu_ms.max(upload_cpu_ms);
+            run_frames.max_upload_chunks = run_frames.max_upload_chunks.max(uploaded_count);
+            let upload_payload_bytes = uploaded_count * bytes_per_chunk(1);
+            run_frames.max_upload_payload_bytes = run_frames
+                .max_upload_payload_bytes
+                .max(upload_payload_bytes);
+            let row_padding_bytes = uploaded_count * STAGING_PADDING_BYTES_PER_CHUNK;
+            let staging_bytes = uploaded_count * STAGING_BYTES_PER_CHUNK;
+            run_frames.max_upload_row_padding_bytes = run_frames
+                .max_upload_row_padding_bytes
+                .max(row_padding_bytes);
+            run_frames.max_upload_staging_bytes =
+                run_frames.max_upload_staging_bytes.max(staging_bytes);
+            if upload_cpu_ms >= run_frames.max_upload_cpu_ms {
+                run_frames.upload_cpu_peak_chunks = uploaded_count;
+                run_frames.upload_cpu_peak_payload_bytes = upload_payload_bytes;
+                run_frames.upload_cpu_peak_row_padding_bytes = row_padding_bytes;
+                run_frames.upload_cpu_peak_staging_bytes = staging_bytes;
+            }
             run_frames.max_submit_cpu_ms = run_frames.max_submit_cpu_ms.max(submit_cpu_ms);
             let max_interval = run_frames.capture_intervals_ns.last().copied().unwrap_or(0);
             if max_interval > 33_333_333 {
