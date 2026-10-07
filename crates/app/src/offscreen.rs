@@ -48,17 +48,31 @@ pub(super) fn run(
     let mut seeded = false;
     let mut dirty_chunks = Vec::with_capacity(MAX_CHUNKS_PER_FRAME);
     let mut feel = Feel::new(chunks_x, chunks_y);
+    let mut last_viewport = None;
+    let mut viewport_submit_age = 0_u32;
     let mut history = FrameHistory::default();
     let mut deferred_overlay = true;
     let mut last_tick: Option<Instant> = None;
     let mut next_frame = Instant::now();
     let mut scripted_ignite_target = None;
-    let mut last_viewport = None;
-    let mut viewport_submit_age = 0_u32;
     let mut capture_started = None;
     let mut run = PolicySmoke {
         capture_intervals_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         capture_sim_cpu_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_focus_evaluation_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_background_evaluation_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_focus_blast_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_background_blast_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_recovery_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_command_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
+        capture_scheduler_overhead_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         ..PolicySmoke::default()
     };
     let mut frame_number = 0_u32;
@@ -333,6 +347,35 @@ pub(super) fn run(
             run_frames
                 .capture_sim_cpu_ns
                 .push((sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
+            #[cfg(feature = "quantum-diagnostics")]
+            {
+                run_frames
+                    .capture_focus_evaluation_ns
+                    .push(sim_metrics.slice.focus_evaluation_ns);
+                run_frames
+                    .capture_background_evaluation_ns
+                    .push(sim_metrics.slice.background_evaluation_ns);
+                run_frames
+                    .capture_focus_blast_ns
+                    .push(sim_metrics.slice.focus_blast_ns);
+                run_frames
+                    .capture_background_blast_ns
+                    .push(sim_metrics.slice.background_blast_ns);
+                run_frames
+                    .capture_recovery_ns
+                    .push(sim_metrics.slice.recovery_ns);
+                run_frames
+                    .capture_command_ns
+                    .push(sim_metrics.slice.command_ns);
+                let measured_sim_ns = (sim_cpu_ms.max(0.0) * 1_000_000.0) as u64;
+                let measured_quantum_ns = sim_metrics.slice.evaluation_ns
+                    + sim_metrics.slice.blast_ns
+                    + sim_metrics.slice.recovery_ns
+                    + sim_metrics.slice.command_ns;
+                run_frames
+                    .capture_scheduler_overhead_ns
+                    .push(measured_sim_ns.saturating_sub(measured_quantum_ns));
+            }
             run_frames.last_pending = sim_metrics.slice.pending_cells;
             run_frames.max_pending = run_frames
                 .max_pending
@@ -352,6 +395,11 @@ pub(super) fn run(
             run_frames.total_recoveries += sim_metrics.slice.recoveries as u64;
             run_frames.total_commands += sim_metrics.slice.commands as u64;
             run_frames.total_selections += sim_metrics.slice.selections as u64;
+            run_frames.total_focus_evaluations += sim_metrics.slice.focus_evaluations as u64;
+            run_frames.total_background_evaluations +=
+                sim_metrics.slice.background_evaluations as u64;
+            run_frames.total_focus_blasts += sim_metrics.slice.focus_blasts as u64;
+            run_frames.total_background_blasts += sim_metrics.slice.background_blasts as u64;
             run_frames.max_upload_cpu_ms = run_frames.max_upload_cpu_ms.max(upload_cpu_ms);
             run_frames.max_upload_chunks = run_frames.max_upload_chunks.max(uploaded_count);
             let upload_payload_bytes = uploaded_count * bytes_per_chunk(1);
@@ -393,6 +441,8 @@ pub(super) fn run(
             );
             if started.elapsed() >= deadline {
                 demo.set_destroy_held(false);
+                #[cfg(feature = "quantum-diagnostics")]
+                print_quantum_timing(run_frames, "OFFSCREEN_QUANTUM_TIMING");
                 println!(
                     "OFFSCREEN_CAPTURE_RESULT policy={} frames={} target={}x{} cadence_hz=60 feel_basis=scripted_action_to_cpu_detected_effect_and_upload_queue_write display_presentation=not_measured vsync=not_measured compositor=not_measured scanout=not_measured",
                     policy.name(),

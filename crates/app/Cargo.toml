@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [features]
 allocation-diagnostics = ["dep:stats_alloc"]
+quantum-diagnostics = ["cascade-sim/quantum-timing"]
 
 [dependencies]
 cascade-sim = { path = "../sim" }

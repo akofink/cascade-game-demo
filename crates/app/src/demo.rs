@@ -3,7 +3,8 @@
 use std::sync::OnceLock;
 
 use cascade_sim::{
-    Capacity, Command, Credits, Material, SchedulerPolicy, SliceMetrics, SubmitResult, World,
+    Capacity, Command, Credits, MINIMUM_SLICE_CREDITS, Material, SchedulerPolicy, SliceMetrics,
+    SubmitResult, World,
     fixtures::{
         DEFAULT_DISTURBANCE_LIMIT, DisturbanceCommandStream, FixtureId, MAX_DISTURBANCES_PER_SLICE,
         ScenarioDescriptor,
@@ -13,7 +14,7 @@ use cascade_sim::{
 pub const DEMO_WIDTH: u32 = 1024;
 pub const DEMO_HEIGHT: u32 = 1024;
 const CREDIT_PROFILE: &str = include_str!("../../../profiles/m2-16gb-v3.toml");
-pub const MIN_CREDITS: u32 = 25;
+pub const MIN_CREDITS: u32 = MINIMUM_SLICE_CREDITS;
 
 #[derive(Clone, Copy)]
 struct AppCreditProfile {

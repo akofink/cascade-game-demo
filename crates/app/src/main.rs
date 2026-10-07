@@ -96,6 +96,10 @@ struct PolicySmoke {
     total_recoveries: u64,
     total_commands: u64,
     total_selections: u64,
+    total_focus_evaluations: u64,
+    total_background_evaluations: u64,
+    total_focus_blasts: u64,
+    total_background_blasts: u64,
     max_upload_cpu_ms: f32,
     max_upload_chunks: usize,
     max_upload_payload_bytes: usize,
@@ -117,6 +121,20 @@ struct PolicySmoke {
     capture_intervals_ns: Vec<u64>,
     capture_interval_drops: u64,
     capture_sim_cpu_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_focus_evaluation_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_background_evaluation_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_focus_blast_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_background_blast_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_recovery_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_command_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
+    capture_scheduler_overhead_ns: Vec<u64>,
 }
 
 struct Smoke {
@@ -432,6 +450,17 @@ impl App {
             };
             run.capture_intervals_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
             run.capture_sim_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+            #[cfg(feature = "quantum-diagnostics")]
+            {
+                run.capture_focus_evaluation_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_background_evaluation_ns =
+                    Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_focus_blast_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_background_blast_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_recovery_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_command_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_scheduler_overhead_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+            }
         }
         let (width, height) = demo.dimensions();
         let chunks_x = width / CHUNK_SIZE;
@@ -1424,6 +1453,27 @@ impl App {
         run.frames = run.frames.saturating_add(1);
         run.capture_sim_cpu_ns
             .push((self.sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
+        #[cfg(feature = "quantum-diagnostics")]
+        {
+            run.capture_focus_evaluation_ns
+                .push(sim_metrics.slice.focus_evaluation_ns);
+            run.capture_background_evaluation_ns
+                .push(sim_metrics.slice.background_evaluation_ns);
+            run.capture_focus_blast_ns
+                .push(sim_metrics.slice.focus_blast_ns);
+            run.capture_background_blast_ns
+                .push(sim_metrics.slice.background_blast_ns);
+            run.capture_recovery_ns.push(sim_metrics.slice.recovery_ns);
+            run.capture_command_ns.push(sim_metrics.slice.command_ns);
+            run.capture_scheduler_overhead_ns.push(
+                ((self.sim_cpu_ms.max(0.0) * 1_000_000.0) as u64).saturating_sub(
+                    sim_metrics.slice.evaluation_ns
+                        + sim_metrics.slice.blast_ns
+                        + sim_metrics.slice.recovery_ns
+                        + sim_metrics.slice.command_ns,
+                ),
+            );
+        }
         run.last_pending = sim_metrics.slice.pending_cells;
         run.max_pending = run
             .max_pending
@@ -1443,6 +1493,10 @@ impl App {
         run.total_recoveries += sim_metrics.slice.recoveries as u64;
         run.total_commands += sim_metrics.slice.commands as u64;
         run.total_selections += sim_metrics.slice.selections as u64;
+        run.total_focus_evaluations += sim_metrics.slice.focus_evaluations as u64;
+        run.total_background_evaluations += sim_metrics.slice.background_evaluations as u64;
+        run.total_focus_blasts += sim_metrics.slice.focus_blasts as u64;
+        run.total_background_blasts += sim_metrics.slice.background_blasts as u64;
         run.max_upload_cpu_ms = run.max_upload_cpu_ms.max(self.upload_cpu_ms);
         run.max_upload_chunks = run.max_upload_chunks.max(self.last_upload_chunks);
         let upload_payload_bytes = self.last_upload_chunks * bytes_per_chunk(1);
@@ -2526,6 +2580,57 @@ fn print_feel(label: &str, feel: &Feel) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+#[cfg(feature = "quantum-diagnostics")]
+fn timing_p99_ms(values: &[u64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let rank = (99 * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1] as f64 / 1_000_000.0
+}
+
+#[cfg(feature = "quantum-diagnostics")]
+fn print_quantum_timing(run: &PolicySmoke, label: &str) {
+    let estimated_mean_ns = |values: &[u64], count: u64| {
+        if count == 0 {
+            0.0
+        } else {
+            values.iter().map(|&value| value as u128).sum::<u128>() as f64 / count as f64
+        }
+    };
+    println!(
+        "{label} focus_eval_p99_ms={:.3} background_eval_p99_ms={:.3} focus_blast_p99_ms={:.3} background_blast_p99_ms={:.3} recovery_p99_ms={:.3} command_p99_ms={:.3} scheduler_overhead_p99_ms={:.3} estimated_mean_ns_per_quantum=focus-eval:{:.1},background-eval:{:.1},focus-blast:{:.1},background-blast:{:.1},recovery:{:.1},command:{:.1} total_focus_eval={} total_background_eval={} total_focus_blast={} total_background_blast={}",
+        timing_p99_ms(&run.capture_focus_evaluation_ns),
+        timing_p99_ms(&run.capture_background_evaluation_ns),
+        timing_p99_ms(&run.capture_focus_blast_ns),
+        timing_p99_ms(&run.capture_background_blast_ns),
+        timing_p99_ms(&run.capture_recovery_ns),
+        timing_p99_ms(&run.capture_command_ns),
+        timing_p99_ms(&run.capture_scheduler_overhead_ns),
+        estimated_mean_ns(
+            &run.capture_focus_evaluation_ns,
+            run.total_focus_evaluations,
+        ),
+        estimated_mean_ns(
+            &run.capture_background_evaluation_ns,
+            run.total_background_evaluations,
+        ),
+        estimated_mean_ns(&run.capture_focus_blast_ns, run.total_focus_blasts),
+        estimated_mean_ns(
+            &run.capture_background_blast_ns,
+            run.total_background_blasts,
+        ),
+        estimated_mean_ns(&run.capture_recovery_ns, run.total_recoveries),
+        estimated_mean_ns(&run.capture_command_ns, run.total_commands),
+        run.total_focus_evaluations,
+        run.total_background_evaluations,
+        run.total_focus_blasts,
+        run.total_background_blasts,
+    );
+}
+
 fn print_capture(label: &str, run: &PolicySmoke) {
     let mut intervals = run.capture_intervals_ns.clone();
     intervals.sort_unstable();
@@ -2593,6 +2698,8 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         run.max_pending,
         run.max_upload_backlog,
     );
+    #[cfg(feature = "quantum-diagnostics")]
+    print_quantum_timing(run, "SMOKE_QUANTUM_TIMING");
 }
 
 fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
