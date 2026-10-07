@@ -1,5 +1,5 @@
 # Reference machine headless candidate, calibrated 2026-10-05 after correcting traditional frontier semantics.
-# Focus-share values are initial scheduler parameters, not yet calibrated by the milestone-6 action benchmark.
+# The 5% focus-share candidate is supported by offscreen p99 and headless burst diagnostics; windowed validation remains pending.
 version = 3
 name = "m2-16gb-headless"
 reference = "MacBook Air M2, 16 GB, macOS 27.0.1"
@@ -13,7 +13,7 @@ simulator_max_supported_credits = 10000000
 app_current_max_credits = 1000000
 app_current_default_credits = 1000000
 ready_capacity_per_lane = 32768
-focus_share_percent = 50
+focus_share_percent = 5
 background_min_service_percent = 20
 focus_region_capacity = 8
 action_record_capacity = 256
@@ -52,7 +52,7 @@ native_windowed_bounded_fifo_p99_ms = [18.661, 18.485, 18.521]
 native_windowed_bounded_fifo_sim_p99_ms = [4.398, 4.372, 4.391]
 native_windowed_bounded_fifo_max_sim_cpu_ms = [4.972, 4.981, 4.904]
 native_windowed_bounded_fifo_max_upload_cpu_ms = [4.663, 5.123, 5.062]
-status = "1M credits retained; recovery probes repriced to 20 credits; 72,000-slice burst has no stable window; current rule version 7; accepted native FIFO simulation p99 and maxima still exceed 4 ms"
+status = "1M credits retained; 5% focus-share candidate reduces burst backlog but reaches no stable window; current rule version 7; accepted native slice p99 and maxima still exceed 4 ms; windowed validation pending"
 
 # Calibration and held-out validation descriptor roles are disjoint; see scenario TOML metadata.
 # Historical calibration/validation streams shared descriptors, so those captures are not

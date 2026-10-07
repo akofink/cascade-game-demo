@@ -272,7 +272,7 @@ pub struct ServiceShares {
 impl Default for ServiceShares {
     fn default() -> Self {
         Self {
-            focus_percent: 50,
+            focus_percent: 5,
             background_min_percent: 20,
         }
     }
@@ -1660,12 +1660,14 @@ impl World {
             if self.lane_cursor == 100 {
                 self.lane_cursor = 0;
             }
-            let focus_eval = self.focus_enabled && self.focus_eval_ready.len() > 0;
-            let focus_blast = self.focus_enabled && self.focus_blast_ready.len() > 0;
-            let background_eval = self.eval_ready.len() > 0
-                || (!self.focus_enabled && self.focus_eval_ready.len() > 0);
-            let background_blast = self.blast_ready.len() > 0
-                || (!self.focus_enabled && self.focus_blast_ready.len() > 0);
+            let focus_eval_available = self.focus_eval_ready.len() > 0;
+            let focus_blast_available = self.focus_blast_ready.len() > 0;
+            let focus_eval = self.focus_enabled && focus_eval_available;
+            let focus_blast = self.focus_enabled && focus_blast_available;
+            let background_eval =
+                self.eval_ready.len() > 0 || (!self.focus_enabled && focus_eval_available);
+            let background_blast =
+                self.blast_ready.len() > 0 || (!self.focus_enabled && focus_blast_available);
             let recovery_demand = self.pending_count > 0;
             let command_demand = self.command_len() > 0;
             let focus_demand = focus_eval || focus_blast;
@@ -1707,12 +1709,6 @@ impl World {
                     .map_or(6, |index| index as u8 + 2)
             };
             let pick_focus = lane == 0 || lane == 1;
-            #[cfg(feature = "quantum-timing")]
-            if let Some(started) = selection_started {
-                m.selection_ns = m.selection_ns.saturating_add(
-                    started.elapsed().as_nanos() as u64 * QUANTUM_TIMING_SAMPLE_INTERVAL,
-                );
-            }
             let (cost, job, command) = match lane {
                 0 => self.focus_eval_ready.pop().map_or((None, None, None), |j| {
                     (Some(self.costs.evaluate.0), Some(j), None)
@@ -1724,30 +1720,38 @@ impl World {
                         (Some(self.costs.blast.0), Some(j), None)
                     }),
                 2 => {
-                    let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
-                    let job = if background_first {
-                        self.eval_ready
-                            .pop()
-                            .or_else(|| self.focus_eval_ready.pop())
+                    let job = if !focus_eval_available {
+                        self.eval_ready.pop()
                     } else {
-                        self.focus_eval_ready
-                            .pop()
-                            .or_else(|| self.eval_ready.pop())
+                        let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
+                        if background_first {
+                            self.eval_ready
+                                .pop()
+                                .or_else(|| self.focus_eval_ready.pop())
+                        } else {
+                            self.focus_eval_ready
+                                .pop()
+                                .or_else(|| self.eval_ready.pop())
+                        }
                     };
                     job.map_or((None, None, None), |j| {
                         (Some(self.costs.evaluate.0), Some(j), None)
                     })
                 }
                 3 => {
-                    let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
-                    let job = if background_first {
-                        self.blast_ready
-                            .pop()
-                            .or_else(|| self.focus_blast_ready.pop())
+                    let job = if !focus_blast_available {
+                        self.blast_ready.pop()
                     } else {
-                        self.focus_blast_ready
-                            .pop()
-                            .or_else(|| self.blast_ready.pop())
+                        let background_first = self.focus_enabled || self.lane_cursor & 1 == 0;
+                        if background_first {
+                            self.blast_ready
+                                .pop()
+                                .or_else(|| self.focus_blast_ready.pop())
+                        } else {
+                            self.focus_blast_ready
+                                .pop()
+                                .or_else(|| self.blast_ready.pop())
+                        }
                     };
                     job.map_or((None, None, None), |j| {
                         (Some(self.costs.blast.0), Some(j), None)
@@ -1762,6 +1766,12 @@ impl World {
                     })
                 }
             };
+            #[cfg(feature = "quantum-timing")]
+            if let Some(started) = selection_started {
+                m.selection_ns = m.selection_ns.saturating_add(
+                    started.elapsed().as_nanos() as u64 * QUANTUM_TIMING_SAMPLE_INTERVAL,
+                );
+            }
             let Some(cost) = cost else {
                 empty_lanes += 1;
                 if empty_lanes >= 4 {
