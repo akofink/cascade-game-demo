@@ -29,6 +29,8 @@ FIXTURES = (
 )
 POLICIES = ("bounded-focus", "bounded-fifo", "traditional")
 LOAD_LIMIT = 3.0
+STARTUP_FAILURE_REASON = "window occluded before timing capture; no capture timer started (startup retry permitted)"
+MAX_STARTUP_RETRIES = 1
 
 
 def load_one() -> float:
@@ -161,14 +163,22 @@ def load_report_attempts(path: pathlib.Path) -> tuple[str, str, list[dict], list
     attempts = rejected + accepted
     notes = []
     for item in attempts:
-        if item["status"] != "rejected" or item["reason"] != "capture duration, fixture, policy, or sample completeness mismatch":
-            continue
-        if item["load_after"] == "n/a" or float(item["load_before"]) >= LOAD_LIMIT or float(item["load_after"]) >= LOAD_LIMIT:
+        if item["status"] != "rejected":
             continue
         log_path = ROOT / item["log"]
         if not log_path.is_file():
             continue
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        if is_occluded_startup_failure(log_text):
+            item["reason"] = STARTUP_FAILURE_REASON
+            notes.append(
+                f"Confirmed {item['fixture']}/{item['policy']} rep {item['rep']} failed before capture start because the native window was occluded; no timing data was collected."
+            )
+            continue
+        if item["reason"] != "capture duration, fixture, policy, or sample completeness mismatch":
+            continue
+        if item["load_after"] == "n/a" or float(item["load_before"]) >= LOAD_LIMIT or float(item["load_after"]) >= LOAD_LIMIT:
+            continue
         if "SMOKE_RESULT ok" not in log_text:
             continue
         metrics, feel, reasons = validate_capture(log_text, item["fixture"], item["policy"], 60)
@@ -178,6 +188,17 @@ def load_report_attempts(path: pathlib.Path) -> tuple[str, str, list[dict], list
                 f"Revalidated {item['fixture']}/{item['policy']} rep {item['rep']} from its retained log after removing the incorrect fixed-3600-frame requirement; no recapture was made."
             )
     return source.group(1), started.group(1), attempts, notes
+
+
+def is_occluded_startup_failure(text: str) -> bool:
+    return (
+        "smoke timed out" in text
+        and "occluded=" in text
+        and "presents=0" in text
+        and "SMOKE_CAPTURE_STARTED " not in text
+        and "SMOKE_CAPTURE " not in text
+        and "SMOKE_RESULT ok" not in text
+    )
 
 
 def fmt_load(value: float | None) -> str:
@@ -315,6 +336,7 @@ def main() -> int:
                       and item["reason"] not in {
                           "one-minute load gate failed",
                           "pre-run one-minute load not below 3",
+                          STARTUP_FAILURE_REASON,
                       }]
         if unresolved:
             parser.error("resume stopped: a prior non-load rejection remains unresolved; inspect its retained log")
@@ -364,16 +386,35 @@ def main() -> int:
                 reasons = []
                 if before >= LOAD_LIMIT or after >= LOAD_LIMIT:
                     reasons.append("one-minute load gate failed")
-                if result.returncode != 0 or "SMOKE_RESULT ok" not in text:
-                    reasons.append(f"app failed (exit {result.returncode} or no SMOKE_RESULT ok)")
-                reasons.extend(capture_reasons)
+                startup_failure = result.returncode != 0 and is_occluded_startup_failure(text)
+                if startup_failure:
+                    reasons.append(STARTUP_FAILURE_REASON)
+                else:
+                    if result.returncode != 0 or "SMOKE_RESULT ok" not in text:
+                        reasons.append(f"app failed (exit {result.returncode} or no SMOKE_RESULT ok)")
+                    reasons.extend(capture_reasons)
+                prior_startup_failures = sum(
+                    item["status"] == "rejected"
+                    and item["fixture"] == fixture
+                    and item["policy"] == policy
+                    and item["rep"] == rep
+                    and STARTUP_FAILURE_REASON in item["reason"]
+                    for item in attempts
+                )
                 if reasons:
                     base.update(status="rejected", reason="; ".join(reasons))
                     attempts.append(base)
                     print(f"REJECT {fixture}/{policy} rep={rep} load={before:.2f}/{after:.2f}: {base['reason']}", flush=True)
-                    if any(reason != "one-minute load gate failed" for reason in reasons):
-                        print("Stopping after a non-load capture failure; inspect the retained log and fix the cause before retrying.", file=sys.stderr)
+                    nonretryable = any(
+                        reason not in {"one-minute load gate failed", STARTUP_FAILURE_REASON}
+                        for reason in reasons
+                    )
+                    if nonretryable or (startup_failure and prior_startup_failures >= MAX_STARTUP_RETRIES):
+                        print("Stopping after a non-retryable capture failure; inspect the retained log before another attempt.", file=sys.stderr)
                         return 1
+                    if startup_failure:
+                        print("Retrying once; the occluded app exited before the capture timer started, so no timing run is being repeated.", flush=True)
+                        time.sleep(5)
                 else:
                     base.update(status="accepted", reason="", metrics=metrics, feel=feel)
                     attempts.append(base)

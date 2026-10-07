@@ -85,6 +85,34 @@ class AcceptanceSuiteTests(unittest.TestCase):
             self.assertEqual(attempts[0]["metrics"]["frames"], "1190")
             self.assertIn("no recapture was made", notes[0])
 
+    def test_resume_marks_occluded_pre_capture_failure_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.lock").write_bytes((suite.ROOT / "Cargo.lock").read_bytes())
+            log_path = root / "benchmarks/tmp/native-acceptance/startup.log"
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text(
+                "smoke timed out (timeout=0 occluded=6458 outdated=0)\n"
+                "smoke presents=0 pan=false zoom=false readback=false",
+                encoding="utf-8",
+            )
+            attempt = dict(
+                fixture="explosive-lattice", policy="bounded-focus", rep=1, attempt=1,
+                load_before="1.68", load_after="1.41", status="rejected",
+                reason="app failed (exit 1 or no SMOKE_RESULT ok); missing or ambiguous capture telemetry",
+                log=str(log_path.relative_to(root)),
+            )
+            report = root / "report.md"
+            with patch.object(suite, "ROOT", root):
+                write_report(report, "d05cb91", [attempt], "2026-10-07T00:57:00-04:00")
+                _, _, attempts, notes = suite.load_report_attempts(report)
+            self.assertFalse(suite.is_occluded_startup_failure(
+                log_path.read_text(encoding="utf-8") + " SMOKE_CAPTURE_STARTED policy=bounded-focus"
+            ))
+            self.assertEqual(attempts[0]["status"], "rejected")
+            self.assertEqual(attempts[0]["reason"], suite.STARTUP_FAILURE_REASON)
+            self.assertIn("no timing data was collected", notes[0])
+
     def test_report_keeps_rejected_attempt_and_marks_incomplete(self):
         attempts = [
             {
