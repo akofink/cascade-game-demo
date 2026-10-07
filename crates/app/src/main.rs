@@ -30,6 +30,11 @@ const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const FRAME_SAMPLES: usize = 240;
 const SMOKE_POLICY_FRAMES: u32 = 120;
 const CAPTURE_INTERVAL_CAPACITY: usize = 16_384;
+const MAX_PRIORITY_UPLOADS: usize = 16;
+const UPLOAD_BYTES_PER_ROW: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+const STAGING_BYTES_PER_CHUNK: usize =
+    (CHUNK_SIZE as usize - 1) * UPLOAD_BYTES_PER_ROW + CHUNK_SIZE as usize;
+const STAGING_PADDING_BYTES_PER_CHUNK: usize = STAGING_BYTES_PER_CHUNK - CHUNK_CELLS;
 
 #[derive(Clone, Copy)]
 struct CaptureConfig {
@@ -89,6 +94,14 @@ struct PolicySmoke {
     total_commands: u64,
     total_selections: u64,
     max_upload_cpu_ms: f32,
+    max_upload_chunks: usize,
+    max_upload_payload_bytes: usize,
+    max_upload_row_padding_bytes: usize,
+    max_upload_staging_bytes: usize,
+    upload_cpu_peak_chunks: usize,
+    upload_cpu_peak_payload_bytes: usize,
+    upload_cpu_peak_row_padding_bytes: usize,
+    upload_cpu_peak_staging_bytes: usize,
     max_submit_cpu_ms: f32,
     slow_frame_count: u32,
     slow_frame_max_ns: u64,
@@ -152,6 +165,7 @@ struct App {
     submit_cpu_ms: f32,
     last_frame_interval_ns: u64,
     last_plan: UploadPlan,
+    last_upload_chunks: usize,
     destroy_presses: u64,
     destroy_press_at: Option<Instant>,
     deferred_user_set: bool,
@@ -412,6 +426,7 @@ impl App {
             submit_cpu_ms: 0.0,
             last_frame_interval_ns: 0,
             last_plan: UploadPlan::default(),
+            last_upload_chunks: 0,
             destroy_presses: 0,
             destroy_press_at: None,
             deferred_user_set: false,
@@ -601,9 +616,8 @@ impl App {
             let _ = self.uploads.mark_dirty(ChunkCoord { x, y });
         }
         let started = Instant::now();
-        let plan = self
-            .uploads
-            .plan(bytes_per_chunk(1), UploadBudget::default());
+        let plan = self.uploads.plan(bytes_per_chunk(1), upload_budget());
+        self.last_upload_chunks = 0;
         if let Some(gpu) = self.gpu.as_ref() {
             let mut exempt = [(0_u32, 0_u32); 64];
             let exempt_len = self.feel.exempt_cells(&mut exempt);
@@ -622,10 +636,10 @@ impl App {
                 uploaded[index] = (chunk.x, chunk.y);
             }
             let mut uploaded_len = plan.count;
-            let mut targets = [(0_u32, 0_u32); 16];
+            let mut targets = [(0_u32, 0_u32); MAX_PRIORITY_UPLOADS];
             let target_len = self.demo.player_targets(&mut targets);
-            for &(x, y) in &targets[..target_len] {
-                if uploaded_len == uploaded.len() {
+            for &(x, y) in &targets[..target_len.min(MAX_PRIORITY_UPLOADS)] {
+                if uploaded_len == MAX_CHUNKS_PER_FRAME {
                     break;
                 }
                 let chunk = (x / CHUNK_SIZE, y / CHUNK_SIZE);
@@ -647,10 +661,11 @@ impl App {
                 uploaded_len += 1;
             }
             self.feel.note_uploads(&uploaded[..uploaded_len]);
+            self.last_upload_chunks = uploaded_len;
         }
         self.upload_cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
         if let Some(smoke) = self.smoke.as_mut() {
-            smoke.uploaded += plan.count as u32;
+            smoke.uploaded += self.last_upload_chunks as u32;
             smoke.saw_stale |= plan.stale;
         }
         self.last_plan = plan;
@@ -1395,6 +1410,19 @@ impl App {
         run.total_commands += sim_metrics.slice.commands as u64;
         run.total_selections += sim_metrics.slice.selections as u64;
         run.max_upload_cpu_ms = run.max_upload_cpu_ms.max(self.upload_cpu_ms);
+        run.max_upload_chunks = run.max_upload_chunks.max(self.last_upload_chunks);
+        let upload_payload_bytes = self.last_upload_chunks * bytes_per_chunk(1);
+        run.max_upload_payload_bytes = run.max_upload_payload_bytes.max(upload_payload_bytes);
+        let row_padding_bytes = self.last_upload_chunks * STAGING_PADDING_BYTES_PER_CHUNK;
+        let staging_bytes = self.last_upload_chunks * STAGING_BYTES_PER_CHUNK;
+        run.max_upload_row_padding_bytes = run.max_upload_row_padding_bytes.max(row_padding_bytes);
+        run.max_upload_staging_bytes = run.max_upload_staging_bytes.max(staging_bytes);
+        if self.upload_cpu_ms >= run.max_upload_cpu_ms {
+            run.upload_cpu_peak_chunks = self.last_upload_chunks;
+            run.upload_cpu_peak_payload_bytes = upload_payload_bytes;
+            run.upload_cpu_peak_row_padding_bytes = row_padding_bytes;
+            run.upload_cpu_peak_staging_bytes = staging_bytes;
+        }
         run.max_submit_cpu_ms = run.max_submit_cpu_ms.max(self.submit_cpu_ms);
         if self.last_frame_interval_ns > 33_333_333 {
             run.slow_frame_count = run.slow_frame_count.saturating_add(1);
@@ -2221,6 +2249,28 @@ fn create_gpu(
     })
 }
 
+fn upload_budget() -> UploadBudget {
+    UploadBudget {
+        max_chunks: MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS,
+        max_copies: MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS,
+        ..UploadBudget::default()
+    }
+}
+
+fn exempt_mask(chunk: ChunkCoord, exempt: &[(u32, u32)]) -> [bool; CHUNK_CELLS] {
+    let mut mask = [false; CHUNK_CELLS];
+    let chunk_x = chunk.x * CHUNK_SIZE;
+    let chunk_y = chunk.y * CHUNK_SIZE;
+    for &(cell_x, cell_y) in exempt {
+        if cell_x / CHUNK_SIZE == chunk.x && cell_y / CHUNK_SIZE == chunk.y {
+            let local_x = cell_x - chunk_x;
+            let local_y = cell_y - chunk_y;
+            mask[(local_y * CHUNK_SIZE + local_x) as usize] = true;
+        }
+    }
+    mask
+}
+
 fn write_chunk(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
@@ -2229,7 +2279,8 @@ fn write_chunk(
     deferred_overlay: bool,
     exempt: &[(u32, u32)],
 ) {
-    let mut bytes = [0_u8; CHUNK_CELLS];
+    let mut bytes = [0_u8; UPLOAD_BYTES_PER_ROW * CHUNK_SIZE as usize];
+    let exempt_mask = exempt_mask(chunk, exempt);
     let (width, height) = world.dimensions();
     for y in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
@@ -2238,8 +2289,8 @@ fn write_chunk(
             if cell_x < width && cell_y < height {
                 let cell = world.cell(cell_x, cell_y);
                 let pending = world.cell_pending(cell_x, cell_y) == Some(true);
-                let exempt_cell = exempt.contains(&(cell_x, cell_y));
-                bytes[(y * CHUNK_SIZE + x) as usize] = cell
+                let exempt_cell = exempt_mask[(y * CHUNK_SIZE + x) as usize];
+                bytes[y as usize * UPLOAD_BYTES_PER_ROW + x as usize] = cell
                     .map(|cell| {
                         presented_byte(
                             cell.material as u8,
@@ -2267,7 +2318,7 @@ fn write_chunk(
         &bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(CHUNK_SIZE),
+            bytes_per_row: Some(UPLOAD_BYTES_PER_ROW as u32),
             rows_per_image: Some(CHUNK_SIZE),
         },
         wgpu::Extent3d {
@@ -2450,7 +2501,7 @@ fn print_capture(label: &str, run: &PolicySmoke) {
     };
     let over_33_3_ms = intervals.iter().filter(|&&ns| ns > 33_333_333).count();
     println!(
-        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
+        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
         intervals.len(),
         percentile(50) as f64 / 1_000_000.0,
         percentile(95) as f64 / 1_000_000.0,
@@ -2470,6 +2521,14 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         run.total_commands,
         run.total_selections,
         run.max_upload_cpu_ms,
+        run.max_upload_chunks,
+        run.max_upload_payload_bytes,
+        run.max_upload_staging_bytes,
+        run.max_upload_row_padding_bytes,
+        run.upload_cpu_peak_chunks,
+        run.upload_cpu_peak_payload_bytes,
+        run.upload_cpu_peak_staging_bytes,
+        run.upload_cpu_peak_row_padding_bytes,
         run.max_submit_cpu_ms,
         run.slow_frame_count,
         run.slow_frame_max_ns as f64 / 1_000_000.0,
@@ -2521,4 +2580,44 @@ fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
         smoke.traditional.max_frame_interval_ns as f32 / 1_000_000.0,
         smoke.hold_frames,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_uploads_share_the_frame_copy_cap() {
+        let budget = upload_budget();
+        assert_eq!(
+            budget.max_chunks,
+            MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS
+        );
+        assert_eq!(
+            budget.max_copies,
+            MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS
+        );
+        assert!(budget.max_copies + MAX_PRIORITY_UPLOADS <= MAX_CHUNKS_PER_FRAME);
+        assert_eq!(
+            UPLOAD_BYTES_PER_ROW,
+            wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
+        );
+        assert_eq!(
+            STAGING_BYTES_PER_CHUNK,
+            (CHUNK_SIZE as usize - 1) * 256 + CHUNK_SIZE as usize
+        );
+        assert_eq!(
+            STAGING_PADDING_BYTES_PER_CHUNK,
+            STAGING_BYTES_PER_CHUNK - CHUNK_CELLS
+        );
+    }
+
+    #[test]
+    fn exempt_mask_is_chunk_local_and_indexed_by_cell() {
+        let mask = exempt_mask(ChunkCoord { x: 0, y: 0 }, &[(31, 31), (32, 0), (0, 1)]);
+        assert!(mask[31 * CHUNK_SIZE as usize + 31]);
+        assert!(mask[CHUNK_SIZE as usize]);
+        assert!(!mask[0]);
+        assert_eq!(mask.iter().filter(|&&marked| marked).count(), 2);
+    }
 }
