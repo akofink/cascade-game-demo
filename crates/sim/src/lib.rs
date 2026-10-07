@@ -207,10 +207,8 @@ enum JobKind {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-struct FocusCacheEntry {
-    epoch: u64,
-    focused: bool,
-}
+#[repr(transparent)]
+struct FocusCacheEntry(u32);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct FocusRegion {
     min_x: u32,
@@ -388,7 +386,7 @@ pub struct World {
     focus_blast_ready: Ring<Job>,
     focus_regions: [FocusRegion; FOCUS_REGION_CAPACITY],
     focus_cache: Vec<FocusCacheEntry>,
-    focus_epoch: u64,
+    focus_epoch: u32,
     focus_enabled: bool,
     shares: ServiceShares,
     action_records: Vec<Option<ActionRecord>>,
@@ -660,7 +658,7 @@ impl World {
         (x / CHUNK_SIDE, y / CHUNK_SIDE)
     }
     fn invalidate_focus_cache(&mut self) {
-        if self.focus_epoch == u64::MAX {
+        if self.focus_epoch == u32::MAX >> 1 {
             self.focus_cache.fill(FocusCacheEntry::default());
             self.focus_epoch = 1;
         } else {
@@ -673,18 +671,15 @@ impl World {
         }
         let (x, y) = self.chunk_xy(id);
         let index = (y * self.chunks_x + x) as usize;
-        let cached = self.focus_cache[index];
-        if cached.epoch == self.focus_epoch {
-            return cached.focused;
+        let cached = self.focus_cache[index].0;
+        if cached >> 1 == self.focus_epoch {
+            return cached & 1 != 0;
         }
         let focused = self
             .focus_regions
             .iter()
             .any(|region| region.contains(x, y, self.slice));
-        self.focus_cache[index] = FocusCacheEntry {
-            epoch: self.focus_epoch,
-            focused,
-        };
+        self.focus_cache[index] = FocusCacheEntry((self.focus_epoch << 1) | u32::from(focused));
         focused
     }
     fn focus_cell(&mut self, id: CellId, lifetime: u16) {
@@ -2592,8 +2587,9 @@ mod tests {
             resources.focus_cache_bytes,
             16_384 * std::mem::size_of::<FocusCacheEntry>()
         );
+        assert_eq!(resources.focus_cache_bytes, 16_384 * 4);
         assert_eq!(resources.action_effect_index_bytes, 16_384 * 32);
-        assert_eq!(resources.total_bytes, 103_063_040);
+        assert_eq!(resources.total_bytes, 102_866_432);
         assert!(resources.total_bytes < 256 * 1024 * 1024);
     }
     #[test]
