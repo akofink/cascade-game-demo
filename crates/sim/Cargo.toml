@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dev-dependencies]
+stats_alloc = "0.1.10"
+
 [lints]
 workspace = true

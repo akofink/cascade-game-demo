@@ -62,7 +62,7 @@ Tails are not monotonic: the 800,000-credit point had five samples over 4 ms and
 
 ## Finite burst and recovery probe
 
-Three paired full-size repetitions per policy used mixed-overload, 1,200 seeded commands at up to 64 per slice, then no new commands for the remainder of 1,800 measured slices. Warm-up was 120 slices followed by fresh fixture preparation; policy order alternated B/T, T/B, B/T. All 1,200 commands per run were accepted; rejection and coalescing were zero. No run reached the runner's empty/stable completion predicate within 1,800 slices.
+Three paired full-size repetitions per policy used mixed-overload, 1,200 seeded commands at up to 64 per slice, then no new commands for the remainder of 1,800 measured slices. Warm-up was 120 slices followed by fresh fixture preparation; policy order alternated B/T, T/B, B/T. All 1,200 commands per run were accepted; rejection and coalescing were zero. No run reached the runner's empty completion predicate within 1,800 slices. For future recovery claims, stable state requires no new input, no pending cells or commands, and unchanged authoritative cell contents for 60 consecutive slices. The saved run has zero empty samples and therefore cannot meet that criterion; recovery remains right-censored beyond 1,800 slices. Persistent water-driven work is activity, not stability.
 
 | Policy | N | p50 ms | p95 ms | p99 ms | max ms | >4 ms | avg quanta/slice | work quanta/run | backlog high-water/end | measured wall/run | complete runs |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|

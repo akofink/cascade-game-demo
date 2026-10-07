@@ -1,5 +1,28 @@
 # Performance evidence
 
+## Charter section 15 acceptance checklist
+
+Statuses describe the evidence currently published here; “not measured” means no qualifying measurement is available, while “unmet” means an available result misses the criterion.
+
+| Section 15 criterion | Status | Evidence |
+| --- | --- | --- |
+| Every bounded slice stays within its credit allowance, including saturation and stale jobs | met | [Headless calibration v4](../benchmarks/results/headless-v4.md); scheduler adversarial tests in `crates/sim/src/lib.rs` |
+| Every interactive engine-owned loop has a fixed limit or charged resumable cursor | met | [Architecture work/resource contracts](architecture.md); [native sustained capture v2](../benchmarks/results/native-sustained-v2.md) |
+| Queue, pool, upload, and resident storage limits hold under stress fixtures | met | [Resource accounting below](#world-size-resource-bounds); [headless v4](../benchmarks/results/headless-v4.md); [native sustained capture v2](../benchmarks/results/native-sustained-v2.md) |
+| Accepted deferred work is retained or explicitly canceled; repeat requests do not grow unbounded history | met | [Architecture and overload semantics](architecture.md); queue saturation and recovery tests in `crates/sim/src/lib.rs` |
+| Finite pending demand receives fair service; stale generations cannot mutate reset worlds | met | Scheduler fairness, reset, and stale-generation tests in `crates/sim/src/lib.rs` |
+| Sand/water conservation and blast/fire conversion rules pass tests | met | [Rules and conservation tests](rules.md) |
+| Replays reproduce full future-affecting state hashes | met | Replay/hash tests in `crates/sim/src/lib.rs`; [headless results](../benchmarks/results/headless-v4.md) |
+| No simulation/scheduler hot-path heap growth after initialization, verified by allocation instrumentation | met | [Allocation and GPU diagnostics](#allocation-and-gpu-diagnostics): saturated-slice global-allocator test observed zero allocation/reallocation calls |
+| Each fixture: three release captures of at least 60 seconds after warm-up, 1920 x 1080, 60 Hz, including quiet baseline | unmet | [Native sustained capture v2](../benchmarks/results/native-sustained-v2.md) covers three policies on mixed overload, not every fixture or a quiet baseline |
+| Simulation slice p99 at or below 4 ms | unmet | [Headless calibration v4](../benchmarks/results/headless-v4.md): burning-forest has 8/5,400 samples above 4 ms and a 9.767 ms maximum; native maxima also exceed 4 ms |
+| Frame interval p99 at or below 20 ms, with >33.3 ms counts and maximum disclosed | unmet | [Native sustained capture v2](../benchmarks/results/native-sustained-v2.md): bounded FIFO p99 remains above 20 ms; the full fixture matrix is not measured |
+| Camera/UI feedback p95 at or below 50 ms with documented method | met | [Game-feel measurement](#game-feel-measurement) and [native sustained capture v2](../benchmarks/results/native-sustained-v2.md); display scanout is excluded |
+| Focus-enabled action-to-first-effect p95 at or below 50 ms under sustained overload, with minimum background service | met | [Player-focus results v1](../benchmarks/results/player-focus-v1.md): bounded-focus p95 2.754 ms across scripted headless actions; native material-visible latency is reported separately |
+| Full-size mixed overload stays within resource limits without crash, deadlock, or loss of accepted work | not measured | [Full-size native smoke](#full-size-release-smoke-after-the-traditional-frontier-correction) passed functionally, but the complete GPU-owned memory high-water is unavailable; see [resource audit](#world-size-resource-bounds) |
+| Finite stress burst drains or reaches a verified stable state in a measured recovery window | unmet | [Finite burst and recovery probe](../benchmarks/results/headless-v3.md): neither policy reached empty/stable by 1,800 slices; recovery time is right-censored |
+| Paired heavy-work fixture materially reduces bounded p99 frame latency while showing completion cost; target 2x | met | [Native sustained capture v2](../benchmarks/results/native-sustained-v2.md): mixed-overload comparison shows the bounded/traditional latency difference and completion/backlog context; traditional is the specified full-frontier baseline |
+
 ## Default native timing workflow
 
 For unattended native timing captures, build release once before checking the quiet-machine gate, then use the offscreen GPU-texture path (one fresh process per policy):
@@ -33,9 +56,17 @@ Fixture disclosures: `explosive-lattice` has a seeded center blast (energy 15) p
 
 ## Headless method and machine
 
-Release build: `cargo build --release -p cascade-bench`. The runner reports preparation and warm-up durations separately, re-prepares the descriptor after optional warm-up, and records measured wall time around each CPU-only `World::step`. The timer is monotonic wall time, not thread CPU time, and includes operating-system preemption. See the v3 report for the exact calibration, paired-matrix and burst protocols, sample counts, percentiles, backlogs, work, and completion semantics. Calibration and validation use distinct disturbance streams but share the static burning-forest and mixed-overload descriptors; fixture-level holdout independence is incomplete.
+Release build: `cargo build --release -p cascade-bench`. The runner reports preparation and warm-up durations separately, re-prepares the descriptor after optional warm-up, and records measured wall time around each CPU-only `World::step`. The timer is monotonic wall time, not thread CPU time, and includes operating-system preemption. See the v3 report for the exact calibration, paired-matrix and burst protocols, sample counts, percentiles, backlogs, work, and completion semantics. The v3 profile now assigns calibration and held-out validation roles to disjoint scenario descriptors; historical v3 calibration and validation streams shared descriptors and do not provide fixture-level holdout evidence.
 
 Reference machine: MacBook Air (Mac14,2), Apple M2 with 8 CPU cores, 16 GB RAM and integrated M2 GPU; macOS 27.0.1; built-in 2560 x 1664 display. Rust 1.99.0 (`b940084d7`, aarch64-apple-darwin), Cargo 1.99.0 (`5f94df478`). `Cargo.lock` SHA-256: `c4084ec2080b2c4da29d605573b159b02504f86af481d13c5807e565d419afe7`. Power mode, thermal state, background load, and display refresh/presentation mode were not controlled.
+
+## Allocation and GPU diagnostics
+
+`cargo test -p cascade-sim --test hot_path_allocations` installs an instrumented system allocator in a dedicated test executable, initializes a world and queues 256 paint commands before measurement, then checks 256 slices at the minimum 25-credit allowance. The test asserts zero allocations, reallocations, and newly allocated bytes while the scheduler services queued work, and asserts the credit limit on every slice. This verifies the simulation/scheduler hot path after initialization in the tested build; it does not cover app presentation code or prove behavior for every possible event path.
+
+For app-side visibility, build with `cargo run --release -p cascade-app --features allocation-diagnostics -- --offscreen-capture --capture-policy bounded-focus --capture-seconds 60 --world-size 4096`. The diagnostic global allocator is sampled around each `World::step` dispatched by `Demo::tick`; the overlay reports allocation-call delta per simulation frame. Ordinary builds show that diagnostic allocation counts are unavailable. Instrumentation overhead means diagnostic builds are for allocation observation, not timing publication.
+
+GPU duration is unavailable in the current app build. Timestamp-query features are not requested and no delayed timestamp-query/readback ring is implemented; the overlay labels the value unavailable rather than presenting CPU submission time as GPU duration. GPU timing remains not measured on the reference backend.
 
 ## Player-action focus latency
 
@@ -83,7 +114,14 @@ A follow-up screenshot smoke ran the same command with `--screenshot docs/cascad
 
 ## World-size resource bounds
 
-At 4096 x 4096 with default ready capacities, one `World` accounts for 103,063,040 bytes (98.29 MiB) of simulation-owned arrays, including focus rings, the 262,144-byte per-chunk focus membership cache, the action-record ring, its per-chunk action-effect index, and its one-byte-per-cell traditional snapshot. The app holds a normal-capacity world and a tiny-capacity alternate world; each has a separately bounded allocation. The CPU material grid adds 16 MiB; the material texture is a separate 16 MiB GPU resource. Allocator metadata and process RSS are excluded. Startup allocation and full-size fixture-preparation latency are separate from steady-state measurements.
+At 4096 x 4096 with default ready capacities, one normal `World` accounts for 103,063,040 bytes (98.29 MiB) of simulation-owned arrays. The app also keeps a tiny-capacity alternate world, a CPU material grid, and one GPU material texture. The two worlds together account for about 196.6 MiB, the CPU material grid is 16 MiB, and listed application-owned CPU storage is therefore about 212.6 MiB (83.0% of the charter's 256 MiB CPU budget). The tiny world's exact resource count is exposed by `World::resources()`; this sum rounds its size to the normal-world figure and is conservative.
+
+The material texture is 16 MiB (12.5% of the charter's 128 MiB GPU budget). This is a lower-bound inventory, not a measured driver/GPU high-water: surface swapchain images, egui GPU allocations, allocator metadata, and backend-private resources are not exposed by wgpu as an exact application-owned byte total. Therefore a complete GPU-budget high-water remains not measured. Process RSS is not the charter's application-owned CPU storage measure. Startup allocations and fixture-preparation latency are separate from steady-state measurements.
+
+## Fixture roles and held-out validation
+
+Each scenario descriptor TOML declares `benchmark_role`. The v3 profile names `burning-forest-v1` and `mixed-overload-v1` as calibration descriptors and six distinct descriptors as held-out validation: quiet-world, explosive-lattice, sand-release, reservoir-breach, dirty-world-sweep, and tiny-capacity. Their descriptor-level groups do not overlap. The existing v3 fixture-matrix report includes the calibration fixtures and is not itself a held-out-only result; the profile's short validation measurements are limited to the disjoint fixture matrix evidence and do not satisfy the sustained 60-second acceptance protocol. The old statement that calibration and validation share static descriptors refers to that earlier mixed-purpose matrix and is superseded by the explicit descriptor roles.
+
 
 ## Game-feel measurement
 
@@ -165,9 +203,9 @@ The post-cache valid native suite reports focus simulation maxima 4.876–5.062 
 - The post-cache native full-size bounded simulation CPU maxima remain 4.876–5.600 ms, above the 4 ms target. Headless v4 burning-forest p99 is below 4 ms, but its worst sample is 9.767 ms and 8/5,400 samples exceed 4 ms. Do not claim the CPU timing target is closed.
 - Post-cache bounded FIFO frame p99 remains slightly above 20 ms (20.506–20.621 ms); post-cache bounded focus met the 20 ms target. The prior 34.342 ms focus interval did not recur, but remains historical evidence.
 - The traditional full-frontier policy had every measured frame interval over 33.3 ms and is far beyond the 4 ms simulation-slice target by design. This is the charter's intentionally expensive batch-all baseline, not evidence about all conventional engines.
-- GPU timing was unavailable; native visible-action latency excludes display scanout/composition. Captures cover one M2 Mac and one mixed-overload fixture, not all fixtures or devices.
-- The 1,200-command full-size headless burst did not resolve or reach an empty/stable state for either policy within 1,800 slices; completion time is right-censored.
+- GPU timing is unavailable in the current app build, and complete GPU-owned memory high-water remains not measured; native visible-action latency excludes display scanout/composition. Captures cover one M2 Mac and one mixed-overload fixture, not all fixtures or devices.
+- The 1,200-command full-size burst at the current 1,000,000-credit profile did not resolve or reach an empty state for either policy within 1,800 slices. Recovery is right-censored at more than 1,800 slices; the measured 1,800-slice windows took 1.474–1.527 seconds bounded and 48.640–48.678 seconds traditional, including OS preemption. A verified stable state means no new input, no pending cells or commands, and unchanged authoritative cell contents for 60 consecutive slices. No run even reached a single empty sample (0/3), so neither policy met this criterion. The mixed-overload fixture includes persistent water activity; continuing activity is not a settled state. See [the burst/recovery report](../benchmarks/results/headless-v3.md#finite-burst-and-recovery-probe).
 - The app maximum/default reads the selected 1,000,000-credit allowance from profile v3. Focus service-share values are initial scheduler parameters and have not been calibrated.
-- Static descriptors overlap between headless calibration and validation; only disturbance command streams are distinct.
+- Historical calibration and validation runs shared the burning-forest and mixed-overload descriptors. Scenario descriptors now carry disjoint calibration/held-out-validation roles; historical calibration measurements are not held-out results. See [fixture roles](#fixture-roles-and-held-out-validation).
 
 Results are empirical on one machine. Bounded-mode credits constrain accounted algorithmic work, not operating-system or hardware latency.

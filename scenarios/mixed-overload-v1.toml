@@ -1,3 +1,4 @@
 id = "mixed-overload"
 version = 1
 seed = 1128354568
+benchmark_role = "calibration"

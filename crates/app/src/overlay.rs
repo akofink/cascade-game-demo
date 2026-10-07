@@ -15,6 +15,7 @@ pub struct OverlayInput<'a> {
     pub intervals_ns: &'a [u64],
     pub pending_samples: &'a [usize],
     pub sim_cpu_ms: f32,
+    pub hot_path_allocations: Option<usize>,
     pub upload_cpu_ms: f32,
     pub submit_cpu_ms: f32,
     pub backlog: usize,
@@ -296,6 +297,11 @@ fn details(
         "CPU sim {:.2} ms · upload {:.2} ms · submit {:.2} ms",
         input.sim_cpu_ms, input.upload_cpu_ms, input.submit_cpu_ms
     ));
+    ui.label(match input.hot_path_allocations {
+        Some(count) => format!("hot-path allocation calls this frame: {count}"),
+        None => "hot-path allocations: diagnostic build unavailable".to_owned(),
+    });
+    ui.label("GPU duration: unavailable (timestamp queries not enabled)");
     ui.label(format!(
         "upload backlog {} · this frame {} chunks · stale {}",
         input.backlog, input.uploaded_chunks, input.stale
