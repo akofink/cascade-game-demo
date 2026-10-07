@@ -47,16 +47,17 @@ worst_workload_p99_ns = 2838709
 worst_observed_slice_ns = 9767333
 slices_over_4ms = 8
 budget_target_ns = 4000000
-native_windowed_capture_revision = "dc237d2"
-native_windowed_bounded_fifo_p99_ms = [18.096, 17.944, 18.000]
-native_windowed_bounded_fifo_max_sim_cpu_ms = [5.287, 5.188, 5.410]
-native_windowed_bounded_fifo_max_upload_cpu_ms = [3.468, 3.729, 3.538]
-status = "1M credits retained; recovery probes repriced to 20 credits; 72,000-slice burst still has pending work; current rule version 7; bounded slice maxima remain under investigation"
+native_windowed_capture_revision = "50a0fc5"
+native_windowed_bounded_fifo_p99_ms = [18.661, 18.485, 18.521]
+native_windowed_bounded_fifo_sim_p99_ms = [4.398, 4.372, 4.391]
+native_windowed_bounded_fifo_max_sim_cpu_ms = [4.972, 4.981, 4.904]
+native_windowed_bounded_fifo_max_upload_cpu_ms = [4.663, 5.123, 5.062]
+status = "1M credits retained; recovery probes repriced to 20 credits; 72,000-slice burst has no stable window; current rule version 7; accepted native FIFO simulation p99 and maxima still exceed 4 ms"
 
 # Calibration and held-out validation descriptor roles are disjoint; see scenario TOML metadata.
 # Historical calibration/validation streams shared descriptors, so those captures are not
 # held-out evidence. Three accepted 60-second post-upload-fix windowed FIFO captures are published in
-# native-sustained-v2.md; the three-capture, all-fixture acceptance suite remains incomplete.
+# native-sustained-v3.md; the three-capture, all-fixture acceptance suite remains incomplete.
 # The renderer caps total writes at 256/frame (240 queued plus 16 priority) and uses 256-byte
-# row-pitch staging for 32x32 R8 chunks. Three post-fix FIFO p99 captures met 20 ms;
-# observed simulation CPU maxima remain above 4 ms. The 1M credit allowance was not reduced.
+# row-pitch staging for 32x32 R8 chunks. Three post-fix FIFO frame p99 captures met 20 ms;
+# simulation p99 and maxima remain above 4 ms. The 1M credit allowance was not reduced.
