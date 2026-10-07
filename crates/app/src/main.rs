@@ -1392,8 +1392,8 @@ impl App {
                     event_loop.exit();
                     return;
                 }
-                let quiet_baseline = capture.fixture == FixtureId::QuietWorld;
-                self.demo.set_destroy_held(!quiet_baseline);
+                let mixed_overload = capture.fixture == FixtureId::MixedOverload;
+                self.demo.set_destroy_held(mixed_overload);
                 self.feel.clear_latencies();
                 self.history = FrameHistory::default();
                 self.last_present = None;
@@ -1468,13 +1468,15 @@ impl App {
                 run.slow_frame_slice = sim_metrics.slice;
             }
         }
-        if capture.fixture != FixtureId::QuietWorld {
+        if capture.fixture == FixtureId::MixedOverload {
             self.scripted_player_action(run.frames);
         }
         if smoke.capture_started.is_some_and(|started| {
             started.elapsed() >= std::time::Duration::from_secs(capture.seconds)
         }) {
-            if capture.fixture != FixtureId::QuietWorld && !has_minimum_action_samples(&self.feel) {
+            if capture.fixture == FixtureId::MixedOverload
+                && !has_minimum_action_samples(&self.feel)
+            {
                 smoke.failed = Some(format!(
                     "{policy_label} action stream sample counts below 30 per action type"
                 ));
