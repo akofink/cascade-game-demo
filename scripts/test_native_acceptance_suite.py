@@ -58,6 +58,59 @@ class AcceptanceSuiteTests(unittest.TestCase):
             self.assertIn("## Interaction feedback samples", text)
             self.assertIn("quiet-world | bounded-fifo | 1 | 0 / 0", text)
 
+    def test_offscreen_capture_validation_and_separate_runner_output(self):
+        text = "\n".join([
+            "OFFSCREEN_CAPTURE_START policy=bounded focus seconds=1 target=1920x1080 cadence_hz=60 presentation=none",
+            "OFFSCREEN_CAPTURE_STARTED policy=bounded focus target=1920x1080 fixture=quiet-world-v1",
+            "OFFSCREEN_CAPTURE_RESULT policy=bounded focus frames=43 target=1920x1080 cadence_hz=60 feel_basis=scripted_action_to_cpu_detected_effect_and_upload_queue_write display_presentation=not_measured vsync=not_measured compositor=not_measured scanout=not_measured",
+            "SMOKE_FEEL policy=offscreen-bounded-focus camera_n=0 camera_p95_ms=0 paint_n=0 paint_p95_ms=0 ignite_n=0 ignite_p95_ms=0 detonate_n=0 detonate_p95_ms=0",
+            "SMOKE_CAPTURE policy=offscreen-bounded-focus frames=42 p99_ms=17.0 max_ms=18.0 over_33_3_ms=0 interval_drops=0 sim_p99_ms=2.5 sim_samples=43 max_sim_cpu_ms=3.0",
+            "SMOKE_RESULT ok mode=offscreen",
+        ])
+        metrics, feel, reasons = suite.validate_capture(
+            text, "quiet-world", "bounded-focus", 1, "offscreen"
+        )
+        self.assertEqual(metrics["frames"], "42")
+        self.assertEqual(feel["policy"], "offscreen-bounded-focus")
+        self.assertEqual(reasons, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_app = root / "fake-app"
+            fake_app.write_text(
+                "#!/bin/sh\n"
+                "echo 'ARGS='$*\n"
+                "echo 'OFFSCREEN_CAPTURE_START policy=bounded fifo seconds=1 target=1920x1080 cadence_hz=60 presentation=none'\n"
+                "echo 'OFFSCREEN_CAPTURE_STARTED policy=bounded fifo target=1920x1080 fixture=quiet-world-v1'\n"
+                "echo 'OFFSCREEN_CAPTURE_RESULT policy=bounded fifo frames=43 target=1920x1080 cadence_hz=60 feel_basis=scripted_action_to_cpu_detected_effect_and_upload_queue_write display_presentation=not_measured'\n"
+                "echo 'SMOKE_FEEL policy=offscreen-bounded-fifo camera_n=0 camera_p95_ms=0 paint_n=0 paint_p95_ms=0 ignite_n=0 ignite_p95_ms=0 detonate_n=0 detonate_p95_ms=0'\n"
+                "echo 'SMOKE_CAPTURE policy=offscreen-bounded-fifo frames=42 p99_ms=18.123 max_ms=19.000 over_33_3_ms=0 interval_drops=0 sim_p99_ms=2.500 sim_samples=43 max_sim_cpu_ms=3.000'\n"
+                "echo 'SMOKE_RESULT ok mode=offscreen'\n",
+                encoding="utf-8",
+            )
+            fake_app.chmod(0o755)
+            report = root / "offscreen-report.md"
+            argv = [
+                "native_acceptance_suite.py", "--mode", "offscreen", "--binary", str(fake_app),
+                "--output", str(report), "--fixtures", "quiet-world", "--policies", "bounded-fifo",
+                "--repetitions", "1", "--seconds", "1", "--no-caffeinate",
+            ]
+            def fake_check_output(command, **kwargs):
+                return "test-revision" if command[0] == "git" else "rustc test"
+
+            with patch("sys.argv", argv), patch.object(suite, "ROOT", root), patch.object(
+                suite, "load_one", return_value=1.0
+            ), patch.object(suite.subprocess, "check_output", side_effect=fake_check_output):
+                (root / "Cargo.lock").write_bytes(b"test lock")
+                self.assertEqual(suite.main(), 0)
+            report_text = report.read_text(encoding="utf-8")
+            self.assertIn("offscreen matrix incomplete; 1/72 accepted captures", report_text)
+            self.assertIn("windowed presentation confirmation pending", report_text)
+            with self.assertRaisesRegex(ValueError, "different capture mode"):
+                suite.load_report_attempts(report, "windowed")
+            log = (root / "benchmarks/tmp/native-acceptance-offscreen/quiet-world-bounded-fifo-rep1-attempt1.log").read_text()
+            self.assertIn("ARGS=--offscreen-capture --capture-policy bounded-fifo", log)
+
     def test_resume_reclassifies_retained_complete_capture_without_recapture(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
