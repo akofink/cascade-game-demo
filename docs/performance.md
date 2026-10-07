@@ -66,7 +66,7 @@ Reference machine: MacBook Air (Mac14,2), Apple M2 with 8 CPU cores, 16 GB RAM a
 
 For app-side visibility, build with `cargo run --release -p cascade-app --features allocation-diagnostics -- --offscreen-capture --capture-policy bounded-focus --capture-seconds 60 --world-size 4096`. The diagnostic global allocator is sampled around each `World::step` dispatched by `Demo::tick`; the overlay reports allocation-call delta per simulation frame. Ordinary builds show that diagnostic allocation counts are unavailable. Instrumentation overhead means diagnostic builds are for allocation observation, not timing publication.
 
-GPU duration is unavailable in the current app build. Timestamp-query features are not requested and no delayed timestamp-query/readback ring is implemented; the overlay labels the value unavailable rather than presenting CPU submission time as GPU duration. GPU timing remains not measured on the reference backend.
+GPU duration is unavailable on the reference adapter, with direct capability evidence from `cargo run -p cascade-app --example adapter_caps`: backend `Metal`, adapter `Apple M2` (`IntegratedGpu`), `TIMESTAMP_QUERY=true`, `TIMESTAMP_QUERY_INSIDE_ENCODERS=false`, and `TIMESTAMP_QUERY_INSIDE_PASSES=false`. The base query feature alone cannot write a timestamp: wgpu 30 requires the encoder or pass feature for timestamp writes. Its feature documentation lists those write features for Metal AMD/Intel, not Apple GPUs ([encoder timestamp feature](https://docs.rs/wgpu-types/30.0.1/wgpu_types/struct.FeaturesWGPU.html#associatedconstant.TIMESTAMP_QUERY_INSIDE_ENCODERS), [pass timestamp feature](https://docs.rs/wgpu-types/30.0.1/wgpu_types/struct.FeaturesWGPU.html#associatedconstant.TIMESTAMP_QUERY_INSIDE_PASSES)). The adapter therefore lacks a usable timestamp-write path, so delayed GPU duration queries cannot be implemented through this wgpu backend; the overlay labels timing unavailable rather than presenting CPU submission time as GPU duration. This is not a generic claim about every backend.
 
 ## Player-action focus latency
 
@@ -116,7 +116,22 @@ A follow-up screenshot smoke ran the same command with `--screenshot docs/cascad
 
 At 4096 x 4096 with default ready capacities, one normal `World` accounts for 103,063,040 bytes (98.29 MiB) of simulation-owned arrays. The app also keeps a tiny-capacity alternate world, a CPU material grid, and one GPU material texture. The two worlds together account for about 196.6 MiB, the CPU material grid is 16 MiB, and listed application-owned CPU storage is therefore about 212.6 MiB (83.0% of the charter's 256 MiB CPU budget). The tiny world's exact resource count is exposed by `World::resources()`; this sum rounds its size to the normal-world figure and is conservative.
 
-The material texture is 16 MiB (12.5% of the charter's 128 MiB GPU budget). This is a lower-bound inventory, not a measured driver/GPU high-water: surface swapchain images, egui GPU allocations, allocator metadata, and backend-private resources are not exposed by wgpu as an exact application-owned byte total. Therefore a complete GPU-budget high-water remains not measured. Process RSS is not the charter's application-owned CPU storage measure. Startup allocations and fixture-preparation latency are separate from steady-state measurements.
+### Explicit GPU resource inventory
+
+The app's explicit GPU resources are listed below; texture/buffer sizes are their descriptor sizes, not driver-heap measurements.
+
+| Path/resource | Size at 4096² world and 1920×1080 output | Lifetime/notes |
+| --- | ---: | --- |
+| R8Uint material texture | 16,777,216 B (16 MiB) | Persistent, one byte per world cell; windowed and offscreen |
+| Frame uniform buffer | 160 B | Persistent |
+| Offscreen RGBA8 render target | 8,294,400 B (7.91 MiB) | Persistent for one offscreen process; absent in windowed mode |
+| App-created steady-state GPU staging buffer | 0 B | Uploads use `Queue::write_texture`; the app creates no persistent GPU staging buffer. Wgpu/backend transient staging allocations are not exposed as app-owned resources. |
+| Egui textures and vertex/index buffers | Not queryable from app descriptors | Renderer-managed and dynamically sized; not included in known subtotal |
+| Window surface images | Not queryable from app descriptors | Surface/backend-managed; image count and allocation are not exposed as app-owned allocations |
+| Optional smoke screenshot readback | `align_up(width × 4, 256) × height` B | Transient; 8,294,400 B at 1920×1080, created only for screenshot smoke |
+| Optional 8×8 smoke sample texture/readback | 256 B texture + 2,048 B readback buffer | Transient post-measurement verification |
+
+The known persistent windowed subtotal is 16,777,376 B (16 MiB plus the 160 B uniform), 12.5% of the charter's 128 MiB GPU budget. The offscreen known subtotal is 25,071,776 B (23.91 MiB), 18.7% of that budget. The current upload path prepares and reuses a fixed 8 KiB stack chunk with 256-byte rows per `Queue::write_texture` call. At the 256-copy frame cap, telemetry reports at most 2 MiB of padded staging input per frame; this is CPU-side write data, not a claim that wgpu retains 2 MiB of resident GPU staging. Wgpu/backend-managed transient staging is not an app-owned buffer and its resident high-water is not exposed. Surface images, egui allocations, and driver/backend-private resources remain unknown, so these subtotals are lower bounds rather than complete GPU high-water marks. Process RSS is not the charter's application-owned CPU storage measure. Startup allocations and fixture-preparation latency are separate from steady-state measurements.
 
 ## Fixture roles and held-out validation
 
