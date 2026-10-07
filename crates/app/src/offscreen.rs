@@ -23,7 +23,12 @@ struct OffscreenGpu {
     egui_renderer: egui_wgpu::Renderer,
 }
 
-pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result<(), String> {
+pub(super) fn run(
+    policy: PolicyChoice,
+    fixture: FixtureId,
+    seconds: u64,
+    world_size: u32,
+) -> Result<(), String> {
     println!(
         "OFFSCREEN_CAPTURE_START policy={} seconds={seconds} target={WIDTH}x{HEIGHT} cadence_hz=60 presentation=none",
         policy.name()
@@ -31,6 +36,7 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
     let mut demo = Demo::new_with_size(world_size, world_size)
         .map_err(|error| format!("simulation: {error}"))?;
     demo.set_policy(policy);
+    demo.select_fixture(fixture);
     demo.start_fixture()
         .map_err(|error| format!("initial fixture: {error}"))?;
 
@@ -52,6 +58,7 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
     let mut capture_started = None;
     let mut run = PolicySmoke {
         capture_intervals_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        capture_sim_cpu_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         ..PolicySmoke::default()
     };
     let mut frame_number = 0_u32;
@@ -314,14 +321,18 @@ pub(super) fn run(policy: PolicyChoice, seconds: u64, world_size: u32) -> Result
             last_tick = None;
             capture_started = Some(Instant::now());
             println!(
-                "OFFSCREEN_CAPTURE_STARTED policy={} target={}x{} fixture=mixed-overload-v1",
+                "OFFSCREEN_CAPTURE_STARTED policy={} target={}x{} fixture={}-v1",
                 policy.name(),
                 WIDTH,
-                HEIGHT
+                HEIGHT,
+                cascade_sim::fixtures::ScenarioDescriptor::get(fixture).name()
             );
         } else if let Some(started) = capture_started {
             let run_frames = &mut run;
             run_frames.frames = run_frames.frames.saturating_add(1);
+            run_frames
+                .capture_sim_cpu_ns
+                .push((sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
             run_frames.last_pending = sim_metrics.slice.pending_cells;
             run_frames.max_pending = run_frames
                 .max_pending

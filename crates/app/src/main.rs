@@ -9,6 +9,8 @@ use std::time::Instant;
 
 use image::ImageEncoder;
 
+use cascade_sim::fixtures::FixtureId;
+
 use cascade_app::{
     Ack, AckState, ActionKind, BRUSH_CELLS_PER_FRAME, CHUNK_CELLS, CHUNK_SIZE, Camera, ChunkCoord,
     DEMO_HEIGHT, DEMO_WIDTH, Demo, Feel, FocusKind, FocusRect, FrameHistory, MAX_CHUNKS_PER_FRAME,
@@ -39,6 +41,7 @@ const STAGING_PADDING_BYTES_PER_CHUNK: usize = STAGING_BYTES_PER_CHUNK - CHUNK_C
 #[derive(Clone, Copy)]
 struct CaptureConfig {
     policy: PolicyChoice,
+    fixture: FixtureId,
     seconds: u64,
 }
 
@@ -113,6 +116,7 @@ struct PolicySmoke {
     p99_frame_interval_ns: u64,
     capture_intervals_ns: Vec<u64>,
     capture_interval_drops: u64,
+    capture_sim_cpu_ns: Vec<u64>,
 }
 
 struct Smoke {
@@ -207,7 +211,12 @@ fn main() {
         let capture = args
             .capture
             .expect("offscreen capture requires a capture policy");
-        if let Err(error) = offscreen::run(capture.policy, capture.seconds, args.world_size) {
+        if let Err(error) = offscreen::run(
+            capture.policy,
+            capture.fixture,
+            capture.seconds,
+            args.world_size,
+        ) {
             eprintln!("offscreen capture: {error}");
             std::process::exit(1);
         }
@@ -252,6 +261,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut world_size = DEMO_WIDTH;
     let mut screenshot_path = None;
     let mut capture_policy = None;
+    let mut capture_fixture = FixtureId::MixedOverload;
     let mut capture_seconds = 60_u64;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut index = 0;
@@ -278,6 +288,21 @@ fn parse_args() -> Result<CliArgs, String> {
                                 .into(),
                         ),
                     });
+                index += 1;
+            }
+            "--fixture" => {
+                let value = args.get(index + 1).ok_or("missing value for --fixture")?;
+                capture_fixture = match value.as_str() {
+                    "quiet-world" => FixtureId::QuietWorld,
+                    "explosive-lattice" => FixtureId::ExplosiveLattice,
+                    "sand-release" => FixtureId::SandRelease,
+                    "reservoir-breach" => FixtureId::ReservoirBreach,
+                    "burning-forest" => FixtureId::BurningForest,
+                    "dirty-world-sweep" => FixtureId::DirtyWorldSweep,
+                    "tiny-capacity" => FixtureId::TinyCapacity,
+                    "mixed-overload" => FixtureId::MixedOverload,
+                    _ => return Err("unknown fixture; use a section-12 fixture name".into()),
+                };
                 index += 1;
             }
             "--capture-seconds" => {
@@ -309,7 +334,7 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "cascade-app [--smoke] [--offscreen-capture --capture-policy POLICY --capture-seconds N] [--world-size N] [--screenshot PATH] [--capture-policy POLICY --capture-seconds N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. --smoke runs the native three-policy check. --capture-policy runs one windowed 4096x4096 mixed-overload policy for the requested wall duration. --offscreen-capture runs the same policy into a fixed 1920x1080 GPU texture without a window or surface. --screenshot writes a PNG from GPU readback after the measured smoke frames.",
+                    "cascade-app [--smoke] [--offscreen-capture --capture-policy POLICY --fixture FIXTURE --capture-seconds N] [--world-size N] [--screenshot PATH] [--capture-policy POLICY --fixture FIXTURE --capture-seconds N]\n\nDefault world: {DEMO_WIDTH}x{DEMO_HEIGHT}; supported sizes are multiples of 32 through {}. --smoke runs the native three-policy check. --capture-policy runs one windowed 4096x4096 fixture/policy for the requested wall duration; --fixture defaults to mixed-overload. --offscreen-capture runs the same policy into a fixed 1920x1080 GPU texture without a window or surface. --screenshot writes a PNG from GPU readback after the measured smoke frames.",
                     cascade_app::MAX_WORLD_AXIS
                 );
                 std::process::exit(0);
@@ -332,6 +357,7 @@ fn parse_args() -> Result<CliArgs, String> {
     }
     let capture = capture_policy.map(|policy| CaptureConfig {
         policy,
+        fixture: capture_fixture,
         seconds: capture_seconds,
     });
     Ok(CliArgs {
@@ -359,6 +385,7 @@ impl App {
         };
         if let Some(capture) = capture {
             demo.set_policy(capture.policy);
+            demo.select_fixture(capture.fixture);
         } else if !smoke && focus_linked() {
             demo.set_policy(PolicyChoice::BoundedFocus);
         }
@@ -404,6 +431,7 @@ impl App {
                 PolicyChoice::Traditional => &mut smoke.traditional,
             };
             run.capture_intervals_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+            run.capture_sim_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
         }
         let (width, height) = demo.dimensions();
         let chunks_x = width / CHUNK_SIZE;
@@ -1364,7 +1392,8 @@ impl App {
                     event_loop.exit();
                     return;
                 }
-                self.demo.set_destroy_held(true);
+                let quiet_baseline = capture.fixture == FixtureId::QuietWorld;
+                self.demo.set_destroy_held(!quiet_baseline);
                 self.feel.clear_latencies();
                 self.history = FrameHistory::default();
                 self.last_present = None;
@@ -1377,8 +1406,11 @@ impl App {
                 run.last_pending = sim_metrics.slice.pending_cells;
                 smoke.capture_started = Some(Instant::now());
                 println!(
-                    "SMOKE_CAPTURE_STARTED policy={policy_label} seconds={} render={}x{} load_gate=external",
-                    capture.seconds, render_size.0, render_size.1
+                    "SMOKE_CAPTURE_STARTED policy={policy_label} fixture={} seconds={} render={}x{} load_gate=external",
+                    cascade_sim::fixtures::ScenarioDescriptor::get(capture.fixture).name(),
+                    capture.seconds,
+                    render_size.0,
+                    render_size.1
                 );
             }
             return;
@@ -1390,6 +1422,8 @@ impl App {
             PolicyChoice::Traditional => &mut smoke.traditional,
         };
         run.frames = run.frames.saturating_add(1);
+        run.capture_sim_cpu_ns
+            .push((self.sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
         run.last_pending = sim_metrics.slice.pending_cells;
         run.max_pending = run
             .max_pending
@@ -1434,11 +1468,13 @@ impl App {
                 run.slow_frame_slice = sim_metrics.slice;
             }
         }
-        self.scripted_player_action(run.frames);
+        if capture.fixture != FixtureId::QuietWorld {
+            self.scripted_player_action(run.frames);
+        }
         if smoke.capture_started.is_some_and(|started| {
             started.elapsed() >= std::time::Duration::from_secs(capture.seconds)
         }) {
-            if !has_minimum_action_samples(&self.feel) {
+            if capture.fixture != FixtureId::QuietWorld && !has_minimum_action_samples(&self.feel) {
                 smoke.failed = Some(format!(
                     "{policy_label} action stream sample counts below 30 per action type"
                 ));
@@ -2500,8 +2536,16 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         }
     };
     let over_33_3_ms = intervals.iter().filter(|&&ns| ns > 33_333_333).count();
+    let mut sim_cpu = run.capture_sim_cpu_ns.clone();
+    sim_cpu.sort_unstable();
+    let sim_p99_ms = if sim_cpu.is_empty() {
+        0.0
+    } else {
+        let rank = (99 * sim_cpu.len()).div_ceil(100).max(1);
+        sim_cpu[rank - 1] as f64 / 1_000_000.0
+    };
     println!(
-        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} max_sim_cpu_ms={:.3} max_sim_credits={}/{} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
+        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} sim_p99_ms={:.3} sim_samples={} max_sim_cpu_ms={:.3} max_sim_credits={}/{} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
         intervals.len(),
         percentile(50) as f64 / 1_000_000.0,
         percentile(95) as f64 / 1_000_000.0,
@@ -2509,6 +2553,8 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         intervals.last().copied().unwrap_or(0) as f64 / 1_000_000.0,
         over_33_3_ms,
         run.capture_interval_drops,
+        sim_p99_ms,
+        sim_cpu.len(),
         run.max_sim_cpu_ms,
         run.max_sim_slice.charged,
         run.max_sim_slice.allowed,
