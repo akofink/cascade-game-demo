@@ -1,6 +1,6 @@
 # Heavy-fixture slice p99 offscreen follow-up v1
 
-Status: task-branch diagnostic; not windowed acceptance evidence. The eight-cell windowed rerun remains deferred until the operator returns and visible GUI availability is independently confirmed.
+Status: offscreen diagnostic; not windowed acceptance evidence. A single bounded post-PR #49 functional attempt did not confirm visible window presentation. Per follow-up 4, stop windowed attempts and retain the explicit evidence gap.
 
 Candidate profile: 1,000,000 credits/slice, selection probe cost 1, default focus share 5%, background minimum service 20%. Release app, 4096² world, 1920×1080 offscreen target, 60-second scripted capture. Offscreen runs measure CPU simulation slices and the app loop; they do not measure visible presentation, display timing, or scanout. These captures were not accepted as the quiet-machine matrix and must not replace the published windowed results.
 
@@ -38,8 +38,12 @@ The 5% candidate's final pending count is about 55% lower, with effectively unch
 
 Lane attribution places selection work near the evaluation path. A task-branch source experiment caches focus-ring availability and skips a redundant empty focus-ring pop in FIFO/background selection; the measured selector interval now includes this queue-pop choice. One instrumented burning-forest FIFO capture measured selection p99 2.733 ms and 37.8 ns/probe on average. Three uninstrumented captures measured total slice p99 4.139, 4.121, and 4.189 ms (mean 4.150 ms). This is only a small change against historical FIFO captures and is not a paired or decisive improvement. A selection cost-2 experiment worsened burning-forest FIFO p99 to 4.757 ms. A cost-4 experiment improved FIFO p99 in three cells, but reservoir-breach focus p99 rose to 4.269 ms; three further captures reproduced 4.212, 4.201, and 4.354 ms, against the merged cost-1 result of 3.972 ms. Its accepted 72,000-slice burst ended at 103,261 pending channels but completed 2.728B quanta (11.4% fewer than cost 1), without reaching a stable window. Cost 4 was reverted because it regressed a passing focus cell. A cost-6 experiment brought one offscreen matrix to focus p99 3.799–3.987 ms and FIFO p99 3.985–4.149 ms, but 3/4 FIFO cells still missed 4 ms. Its accepted burst completed 2.536B quanta and ended with 129,943 pending channels, versus 3.077B quanta and 120,560 pending at cost 1 with the same focus share. Because this regressed recovery relative to the merged profile and reduced work throughput by 17.6%, cost 6 was reverted; selection cost remains 1. Bit-rotation and lane-table lookup experiments likewise did not establish a reliable gain and were reverted.
 
-The selector change does not resolve any FIFO cell's 4 ms miss. Keep investigating FIFO source costs before treating this task as complete.
+The operator accepted the FIFO miss at approximately 4.2-4.4 ms; no further FIFO diagnosis was requested. The selector change does not resolve any FIFO cell's 4 ms miss.
+
+## Post-PR #49 windowed confirmation
+
+On current-main commit `dd05773`, one bounded native functional check was attempted after the operator authorized waking the console without unlocking it. `caffeinate -u -t 5` was used; the foreground app before launch was `ghostty`. The release app was started with its native smoke/screenshot path and a 60-second process bound. System Events reported process `cascade-app` visible but not frontmost, with no accessible window; asking for its first window returned an invalid-index error. The app produced no smoke output or screenshot and was terminated at the bound. No visible frame presentation was confirmed, and no accepted windowed captures were collected. No credentials were entered or lock screen interaction made. No further windowed attempts were made.
 
 ## Verification and next steps
 
-The retained candidate preserves the 1M-credit allowance and selection cost 1. Workspace format, Clippy, and tests must pass before publishing. The windowed eight-cell acceptance rerun is still required when the operator returns. Offscreen measurements here are diagnostic only.
+The retained candidate preserves the 1M-credit allowance and selection cost 1. Workspace format, Clippy, and tests passed before publication. Windowed acceptance remains incomplete; this report's offscreen measurements are diagnostic only and do not substitute for visible-window captures.
