@@ -52,10 +52,16 @@ def parse_feel(text: str) -> dict[str, str] | None:
     return parse_record(text, "SMOKE_FEEL ")
 
 
-def validate_capture(text: str, fixture: str, policy: str, seconds: int) -> tuple[dict[str, str] | None, dict[str, str] | None, list[str]]:
+def validate_capture(
+    text: str, fixture: str, policy: str, seconds: int, mode: str = "windowed"
+) -> tuple[dict[str, str] | None, dict[str, str] | None, list[str]]:
     metrics = parse_capture(text)
     feel = parse_feel(text)
-    starts = [line for line in text.splitlines() if line.startswith("SMOKE_CAPTURE_STARTED ")]
+    offscreen = mode == "offscreen"
+    starts = [
+        line for line in text.splitlines()
+        if line.startswith("OFFSCREEN_CAPTURE_STARTED " if offscreen else "SMOKE_CAPTURE_STARTED ")
+    ]
     feel_lines = [line for line in text.splitlines() if line.startswith("SMOKE_FEEL ")]
     reasons = []
     if metrics is None or len(starts) != 1 or feel is None or len(feel_lines) != 1:
@@ -79,6 +85,42 @@ def validate_capture(text: str, fixture: str, policy: str, seconds: int) -> tupl
         measurements.extend(float(feel[key]) for key in ("camera_p95_ms", "paint_p95_ms", "ignite_p95_ms", "detonate_p95_ms"))
     except ValueError:
         return metrics, feel, ["invalid numeric capture telemetry"]
+    policy_label = f"offscreen-{policy}" if offscreen else policy
+    if offscreen:
+        display_policy = policy.replace("-", " ")
+        run_start_lines = [line for line in text.splitlines() if line.startswith("OFFSCREEN_CAPTURE_START ")]
+        capture_result_lines = [line for line in text.splitlines() if line.startswith("OFFSCREEN_CAPTURE_RESULT ")]
+        capture_result = parse_record(text, "OFFSCREEN_CAPTURE_RESULT ") or {}
+        try:
+            result_frames = int(capture_result.get("frames", ""))
+        except ValueError:
+            result_frames = -1
+        capture_valid = (
+            metrics.get("policy") == policy_label
+            and feel.get("policy") == policy_label
+            and len(run_start_lines) == 1
+            and f"policy={display_policy} seconds={seconds} target=1920x1080 cadence_hz=60 presentation=none" in run_start_lines[0]
+            and len(starts) == 1
+            and f"policy={display_policy} target=1920x1080 fixture={fixture}-v1" in starts[0]
+            and len(capture_result_lines) == 1
+            and f"policy={display_policy} " in capture_result_lines[0]
+            and frames <= result_frames <= frames + 1
+            and result_frames == sim_samples
+            and capture_result.get("target") == "1920x1080"
+            and capture_result.get("cadence_hz") == "60"
+            and capture_result.get("display_presentation") == "not_measured"
+        )
+    else:
+        capture_valid = (
+            metrics.get("policy") == policy_label
+            and feel.get("policy") == policy_label
+            and any(
+                f"fixture={fixture} " in line
+                and f"seconds={seconds} " in line
+                and "render=1920x1080 " in line
+                for line in starts
+            )
+        )
     if (
         frames <= 0
         or any(count < 0 for count in counts)
@@ -87,14 +129,7 @@ def validate_capture(text: str, fixture: str, policy: str, seconds: int) -> tupl
         or drops != 0
         or sim_samples < frames
         or sim_samples > frames + 1
-        or metrics.get("policy") != policy
-        or feel.get("policy") != policy
-        or not any(
-            f"fixture={fixture} " in line
-            and f"seconds={seconds} " in line
-            and "render=1920x1080 " in line
-            for line in starts
-        )
+        or not capture_valid
     ):
         reasons.append("capture duration, fixture, policy, or sample completeness mismatch")
     return metrics, feel, reasons
@@ -116,8 +151,17 @@ def markdown_rows(text: str, heading: str) -> list[list[str]]:
     return rows[1:] if rows else []
 
 
-def load_report_attempts(path: pathlib.Path) -> tuple[str, str, list[dict], list[str]]:
+def load_report_attempts(
+    path: pathlib.Path, mode: str = "windowed"
+) -> tuple[str, str, list[dict], list[str]]:
     text = path.read_text(encoding="utf-8")
+    expected_title = (
+        "# Native all-fixture offscreen acceptance suite v1"
+        if mode == "offscreen"
+        else "# Native all-fixture acceptance suite v1"
+    )
+    if expected_title not in text.splitlines():
+        raise ValueError(f"cannot resume report in a different capture mode: {path}")
     source = re.search(r"^(?:App )?[Ss]ource revision: `([^`]+)`", text, re.MULTILINE)
     started = re.search(r"^Suite started: (.+?)\s*$", text, re.MULTILINE)
     if source is None or started is None:
@@ -181,7 +225,9 @@ def load_report_attempts(path: pathlib.Path) -> tuple[str, str, list[dict], list
             continue
         if "SMOKE_RESULT ok" not in log_text:
             continue
-        metrics, feel, reasons = validate_capture(log_text, item["fixture"], item["policy"], 60)
+        metrics, feel, reasons = validate_capture(
+            log_text, item["fixture"], item["policy"], 60, mode
+        )
         if not reasons and metrics is not None and feel is not None:
             item.update(status="accepted", reason="", metrics=metrics, feel=feel)
             notes.append(
@@ -212,7 +258,9 @@ def write_report(
     started: str,
     runner_revision: str | None = None,
     resumption_notes: list[str] | None = None,
+    mode: str = "windowed",
 ) -> None:
+    offscreen = mode == "offscreen"
     accepted = [item for item in attempts if item["status"] == "accepted"]
     rejected = [item for item in attempts if item["status"] == "rejected"]
     complete = all(
@@ -220,19 +268,26 @@ def write_report(
             if item["fixture"] == fixture and item["policy"] == policy) >= 3
         for fixture in FIXTURES for policy in POLICIES
     )
+    status = (
+        f"offscreen matrix {'complete' if complete else 'incomplete'}; {len(accepted)}/72 accepted captures; "
+        f"{len(rejected)} rejected attempts; windowed presentation confirmation pending."
+        if offscreen
+        else f"{'complete' if complete else 'incomplete'}; {len(accepted)}/72 accepted captures; {len(rejected)} rejected attempts."
+    )
     lines = [
-        "# Native all-fixture acceptance suite v1",
+        "# Native all-fixture offscreen acceptance suite v1" if offscreen else "# Native all-fixture acceptance suite v1",
         "",
-        f"Status: {'complete' if complete else 'incomplete'}; {len(accepted)}/72 accepted captures; {len(rejected)} rejected attempts.",
+        f"Status: {status}",
         "",
         f"App source revision: `{revision}`  ",
         f"Suite runner revision: `{runner_revision or revision}`  ",
         f"Suite started: {started}  ",
         f"Reference host: `{os.uname().nodename}`, MacBook Air (Mac14,2), Apple M2/8 CPU cores/16 GB RAM/integrated GPU, macOS {platform.mac_ver()[0]}; Rust `{subprocess.check_output(['rustc', '--version'], text=True).strip()}`.",
-        f"Capture: release app, 4096² world, 1920×1080, 60 Hz target, profile `m2-16gb-v3`; Cargo.lock SHA-256 `{hashlib.sha256((ROOT / 'Cargo.lock').read_bytes()).hexdigest()}`.",
+        f"Capture: release app, 4096² world, 1920×1080, 60 Hz {'offscreen cadence' if offscreen else 'target'}, profile `m2-16gb-v3`; Cargo.lock SHA-256 `{hashlib.sha256((ROOT / 'Cargo.lock').read_bytes()).hexdigest()}`.",
         "Power mode, thermal state, background activity, and physical display refresh are not controlled.",
         "",
-        "Each fixture/policy cell requires three accepted 60-second captures. A run is accepted only when one-minute load is below 3 both immediately before and after the process, the app exits successfully with `SMOKE_RESULT ok` after its 60-second capture timer, reports the requested fixture/policy at 1920×1080 with nonzero frame samples, has no interval drops, and has complete slice telemetry. Frame counts are the actual number of presented intervals, not an assumed 60 Hz count. Rejected attempts are retained below and never contribute to accepted percentiles.",
+        "Each fixture/policy cell requires three accepted 60-second captures. A run is accepted only when one-minute load is below 3 both immediately before and after the process, the app exits successfully with `SMOKE_RESULT ok` after its 60-second capture timer, reports the requested fixture/policy at 1920×1080 with nonzero frame samples, has no interval drops, and has complete slice telemetry. Frame counts are actual measured loop intervals, not an assumed 60 Hz count. Rejected attempts are retained below and never contribute to accepted percentiles.",
+        *( ["", "## Charter acceptance scope", "", "These captures are offscreen GPU-texture runs, not windowed evidence. They report app-side simulation slice CPU and fixed-cadence loop intervals. They do not measure display presentation, vsync, compositor, scanout, or visible camera/UI response. They cannot satisfy the presented frame-interval, camera/UI feedback p95, player action-to-first-visible-effect p95, or window/surface-behavior criteria. Treat offscreen frame-interval and scripted action-to-effect proxy results as diagnostic only for those criteria; windowed confirmation remains pending with the operator present."] if offscreen else []),
         "",
         "## Accepted captures",
         "",
@@ -246,7 +301,9 @@ def write_report(
             f"{item['load_before']}/{item['load_after']} | {m['frames']} | {m['p99_ms']} | "
             f"{m['max_ms']} | {m['over_33_3_ms']} | {m['sim_p99_ms']} | {m['max_sim_cpu_ms']} |"
         )
-    lines += ["", "## Section 15 checklist rows", "", "| Fixture | Policy | Accepted runs | Frame p99 ≤20 ms | Slice p99 ≤4 ms | >33.3 ms count / max disclosed |", "|---|---|---:|---|---|---|"]
+    checklist_heading = "## Offscreen section 15 diagnostic rows" if offscreen else "## Section 15 checklist rows"
+    frame_column = "Offscreen loop p99 ≤20 ms (diagnostic)" if offscreen else "Frame p99 ≤20 ms"
+    lines += ["", checklist_heading, "", f"| Fixture | Policy | Accepted runs | {frame_column} | Slice p99 ≤4 ms | >33.3 ms count / max disclosed |", "|---|---|---:|---|---|---|"]
     for fixture in FIXTURES:
         for policy in POLICIES:
             rows = [item for item in accepted if item["fixture"] == fixture and item["policy"] == policy]
@@ -262,7 +319,12 @@ def write_report(
                 f"{'met' if slice_target else 'unmet' if target_runs else 'incomplete'} | "
                 f"{'reported' if disclosure else 'incomplete'} |"
             )
-    lines += ["", "## Interaction feedback samples", "", "These CPU-side event/action-to-visible-upload p95 values use the app's documented method. Counts below 30 are descriptive only; quiet-world intentionally has no scripted interaction samples.", "", "| Fixture | Policy | Rep | Camera n / p95 ms | Paint n / p95 ms | Ignite n / p95 ms | Detonate n / p95 ms |", "|---|---|---:|---:|---:|---:|---:|"]
+    feel_description = (
+        "Offscreen scripted camera/action-to-CPU-effect/upload-queue-write proxies only; these are not visible response measurements. Counts below 30 are descriptive only; quiet-world intentionally has no scripted interaction samples."
+        if offscreen else
+        "These CPU-side event/action-to-visible-upload p95 values use the app's documented method. Counts below 30 are descriptive only; quiet-world intentionally has no scripted interaction samples."
+    )
+    lines += ["", "## Interaction feedback samples", "", feel_description, "", "| Fixture | Policy | Rep | Camera n / p95 ms | Paint n / p95 ms | Ignite n / p95 ms | Detonate n / p95 ms |", "|---|---|---:|---:|---:|---:|---:|"]
     for item in accepted:
         feel = item.get("feel", {})
         lines.append(
@@ -288,7 +350,11 @@ def write_report(
         "",
         "## Interpretation and limits",
         "",
-        "Frame intervals are native windowed event-loop intervals; they include presentation pacing and are not GPU duration. Slice CPU values are monotonic wall-time samples around the app's simulation dispatch, not thread CPU time. Fixture captures do not add external disturbances or player actions, except mixed-overload, which uses the app's scripted sustained-overload action stream to exercise focus latency. The load gate does not exclude all OS/driver interference.",
+        (
+            "Frame intervals are offscreen fixed-cadence loop intervals around GPU command submission; they exclude presentation, vsync, compositor, and scanout, and are not GPU duration. Slice CPU values are monotonic wall-time samples around the app's simulation dispatch, not thread CPU time. Mixed-overload uses the scripted action stream, but its measured effect/upload points do not establish visible response. The load gate does not exclude all OS/driver interference."
+            if offscreen else
+            "Frame intervals are native windowed event-loop intervals; they include presentation pacing and are not GPU duration. Slice CPU values are monotonic wall-time samples around the app's simulation dispatch, not thread CPU time. Fixture captures do not add external disturbances or player actions, except mixed-overload, which uses the app's scripted sustained-overload action stream to exercise focus latency. The load gate does not exclude all OS/driver interference."
+        ),
         "",
         "Raw per-attempt logs are retained locally under `benchmarks/tmp/` and are not committed.",
         "",
@@ -301,7 +367,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--resume", action="store_true", help="resume from the existing report without repeating accepted captures")
     parser.add_argument("--binary", type=pathlib.Path, help="use an existing release binary instead of building")
-    parser.add_argument("--output", type=pathlib.Path, default=ROOT / "benchmarks/results/native-acceptance-v1.md")
+    parser.add_argument("--mode", choices=("windowed", "offscreen"), default="windowed", help="capture mode; offscreen results use a separate report and log directory")
+    parser.add_argument("--output", type=pathlib.Path, help="report path; defaults to a mode-specific file under benchmarks/results")
     parser.add_argument("--fixtures", nargs="+", choices=FIXTURES, default=FIXTURES, help=argparse.SUPPRESS)
     parser.add_argument("--policies", nargs="+", choices=POLICIES, default=POLICIES, help=argparse.SUPPRESS)
     parser.add_argument("--repetitions", type=int, default=3, help=argparse.SUPPRESS)
@@ -321,15 +388,17 @@ def main() -> int:
     if not args.no_caffeinate and shutil.which("caffeinate") is None:
         parser.error("caffeinate is required on the reference macOS host; use --no-caffeinate only for functional tests")
 
-    log_dir = ROOT / "benchmarks/tmp/native-acceptance"
+    mode_suffix = "-offscreen" if args.mode == "offscreen" else ""
+    log_dir = ROOT / f"benchmarks/tmp/native-acceptance{mode_suffix}"
     log_dir.mkdir(parents=True, exist_ok=True)
-    output = args.output if args.output.is_absolute() else ROOT / args.output
+    output = args.output or ROOT / f"benchmarks/results/native-acceptance{mode_suffix}-v1.md"
+    output = output if output.is_absolute() else ROOT / output
     runner_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if args.resume:
         if not output.is_file():
             parser.error(f"cannot resume; report does not exist: {output}")
         try:
-            revision, started, attempts, resume_notes = load_report_attempts(output)
+            revision, started, attempts, resume_notes = load_report_attempts(output, args.mode)
         except (OSError, ValueError) as error:
             parser.error(str(error))
         unresolved = [item for item in attempts if item["status"] == "rejected"
@@ -345,7 +414,7 @@ def main() -> int:
         started = dt.datetime.now().astimezone().isoformat(timespec="seconds")
         attempts = []
         resume_notes = []
-    write_report(output, revision, attempts, started, runner_revision, resume_notes)
+    write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
     fixture_policy_rep = [
         (fixture, policy, rep)
         for rep in range(1, args.repetitions + 1)
@@ -366,7 +435,7 @@ def main() -> int:
                     base.update(status="rejected", reason="pre-run one-minute load not below 3")
                     attempts.append(base)
                     print(f"REJECT {fixture}/{policy} rep={rep} load={before:.2f} before launch", flush=True)
-                    write_report(output, revision, attempts, started, runner_revision, resume_notes)
+                    write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
                     time.sleep(5)
                     continue
                 log_name = f"{fixture}-{policy}-rep{rep}-attempt{attempt_number}.log"
@@ -374,6 +443,8 @@ def main() -> int:
                 base["log"] = str(log_path.relative_to(ROOT))
                 command = [str(binary), "--capture-policy", policy, "--fixture", fixture,
                            "--capture-seconds", str(args.seconds), "--world-size", "4096"]
+                if args.mode == "offscreen":
+                    command.insert(1, "--offscreen-capture")
                 if not args.no_caffeinate and shutil.which("caffeinate"):
                     command = ["caffeinate", "-dimsu", *command]
                 print(f"RUN {fixture}/{policy} rep={rep} attempt={attempt_number} load={before:.2f}", flush=True)
@@ -382,7 +453,9 @@ def main() -> int:
                 after = load_one()
                 base["load_after"] = fmt_load(after)
                 text = log_path.read_text(encoding="utf-8", errors="replace")
-                metrics, feel, capture_reasons = validate_capture(text, fixture, policy, args.seconds)
+                metrics, feel, capture_reasons = validate_capture(
+                    text, fixture, policy, args.seconds, args.mode
+                )
                 reasons = []
                 if before >= LOAD_LIMIT or after >= LOAD_LIMIT:
                     reasons.append("one-minute load gate failed")
@@ -419,12 +492,12 @@ def main() -> int:
                     base.update(status="accepted", reason="", metrics=metrics, feel=feel)
                     attempts.append(base)
                     print(f"ACCEPT {fixture}/{policy} rep={rep} load={before:.2f}/{after:.2f} p99={metrics['p99_ms']} ms", flush=True)
-                write_report(output, revision, attempts, started, runner_revision, resume_notes)
+                write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
     except KeyboardInterrupt:
         print("Interrupted; partial results were written.", file=sys.stderr)
         return 130
     finally:
-        write_report(output, revision, attempts, started, runner_revision, resume_notes)
+        write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
     return 0
 
 
