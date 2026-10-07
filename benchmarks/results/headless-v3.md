@@ -71,6 +71,22 @@ Three paired full-size repetitions per policy used mixed-overload, 1,200 seeded 
 
 Traditional's first measured slice reduced pending backlog to 194,469, then backlog peaked at 3,236,408 and ended at 272,072; it did not settle. Bounded backlog ended at 2,653,611. The distinct service and latency numbers include traditional's two mandatory world sweeps each slice. Completion time is right-censored beyond this 1,800-slice capture.
 
+### Extended bounded recovery follow-up (36,000 slices)
+
+A new release-mode 4096² bounded run used the current 1,000,000-credit profile, mixed-overload-v1, and a finite 1,200-command stream (64 attempted per slice) followed by 36,000 measured slices with no new requests after the stream ended at slice 19. The one-minute system load was 2.41 before and 2.97 after, both below the `<3` quiet-host gate. All 1,200 commands were accepted. Preparation (606 slices / 406 ms) and warm-up (120 slices / 79 ms) were outside measurement.
+
+| Metric | Result |
+| --- | ---: |
+| Measured slices / wall window | 36,000 / 57.999 s |
+| Slices after final input | 35,981 |
+| Completed work quanta | 2,117,631,240 |
+| Backlog high-water / final pending channels | 8,390,120 / 696,272 |
+| Final command backlog | 0 |
+| Empty samples / verified stable windows | 0 / 0 |
+| Recovery duration | right-censored beyond 36,000 slices and 57.999 s |
+
+Stable means 60 consecutive post-input slices with zero pending channels, zero commands, and zero ready jobs. With no queued work in those slices, authoritative cell contents cannot change; a continuing water-work backlog deliberately does not count as settled. This run never had even one empty sample, so it neither drained nor reached the stable criterion. The nonzero final backlog shows unresolved work, but this capture does not isolate which material or rule sustained it; do not attribute the remaining backlog solely to flowing water. Raw CSV was streamed to a summary and is not committed.
+
 ## Method and machine disclosure
 
 The benchmark measures wall-clock `World::step` time, not thread CPU time; OS preemption is included. Fixture preparation and warm-up are timed separately from measured slices. When warm-up is enabled, the fixture is prepared again before measured slice 1; world allocation is excluded. The benchmark's `complete` field means no pending channels or commands at that sample and is not a proof of long-term stability.
