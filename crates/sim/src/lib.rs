@@ -33,6 +33,8 @@ static RECOVERY_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "quantum-timing")]
 static COMMAND_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "quantum-timing")]
+static SELECTION_TIMING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "quantum-timing")]
 fn should_sample_quantum(sequence: &AtomicU64) -> bool {
     sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % QUANTUM_TIMING_SAMPLE_INTERVAL == 0
 }
@@ -275,6 +277,7 @@ impl Default for ServiceShares {
         }
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct Job {
     cell: CellId,
@@ -367,6 +370,7 @@ pub struct SliceMetrics {
     pub action_effect_candidates: u32,
     pub evaluation_ns: u64,
     pub blast_ns: u64,
+    pub selection_ns: u64,
     pub recovery_ns: u64,
     pub focus_evaluation_ns: u64,
     pub background_evaluation_ns: u64,
@@ -1648,6 +1652,9 @@ impl World {
             remaining -= self.costs.selection.0;
             m.charged += self.costs.selection.0;
             m.selections += 1;
+            #[cfg(feature = "quantum-timing")]
+            let selection_started =
+                should_sample_quantum(&SELECTION_TIMING_SEQUENCE).then(Instant::now);
             let phase = self.lane_cursor;
             self.lane_cursor += 1;
             if self.lane_cursor == 100 {
@@ -1655,15 +1662,15 @@ impl World {
             }
             let focus_eval = self.focus_enabled && self.focus_eval_ready.len() > 0;
             let focus_blast = self.focus_enabled && self.focus_blast_ready.len() > 0;
-            let focus_demand = focus_eval || focus_blast;
             let background_eval = self.eval_ready.len() > 0
                 || (!self.focus_enabled && self.focus_eval_ready.len() > 0);
             let background_blast = self.blast_ready.len() > 0
                 || (!self.focus_enabled && self.focus_blast_ready.len() > 0);
-            let background_demand = background_eval
-                || background_blast
-                || self.pending_count > 0
-                || self.command_len() > 0;
+            let recovery_demand = self.pending_count > 0;
+            let command_demand = self.command_len() > 0;
+            let focus_demand = focus_eval || focus_blast;
+            let background_demand =
+                background_eval || background_blast || recovery_demand || command_demand;
             let minimum_background_turn = (background_eval || background_blast)
                 && phase >= self.shares.focus_percent
                 && (phase as u16)
@@ -1691,8 +1698,8 @@ impl World {
                 let demanded = [
                     background_eval,
                     background_blast,
-                    self.pending_count > 0,
-                    self.command_len() > 0,
+                    recovery_demand,
+                    command_demand,
                 ];
                 (0..4)
                     .map(|offset| (phase as usize % 4 + offset) % 4)
@@ -1700,6 +1707,12 @@ impl World {
                     .map_or(6, |index| index as u8 + 2)
             };
             let pick_focus = lane == 0 || lane == 1;
+            #[cfg(feature = "quantum-timing")]
+            if let Some(started) = selection_started {
+                m.selection_ns = m.selection_ns.saturating_add(
+                    started.elapsed().as_nanos() as u64 * QUANTUM_TIMING_SAMPLE_INTERVAL,
+                );
+            }
             let (cost, job, command) = match lane {
                 0 => self.focus_eval_ready.pop().map_or((None, None, None), |j| {
                     (Some(self.costs.evaluate.0), Some(j), None)
@@ -1740,7 +1753,7 @@ impl World {
                         (Some(self.costs.blast.0), Some(j), None)
                     })
                 }
-                4 if self.pending_count > 0 => (Some(self.costs.recovery.0), None, None),
+                4 if recovery_demand => (Some(self.costs.recovery.0), None, None),
                 4 => (None, None, None),
                 _ => {
                     let c = self.deferred_command.take().or_else(|| self.commands.pop());

@@ -134,6 +134,8 @@ struct PolicySmoke {
     #[cfg(feature = "quantum-diagnostics")]
     capture_command_ns: Vec<u64>,
     #[cfg(feature = "quantum-diagnostics")]
+    capture_selection_ns: Vec<u64>,
+    #[cfg(feature = "quantum-diagnostics")]
     capture_scheduler_overhead_ns: Vec<u64>,
 }
 
@@ -459,6 +461,7 @@ impl App {
                 run.capture_background_blast_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
                 run.capture_recovery_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
                 run.capture_command_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+                run.capture_selection_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
                 run.capture_scheduler_overhead_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
             }
         }
@@ -1465,12 +1468,15 @@ impl App {
                 .push(sim_metrics.slice.background_blast_ns);
             run.capture_recovery_ns.push(sim_metrics.slice.recovery_ns);
             run.capture_command_ns.push(sim_metrics.slice.command_ns);
+            run.capture_selection_ns
+                .push(sim_metrics.slice.selection_ns);
             run.capture_scheduler_overhead_ns.push(
                 ((self.sim_cpu_ms.max(0.0) * 1_000_000.0) as u64).saturating_sub(
                     sim_metrics.slice.evaluation_ns
                         + sim_metrics.slice.blast_ns
                         + sim_metrics.slice.recovery_ns
-                        + sim_metrics.slice.command_ns,
+                        + sim_metrics.slice.command_ns
+                        + sim_metrics.slice.selection_ns,
                 ),
             );
         }
@@ -2601,13 +2607,15 @@ fn print_quantum_timing(run: &PolicySmoke, label: &str) {
         }
     };
     println!(
-        "{label} focus_eval_p99_ms={:.3} background_eval_p99_ms={:.3} focus_blast_p99_ms={:.3} background_blast_p99_ms={:.3} recovery_p99_ms={:.3} command_p99_ms={:.3} scheduler_overhead_p99_ms={:.3} estimated_mean_ns_per_quantum=focus-eval:{:.1},background-eval:{:.1},focus-blast:{:.1},background-blast:{:.1},recovery:{:.1},command:{:.1} total_focus_eval={} total_background_eval={} total_focus_blast={} total_background_blast={}",
+        "{label} focus_eval_p99_ms={:.3} background_eval_p99_ms={:.3} focus_blast_p99_ms={:.3} background_blast_p99_ms={:.3} recovery_p99_ms={:.3} command_p99_ms={:.3} selection_p99_ms={:.3} selection_mean_ns_per_probe={:.1} scheduler_overhead_p99_ms={:.3} estimated_mean_ns_per_quantum=focus-eval:{:.1},background-eval:{:.1},focus-blast:{:.1},background-blast:{:.1},recovery:{:.1},command:{:.1} total_focus_eval={} total_background_eval={} total_focus_blast={} total_background_blast={}",
         timing_p99_ms(&run.capture_focus_evaluation_ns),
         timing_p99_ms(&run.capture_background_evaluation_ns),
         timing_p99_ms(&run.capture_focus_blast_ns),
         timing_p99_ms(&run.capture_background_blast_ns),
         timing_p99_ms(&run.capture_recovery_ns),
         timing_p99_ms(&run.capture_command_ns),
+        timing_p99_ms(&run.capture_selection_ns),
+        estimated_mean_ns(&run.capture_selection_ns, run.total_selections),
         timing_p99_ms(&run.capture_scheduler_overhead_ns),
         estimated_mean_ns(
             &run.capture_focus_evaluation_ns,

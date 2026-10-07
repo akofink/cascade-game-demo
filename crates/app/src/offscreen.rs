@@ -72,6 +72,8 @@ pub(super) fn run(
         #[cfg(feature = "quantum-diagnostics")]
         capture_command_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         #[cfg(feature = "quantum-diagnostics")]
+        capture_selection_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        #[cfg(feature = "quantum-diagnostics")]
         capture_scheduler_overhead_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         ..PolicySmoke::default()
     };
@@ -367,11 +369,15 @@ pub(super) fn run(
                 run_frames
                     .capture_command_ns
                     .push(sim_metrics.slice.command_ns);
+                run_frames
+                    .capture_selection_ns
+                    .push(sim_metrics.slice.selection_ns);
                 let measured_sim_ns = (sim_cpu_ms.max(0.0) * 1_000_000.0) as u64;
                 let measured_quantum_ns = sim_metrics.slice.evaluation_ns
                     + sim_metrics.slice.blast_ns
                     + sim_metrics.slice.recovery_ns
-                    + sim_metrics.slice.command_ns;
+                    + sim_metrics.slice.command_ns
+                    + sim_metrics.slice.selection_ns;
                 run_frames
                     .capture_scheduler_overhead_ns
                     .push(measured_sim_ns.saturating_sub(measured_quantum_ns));
