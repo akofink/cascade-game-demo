@@ -1,6 +1,6 @@
 # Headless recovery and quantum-cost follow-up v5
 
-Status: water-direction correction and recovery repricing are merged in `50a0fc5`; the 1,000,000-credit profile is unchanged; finite-burst recovery remains unresolved.
+Status: historical recovery baseline. The water-direction correction and recovery repricing are merged in `50a0fc5`; the 1,000,000-credit profile is unchanged. The previously unresolved finite-burst result is superseded by [headless finite-burst recovery v6](headless-burst-recovery-v6.md), which reaches a stable window at slice 134,367.
 
 ## Sampled operation timing
 

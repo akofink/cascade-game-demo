@@ -6,6 +6,7 @@
 - [Rules](docs/rules.md)
 - [Performance](docs/performance.md)
   - [Full-size headless calibration v4](benchmarks/results/headless-v4.md)
+  - [Headless finite-burst recovery v6](benchmarks/results/headless-burst-recovery-v6.md)
   - [Corrected full-size headless results v3](benchmarks/results/headless-v3.md)
   - [Player-action focus comparison v1](benchmarks/results/player-focus-v1.md)
   - [Native offscreen comparison v1](benchmarks/results/native-offscreen-v1.md)
