@@ -126,9 +126,6 @@ struct PolicySmoke {
     capture_upload_cpu_ns: Vec<u64>,
     capture_submit_cpu_ns: Vec<u64>,
     capture_frame_work_cpu_ns: Vec<u64>,
-    capture_acquire_cpu_ns: Vec<u64>,
-    capture_prepare_cpu_ns: Vec<u64>,
-    capture_present_cpu_ns: Vec<u64>,
     #[cfg(feature = "quantum-diagnostics")]
     capture_focus_evaluation_ns: Vec<u64>,
     #[cfg(feature = "quantum-diagnostics")]
@@ -198,10 +195,6 @@ struct App {
     pre_step_ready: usize,
     upload_cpu_ms: f32,
     submit_cpu_ms: f32,
-    frame_work_cpu_ns: u64,
-    acquire_cpu_ns: u64,
-    prepare_cpu_ns: u64,
-    present_cpu_ns: u64,
     last_frame_interval_ns: u64,
     last_plan: UploadPlan,
     last_upload_chunks: usize,
@@ -467,12 +460,6 @@ impl App {
             };
             run.capture_intervals_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
             run.capture_sim_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
-            run.capture_upload_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
-            run.capture_submit_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
-            run.capture_frame_work_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
-            run.capture_acquire_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
-            run.capture_prepare_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
-            run.capture_present_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
             #[cfg(feature = "quantum-diagnostics")]
             {
                 run.capture_focus_evaluation_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
@@ -508,10 +495,6 @@ impl App {
             pre_step_ready: 0,
             upload_cpu_ms: 0.0,
             submit_cpu_ms: 0.0,
-            frame_work_cpu_ns: 0,
-            acquire_cpu_ns: 0,
-            prepare_cpu_ns: 0,
-            present_cpu_ns: 0,
             last_frame_interval_ns: 0,
             last_plan: UploadPlan::default(),
             last_upload_chunks: 0,
@@ -841,7 +824,6 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let frame_work_started = Instant::now();
         if self.exit_code != 0 {
             return;
         }
@@ -859,11 +841,9 @@ impl App {
             );
             return;
         }
-        let acquire_started = Instant::now();
         let Some(frame) = self.acquire_frame(event_loop) else {
             return;
         };
-        self.acquire_cpu_ns = acquire_started.elapsed().as_nanos() as u64;
         self.apply_held_keys();
         let before_step = self.demo.metrics().slice;
         self.pre_step_pending = before_step.pending_cells;
@@ -872,7 +852,6 @@ impl App {
         self.demo.tick();
         self.sim_cpu_ms = sim_started.elapsed().as_secs_f32() * 1000.0;
         self.upload_dirty();
-        let prepare_started = Instant::now();
         self.update_focus_regions();
         let viewport = self.viewport().unwrap_or((1.0, 1.0));
         let story = self.story_line();
@@ -999,7 +978,6 @@ impl App {
         }
         gpu.queue.write_buffer(&gpu.uniform_buf, 0, &uniform);
 
-        self.prepare_cpu_ns = prepare_started.elapsed().as_nanos() as u64;
         let submit_started = Instant::now();
         let mut encoder = gpu
             .device
@@ -1127,10 +1105,8 @@ impl App {
                 .chain(std::iter::once(encoder.finish())),
         );
         self.submit_cpu_ms = submit_started.elapsed().as_secs_f32() * 1000.0;
-        let present_started = Instant::now();
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
-        self.present_cpu_ns = present_started.elapsed().as_nanos() as u64;
         if let Some(readback) = screenshot {
             match save_screenshot(&gpu.device, readback) {
                 Ok(bytes) => {
@@ -1172,7 +1148,6 @@ impl App {
             }
         }
         self.last_present = Some(now);
-        self.frame_work_cpu_ns = now.duration_since(frame_work_started).as_nanos() as u64;
         self.after_present(event_loop);
         self.request_frame();
     }
@@ -1529,14 +1504,6 @@ impl App {
         run.frames = run.frames.saturating_add(1);
         run.capture_sim_cpu_ns
             .push((self.sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
-        run.capture_upload_cpu_ns
-            .push((self.upload_cpu_ms.max(0.0) * 1_000_000.0) as u64);
-        run.capture_submit_cpu_ns
-            .push((self.submit_cpu_ms.max(0.0) * 1_000_000.0) as u64);
-        run.capture_frame_work_cpu_ns.push(self.frame_work_cpu_ns);
-        run.capture_acquire_cpu_ns.push(self.acquire_cpu_ns);
-        run.capture_prepare_cpu_ns.push(self.prepare_cpu_ns);
-        run.capture_present_cpu_ns.push(self.present_cpu_ns);
         #[cfg(feature = "quantum-diagnostics")]
         {
             run.capture_focus_evaluation_ns
@@ -2726,22 +2693,8 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         }
     };
     let sim_p99_ms = p99_ms(&run.capture_sim_cpu_ns);
-    let upload_p99_ms = p99_ms(&run.capture_upload_cpu_ns);
-    let submit_p99_ms = p99_ms(&run.capture_submit_cpu_ns);
-    let frame_work_p99_ms = p99_ms(&run.capture_frame_work_cpu_ns);
-    let acquire_p99_ms = p99_ms(&run.capture_acquire_cpu_ns);
-    let prepare_p99_ms = p99_ms(&run.capture_prepare_cpu_ns);
-    let present_p99_ms = p99_ms(&run.capture_present_cpu_ns);
-    let cpu_work: Vec<u64> = run
-        .capture_sim_cpu_ns
-        .iter()
-        .zip(&run.capture_upload_cpu_ns)
-        .zip(&run.capture_submit_cpu_ns)
-        .map(|((sim, upload), submit)| sim.saturating_add(*upload).saturating_add(*submit))
-        .collect();
-    let cpu_work_p99_ms = p99_ms(&cpu_work);
     println!(
-        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} sim_p99_ms={:.3} upload_p99_ms={:.3} submit_p99_ms={:.3} cpu_work_p99_ms={:.3} frame_work_p99_ms={:.3} acquire_p99_ms={:.3} prepare_p99_ms={:.3} present_p99_ms={:.3} sim_samples={} max_sim_cpu_ms={:.3} max_sim_credits={}/{} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
+        "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} sim_p99_ms={:.3} sim_samples={} max_sim_cpu_ms={:.3} max_sim_credits={}/{} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
         intervals.len(),
         percentile(50) as f64 / 1_000_000.0,
         percentile(95) as f64 / 1_000_000.0,
@@ -2750,13 +2703,6 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         over_33_3_ms,
         run.capture_interval_drops,
         sim_p99_ms,
-        upload_p99_ms,
-        submit_p99_ms,
-        cpu_work_p99_ms,
-        frame_work_p99_ms,
-        acquire_p99_ms,
-        prepare_p99_ms,
-        present_p99_ms,
         run.capture_sim_cpu_ns.len(),
         run.max_sim_cpu_ms,
         run.max_sim_slice.charged,
