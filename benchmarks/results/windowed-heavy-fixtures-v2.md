@@ -2,9 +2,7 @@
 
 Status: data complete for the requested subset, 24/24 accepted captures across eight bounded heavy-fixture cells; 58 load-gate-rejected attempts. Performance outcome is unresolved: the frame-p99 target is met in only 2/8 cells, and no-worse presentation tails are not established. This is not the 72-capture all-fixture/policy matrix; the other fixtures and traditional policy were not run.
 
-App source revision: `431118a57a3883121e9d4b77b4f23e6d91df83af`  
-Suite runner revision: `431118a57a3883121e9d4b77b4f23e6d91df83af`  
-Suite started: 2026-10-09T21:04:54-04:00  
+App source revision: `431118a57a3883121e9d4b77b4f23e6d91df83af`; suite runner revision: `431118a57a3883121e9d4b77b4f23e6d91df83af`; suite started: 2026-10-09T21:04:54-04:00.
 Reference host: `akmac`, MacBook Air (Mac14,2), Apple M2/8 CPU cores/16 GB RAM/integrated GPU, macOS 27.0.1; Rust `rustc 1.99.0 (b940084d7 2026-09-28)`.
 Capture: release app, 4096² world, 1920×1080, 60 Hz target, profile `m2-16gb-v3`; Cargo.lock SHA-256 `d064050f2b9044bb0eecfb2b7ffee1b18644dd676e192f7b7d0b0008d42db06b`.
 Command: `python3 scripts/native_acceptance_suite.py --binary target/release/cascade-app --output benchmarks/results/windowed-heavy-fixtures-v2.md --fixtures sand-release reservoir-breach burning-forest mixed-overload --policies bounded-focus bounded-fifo --repetitions 3 --seconds 60`.
