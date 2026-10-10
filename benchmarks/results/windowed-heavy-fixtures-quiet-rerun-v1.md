@@ -2,9 +2,9 @@
 
 Status: complete for the requested eight bounded cells; 24/24 accepted captures; 14 load-gate-rejected attempts. This separate rerun covers only the eight bounded cells, not the full 72-capture fixture/policy matrix. Earlier baseline and final-source captures remain in [heavy-fixture follow-up v1](windowed-heavy-fixtures-v1.md) and [follow-up v2](windowed-heavy-fixtures-v2.md); none were replaced or removed.
 
-App source revision: `c5f75089d3ed8eba3b86af9be1cbc3d990f10489`  
-Suite runner revision: `c5f75089d3ed8eba3b86af9be1cbc3d990f10489`  
-Suite started: 2026-10-09T22:21:23-04:00  
+App source revision: `c5f75089d3ed8eba3b86af9be1cbc3d990f10489`
+Suite runner revision: `c5f75089d3ed8eba3b86af9be1cbc3d990f10489`
+Suite started: 2026-10-09T22:21:23-04:00
 Reference host: `akmac`, MacBook Air (Mac14,2), Apple M2/8 CPU cores/16 GB RAM/integrated GPU, macOS 27.0.1; Rust `rustc 1.99.0 (b940084d7 2026-09-28)`.
 Capture: release app, 4096² world, 1920×1080, 60 Hz target, profile `m2-16gb-v3`; Cargo.lock SHA-256 `d064050f2b9044bb0eecfb2b7ffee1b18644dd676e192f7b7d0b0008d42db06b`.
 The operator reported quitting other activity and leaving the display awake. Power mode, thermal state, and physical display refresh are not controlled. Host load and process snapshots were sampled approximately every 10 seconds while the capture app was running. The accepted-capture gate still uses only the one-minute load immediately before and after each run; in-run load samples are diagnostic, not grounds to discard an otherwise valid capture. The sampled `ps` CPU field is not a per-interval CPU delta, so process names and reported percentages show what appeared in snapshots but do not establish exact CPU contention or causation.
