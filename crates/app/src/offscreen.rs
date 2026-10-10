@@ -18,6 +18,7 @@ struct OffscreenGpu {
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     grid_texture: wgpu::Texture,
+    upload_buffer: wgpu::Buffer,
     target: wgpu::Texture,
     egui: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
@@ -47,6 +48,7 @@ pub(super) fn run(
     let mut uploads = UploadScheduler::new(chunks_x, chunks_y);
     let mut seeded = false;
     let mut dirty_chunks = Vec::with_capacity(MAX_CHUNKS_PER_FRAME);
+    let mut upload_bytes = vec![0; UPLOAD_STAGING_CAPACITY_BYTES];
     let mut feel = Feel::new(chunks_x, chunks_y);
     let mut last_viewport = None;
     let mut viewport_submit_age = 0_u32;
@@ -59,6 +61,9 @@ pub(super) fn run(
     let mut run = PolicySmoke {
         capture_intervals_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         capture_sim_cpu_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        capture_upload_cpu_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        capture_submit_cpu_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
+        capture_frame_work_cpu_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         #[cfg(feature = "quantum-diagnostics")]
         capture_focus_evaluation_ns: Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY),
         #[cfg(feature = "quantum-diagnostics")]
@@ -122,21 +127,20 @@ pub(super) fn run(
         let last_plan = uploads.plan(bytes_per_chunk(1), upload_budget());
         let mut exempt = [(0_u32, 0_u32); 64];
         let exempt_len = feel.exempt_cells(&mut exempt);
+        let mut uploaded_coords = [(0_u32, 0_u32); MAX_CHUNKS_PER_FRAME];
+        let mut uploaded_count = 0;
         for chunk in &last_plan.chunks[..last_plan.count] {
+            uploaded_coords[uploaded_count] = (chunk.x, chunk.y);
+            let start = uploaded_count * STAGING_BYTES_PER_CHUNK;
             super::write_chunk(
-                &gpu.queue,
-                &gpu.grid_texture,
                 demo.world(),
+                &mut upload_bytes[start..start + STAGING_BYTES_PER_CHUNK],
                 *chunk,
                 deferred_overlay,
                 &exempt[..exempt_len],
             );
+            uploaded_count += 1;
         }
-        let mut uploaded_coords = [(0_u32, 0_u32); MAX_CHUNKS_PER_FRAME];
-        for (index, chunk) in last_plan.chunks[..last_plan.count].iter().enumerate() {
-            uploaded_coords[index] = (chunk.x, chunk.y);
-        }
-        let mut uploaded_count = last_plan.count;
         let mut targets = [(0_u32, 0_u32); MAX_PRIORITY_UPLOADS];
         let target_len = demo.player_targets(&mut targets);
         for &(x, y) in &targets[..target_len.min(MAX_PRIORITY_UPLOADS)] {
@@ -147,21 +151,26 @@ pub(super) fn run(
             {
                 continue;
             }
-            super::write_chunk(
-                &gpu.queue,
-                &gpu.grid_texture,
-                demo.world(),
-                ChunkCoord {
-                    x: coord.0,
-                    y: coord.1,
-                },
-                deferred_overlay,
-                &exempt[..exempt_len],
-            );
             if uploaded_count < uploaded_coords.len() {
                 uploaded_coords[uploaded_count] = coord;
+                let start = uploaded_count * STAGING_BYTES_PER_CHUNK;
+                super::write_chunk(
+                    demo.world(),
+                    &mut upload_bytes[start..start + STAGING_BYTES_PER_CHUNK],
+                    ChunkCoord {
+                        x: coord.0,
+                        y: coord.1,
+                    },
+                    deferred_overlay,
+                    &exempt[..exempt_len],
+                );
                 uploaded_count += 1;
             }
+        }
+        if uploaded_count > 0 {
+            let bytes = uploaded_count * STAGING_BYTES_PER_CHUNK;
+            gpu.queue
+                .write_buffer(&gpu.upload_buffer, 0, &upload_bytes[..bytes]);
         }
         feel.note_uploads(&uploaded_coords[..uploaded_count]);
         let upload_cpu_ms = upload_started.elapsed().as_secs_f32() * 1000.0;
@@ -270,6 +279,33 @@ pub(super) fn run(
             &paint_jobs,
             &screen,
         );
+        for (index, &(x, y)) in uploaded_coords[..uploaded_count].iter().enumerate() {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &gpu.upload_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: (index * STAGING_BYTES_PER_CHUNK) as u64,
+                        bytes_per_row: Some(UPLOAD_BYTES_PER_ROW as u32),
+                        rows_per_image: Some(CHUNK_SIZE),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu.grid_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: x * CHUNK_SIZE,
+                        y: y * CHUNK_SIZE,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: CHUNK_SIZE,
+                    height: CHUNK_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let view = gpu
             .target
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -331,7 +367,7 @@ pub(super) fn run(
             && frame_number > 10
             && last_plan.count > 0
         {
-            demo.set_destroy_held(true);
+            demo.set_destroy_held(fixture == FixtureId::MixedOverload);
             feel.clear_latencies();
             history = FrameHistory::default();
             last_tick = None;
@@ -349,6 +385,15 @@ pub(super) fn run(
             run_frames
                 .capture_sim_cpu_ns
                 .push((sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
+            run_frames
+                .capture_upload_cpu_ns
+                .push((upload_cpu_ms.max(0.0) * 1_000_000.0) as u64);
+            run_frames
+                .capture_submit_cpu_ns
+                .push((submit_cpu_ms.max(0.0) * 1_000_000.0) as u64);
+            run_frames
+                .capture_frame_work_cpu_ns
+                .push(frame_at.elapsed().as_nanos() as u64);
             #[cfg(feature = "quantum-diagnostics")]
             {
                 run_frames
@@ -437,14 +482,16 @@ pub(super) fn run(
                     run_frames.slow_frame_slice = sim_metrics.slice;
                 }
             }
-            scripted_action(
-                &mut demo,
-                &mut feel,
-                &mut camera,
-                &mut scripted_ignite_target,
-                run_frames.frames,
-                clock_origin.elapsed().as_nanos() as u64,
-            );
+            if fixture == FixtureId::MixedOverload {
+                scripted_action(
+                    &mut demo,
+                    &mut feel,
+                    &mut camera,
+                    &mut scripted_ignite_target,
+                    run_frames.frames,
+                    clock_origin.elapsed().as_nanos() as u64,
+                );
+            }
             if started.elapsed() >= deadline {
                 demo.set_destroy_held(false);
                 #[cfg(feature = "quantum-diagnostics")]
@@ -566,6 +613,12 @@ fn create_gpu(world: (u32, u32)) -> Result<OffscreenGpu, String> {
         view_formats: &[],
     });
     let grid_view = grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let upload_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("offscreen-chunk-upload-staging"),
+        size: UPLOAD_STAGING_CAPACITY_BYTES as u64,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("frame"),
         size: cascade_app::UNIFORM_BYTES as u64,
@@ -611,6 +664,7 @@ fn create_gpu(world: (u32, u32)) -> Result<OffscreenGpu, String> {
         bind_group,
         uniform_buf,
         grid_texture,
+        upload_buffer,
         target,
         egui,
         egui_renderer,

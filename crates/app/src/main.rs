@@ -37,6 +37,7 @@ const UPLOAD_BYTES_PER_ROW: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
 const STAGING_BYTES_PER_CHUNK: usize =
     (CHUNK_SIZE as usize - 1) * UPLOAD_BYTES_PER_ROW + CHUNK_SIZE as usize;
 const STAGING_PADDING_BYTES_PER_CHUNK: usize = STAGING_BYTES_PER_CHUNK - CHUNK_CELLS;
+const UPLOAD_STAGING_CAPACITY_BYTES: usize = MAX_CHUNKS_PER_FRAME * STAGING_BYTES_PER_CHUNK;
 
 #[derive(Clone, Copy)]
 struct CaptureConfig {
@@ -76,6 +77,7 @@ struct Gpu {
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     grid_texture: wgpu::Texture,
+    upload_buffer: wgpu::Buffer,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     egui_inited: bool,
@@ -121,6 +123,9 @@ struct PolicySmoke {
     capture_intervals_ns: Vec<u64>,
     capture_interval_drops: u64,
     capture_sim_cpu_ns: Vec<u64>,
+    capture_upload_cpu_ns: Vec<u64>,
+    capture_submit_cpu_ns: Vec<u64>,
+    capture_frame_work_cpu_ns: Vec<u64>,
     #[cfg(feature = "quantum-diagnostics")]
     capture_focus_evaluation_ns: Vec<u64>,
     #[cfg(feature = "quantum-diagnostics")]
@@ -179,6 +184,9 @@ struct App {
     credit_draft: u32,
     uploads: UploadScheduler,
     dirty_chunks: Vec<(u32, u32)>,
+    upload_bytes: Vec<u8>,
+    upload_copy_coords: [(u32, u32); MAX_CHUNKS_PER_FRAME],
+    upload_copy_count: usize,
     history: FrameHistory,
     last_present: Option<Instant>,
     clock_origin: Instant,
@@ -476,6 +484,9 @@ impl App {
             credit_draft: cascade_app::default_credits(),
             uploads: UploadScheduler::new(chunks_x, chunks_y),
             dirty_chunks: Vec::with_capacity(MAX_CHUNKS_PER_FRAME),
+            upload_bytes: vec![0; UPLOAD_STAGING_CAPACITY_BYTES],
+            upload_copy_coords: [(0, 0); MAX_CHUNKS_PER_FRAME],
+            upload_copy_count: 0,
             history: FrameHistory::default(),
             last_present: None,
             clock_origin: Instant::now(),
@@ -678,24 +689,24 @@ impl App {
         let started = Instant::now();
         let plan = self.uploads.plan(bytes_per_chunk(1), upload_budget());
         self.last_upload_chunks = 0;
+        self.upload_copy_count = 0;
         if let Some(gpu) = self.gpu.as_ref() {
             let mut exempt = [(0_u32, 0_u32); 64];
             let exempt_len = self.feel.exempt_cells(&mut exempt);
+            let mut uploaded = [(0_u32, 0_u32); MAX_CHUNKS_PER_FRAME];
+            let mut uploaded_len = 0;
             for chunk in &plan.chunks[..plan.count] {
+                uploaded[uploaded_len] = (chunk.x, chunk.y);
+                let start = uploaded_len * STAGING_BYTES_PER_CHUNK;
                 write_chunk(
-                    &gpu.queue,
-                    &gpu.grid_texture,
                     self.demo.world(),
+                    &mut self.upload_bytes[start..start + STAGING_BYTES_PER_CHUNK],
                     *chunk,
                     self.deferred_overlay,
                     &exempt[..exempt_len],
                 );
+                uploaded_len += 1;
             }
-            let mut uploaded = [(0_u32, 0_u32); MAX_CHUNKS_PER_FRAME];
-            for (index, chunk) in plan.chunks[..plan.count].iter().enumerate() {
-                uploaded[index] = (chunk.x, chunk.y);
-            }
-            let mut uploaded_len = plan.count;
             let mut targets = [(0_u32, 0_u32); MAX_PRIORITY_UPLOADS];
             let target_len = self.demo.player_targets(&mut targets);
             for &(x, y) in &targets[..target_len.min(MAX_PRIORITY_UPLOADS)] {
@@ -706,10 +717,11 @@ impl App {
                 if uploaded[..uploaded_len].contains(&chunk) {
                     continue;
                 }
+                uploaded[uploaded_len] = chunk;
+                let start = uploaded_len * STAGING_BYTES_PER_CHUNK;
                 write_chunk(
-                    &gpu.queue,
-                    &gpu.grid_texture,
                     self.demo.world(),
+                    &mut self.upload_bytes[start..start + STAGING_BYTES_PER_CHUNK],
                     ChunkCoord {
                         x: chunk.0,
                         y: chunk.1,
@@ -717,9 +729,15 @@ impl App {
                     self.deferred_overlay,
                     &exempt[..exempt_len],
                 );
-                uploaded[uploaded_len] = chunk;
                 uploaded_len += 1;
             }
+            if uploaded_len > 0 {
+                let bytes = uploaded_len * STAGING_BYTES_PER_CHUNK;
+                gpu.queue
+                    .write_buffer(&gpu.upload_buffer, 0, &self.upload_bytes[..bytes]);
+            }
+            self.upload_copy_coords[..uploaded_len].copy_from_slice(&uploaded[..uploaded_len]);
+            self.upload_copy_count = uploaded_len;
             self.feel.note_uploads(&uploaded[..uploaded_len]);
             self.last_upload_chunks = uploaded_len;
         }
@@ -973,6 +991,36 @@ impl App {
             &paint_jobs,
             &screen,
         );
+        for (index, &(x, y)) in self.upload_copy_coords[..self.upload_copy_count]
+            .iter()
+            .enumerate()
+        {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &gpu.upload_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: (index * STAGING_BYTES_PER_CHUNK) as u64,
+                        bytes_per_row: Some(UPLOAD_BYTES_PER_ROW as u32),
+                        rows_per_image: Some(CHUNK_SIZE),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu.grid_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: x * CHUNK_SIZE,
+                        y: y * CHUNK_SIZE,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: CHUNK_SIZE,
+                    height: CHUNK_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2287,6 +2335,12 @@ fn create_gpu(
         view_formats: &[],
     });
     let grid_view = grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let upload_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("chunk-upload-staging"),
+        size: UPLOAD_STAGING_CAPACITY_BYTES as u64,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("frame"),
         size: cascade_app::UNIFORM_BYTES as u64,
@@ -2341,6 +2395,7 @@ fn create_gpu(
         bind_group,
         uniform_buf,
         grid_texture,
+        upload_buffer,
         egui_state,
         egui_renderer,
         egui_inited: false,
@@ -2370,14 +2425,13 @@ fn exempt_mask(chunk: ChunkCoord, exempt: &[(u32, u32)]) -> [bool; CHUNK_CELLS] 
 }
 
 fn write_chunk(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
     world: &cascade_sim::World,
+    bytes: &mut [u8],
     chunk: ChunkCoord,
     deferred_overlay: bool,
     exempt: &[(u32, u32)],
 ) {
-    let mut bytes = [0_u8; UPLOAD_BYTES_PER_ROW * CHUNK_SIZE as usize];
+    debug_assert!(bytes.len() >= STAGING_BYTES_PER_CHUNK);
     let exempt_mask = exempt_mask(chunk, exempt);
     let (width, height) = world.dimensions();
     for y in 0..CHUNK_SIZE {
@@ -2402,29 +2456,6 @@ fn write_chunk(
             }
         }
     }
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: chunk.x * CHUNK_SIZE,
-                y: chunk.y * CHUNK_SIZE,
-                z: 0,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
-        &bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(UPLOAD_BYTES_PER_ROW as u32),
-            rows_per_image: Some(CHUNK_SIZE),
-        },
-        wgpu::Extent3d {
-            width: CHUNK_SIZE,
-            height: CHUNK_SIZE,
-            depth_or_array_layers: 1,
-        },
-    );
 }
 
 fn pan_key_index(key: &winit::keyboard::Key) -> Option<usize> {
@@ -2651,14 +2682,17 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         }
     };
     let over_33_3_ms = intervals.iter().filter(|&&ns| ns > 33_333_333).count();
-    let mut sim_cpu = run.capture_sim_cpu_ns.clone();
-    sim_cpu.sort_unstable();
-    let sim_p99_ms = if sim_cpu.is_empty() {
-        0.0
-    } else {
-        let rank = (99 * sim_cpu.len()).div_ceil(100).max(1);
-        sim_cpu[rank - 1] as f64 / 1_000_000.0
+    let p99_ms = |samples: &[u64]| {
+        if samples.is_empty() {
+            0.0
+        } else {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            let rank = (99 * sorted.len()).div_ceil(100).max(1);
+            sorted[rank - 1] as f64 / 1_000_000.0
+        }
     };
+    let sim_p99_ms = p99_ms(&run.capture_sim_cpu_ns);
     println!(
         "SMOKE_CAPTURE policy={label} frames={} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} over_33_3_ms={} interval_drops={} sim_p99_ms={:.3} sim_samples={} max_sim_cpu_ms={:.3} max_sim_credits={}/{} max_sim_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} totals=eval:{},blast:{},recovery:{},commands:{},selection:{} max_upload_cpu_ms={:.3} max_upload_chunks={} max_upload_payload_bytes={} max_upload_staging_bytes={} max_upload_row_padding_bytes={} upload_cpu_peak_frame=chunks:{},payload_bytes:{},staging_bytes:{},row_padding_bytes:{} max_submit_cpu_ms={:.3} slow_frames={} worst_slow_frame_ms={:.3} slow_frame_cpu_ms=sim:{:.3},upload:{:.3},submit:{:.3} slow_frame_counts=eval:{},blast:{},recovery:{},commands:{},selection:{} max_pending={} max_upload_backlog={}",
         intervals.len(),
@@ -2669,7 +2703,7 @@ fn print_capture(label: &str, run: &PolicySmoke) {
         over_33_3_ms,
         run.capture_interval_drops,
         sim_p99_ms,
-        sim_cpu.len(),
+        run.capture_sim_cpu_ns.len(),
         run.max_sim_cpu_ms,
         run.max_sim_slice.charged,
         run.max_sim_slice.allowed,
@@ -2774,6 +2808,14 @@ mod tests {
         assert_eq!(
             STAGING_PADDING_BYTES_PER_CHUNK,
             STAGING_BYTES_PER_CHUNK - CHUNK_CELLS
+        );
+        assert_eq!(
+            STAGING_BYTES_PER_CHUNK % wgpu::COPY_BUFFER_ALIGNMENT as usize,
+            0
+        );
+        assert_eq!(
+            UPLOAD_STAGING_CAPACITY_BYTES,
+            MAX_CHUNKS_PER_FRAME * STAGING_BYTES_PER_CHUNK
         );
     }
 
