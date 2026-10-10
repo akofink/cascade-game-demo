@@ -1,6 +1,6 @@
 # Native windowed heavy-fixture quiet-host rerun v1
 
-Status: complete for the requested eight bounded cells; 24/24 accepted captures; 14 load-gate-rejected attempts. This separate rerun covers only the eight bounded cells, not the full 72-capture fixture/policy matrix. Earlier baseline and final-source captures remain in [heavy-fixture follow-up v1](windowed-heavy-fixtures-v1.md) and [follow-up v2](windowed-heavy-fixtures-v2.md); none were replaced or removed.
+Status: complete for the requested eight bounded cells; 24/24 accepted captures; 14 load-gate-rejected attempts. This separate rerun covers only the eight bounded cells, not the full 72-capture fixture/policy matrix. Earlier baseline and final-source captures remain in [heavy-fixture follow-up v1](windowed-heavy-fixtures-v1.md) and [follow-up v2](windowed-heavy-fixtures-v2.md); none were replaced or removed. The operator accepts this quiet-host result for delivery, including the residual slice-p99 miss described below; the miss remains disclosed and is not claimed to meet baseline.
 
 App source revision: `c5f75089d3ed8eba3b86af9be1cbc3d990f10489`
 Suite runner revision: `c5f75089d3ed8eba3b86af9be1cbc3d990f10489`
@@ -77,7 +77,7 @@ The in-run samples show some accepted runs briefly at or above load 3 despite pa
 
 All 24 rerun frame p99 values are at or below 20 ms, including all three sand-release/bounded-fifo repetitions. All eight cells that met the frame target in baseline v1 meet it here; sand-release/bounded-fifo also now meets it. No accepted rerun interval exceeded 33.3 ms.
 
-The baseline slice ranges below are the min/max of the three accepted v1 repetitions per cell. Rerun values are listed in repetition order. Under a strict all-repetitions-within-range reading, only burning-forest/bounded-focus has all three values inside its baseline range. By per-cell mean, sand-release/bounded-fifo remains outside its baseline range: rerun mean 4.267 ms versus baseline range 4.099–4.221 ms (baseline mean 4.171 ms). This misses the follow-up's slice-p99 condition, so the delivery gate is not met and no push or PR is authorized by this result.
+The baseline slice ranges below are the min/max of the three accepted v1 repetitions per cell. Rerun values are listed in repetition order. Under a strict all-repetitions-within-range reading, only burning-forest/bounded-focus has all three values inside its baseline range. By per-cell mean, sand-release/bounded-fifo remains outside its baseline range: rerun mean 4.267 ms versus baseline range 4.099–4.221 ms (baseline mean 4.171 ms). This residual miss is accepted for delivery by the operator; it remains unmet against baseline, and no regression-free result is claimed.
 
 | Fixture | Policy | Rerun frame p99 ms (reps 1–3) | Baseline slice p99 range ms | Rerun slice p99 ms (reps 1–3) |
 |---|---|---|---|---|
