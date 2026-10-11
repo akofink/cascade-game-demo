@@ -166,6 +166,19 @@ class AcceptanceSuiteTests(unittest.TestCase):
             self.assertEqual(attempts[0]["reason"], suite.STARTUP_FAILURE_REASON)
             self.assertIn("no timing data was collected", notes[0])
 
+    def test_report_version_matches_output_path_and_can_be_resumed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.lock").write_bytes(b"test lock")
+            output = root / "native-acceptance-v2.md"
+            with patch.object(suite, "ROOT", root):
+                write_report(output, "abc123", [], "2026-10-11T00:00:00-04:00")
+                text = output.read_text(encoding="utf-8")
+                self.assertIn("# Native all-fixture acceptance suite v2", text)
+                self.assertEqual(suite.load_report_attempts(output)[0], "abc123")
+                with self.assertRaisesRegex(ValueError, "different capture mode"):
+                    suite.load_report_attempts(output, "offscreen")
+
     def test_report_keeps_rejected_attempt_and_marks_incomplete(self):
         attempts = [
             {
