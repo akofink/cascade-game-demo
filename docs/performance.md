@@ -56,6 +56,10 @@ The complete [versioned result](../benchmarks/results/native-acceptance-v2.md) c
 
 Traditional policy meets neither timing threshold in any cell. GPU execution duration and complete GPU residency are not measured by this matrix; those remain unmet or unavailable as documented below.
 
+### Unmerged chunk-upload follow-up
+
+A later upload-path experiment is recorded in [windowed upload follow-up v1](../benchmarks/results/windowed-upload-followup-v1.md). It adds a clipped chunk-row iterator to avoid repeated per-cell coordinate validation while preserving immediate uploads, FIFO ordering, and the existing upload/copy caps. Three accepted target captures each showed lower bounded-FIFO frame-p99 averages than v2 (sand-release 20.531 vs 20.861 ms; burning-forest 19.656 vs 19.907 ms). Sand-release still misses 20 ms in all three runs; burning-forest's three frame p99s are below 20 ms, but its slice p99 remains above 4 ms. The single-capture bounded regression screen found quiet-world/bounded-focus and reservoir-breach/bounded-fifo outside their v2 frame-p99 repetition ranges, so the task's no-regression merge gate was not met. This follow-up is not merged and does not change the current-main acceptance checklist above. The full 72-capture matrix was not rerun on the new source; v2 and all earlier results remain historical records and are not replaced by this focused sample.
+
 ## Reproducible all-fixture acceptance command
 
 After a compatible simulation revision is on `main` and a quiet-machine window is available, run this single command from the repository root:
