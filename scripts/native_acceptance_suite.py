@@ -464,6 +464,9 @@ def main() -> int:
                     result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
                 after = load_one()
                 base["load_after"] = fmt_load(after)
+                if args.cooldown_seconds:
+                    print(f"COOLDOWN {args.cooldown_seconds}s after capture attempt", flush=True)
+                    time.sleep(args.cooldown_seconds)
                 text = log_path.read_text(encoding="utf-8", errors="replace")
                 metrics, feel, capture_reasons = validate_capture(
                     text, fixture, policy, args.seconds, args.mode
@@ -507,9 +510,6 @@ def main() -> int:
                     attempts.append(base)
                     print(f"ACCEPT {fixture}/{policy} rep={rep} load={before:.2f}/{after:.2f} p99={metrics['p99_ms']} ms", flush=True)
                     write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
-                    if args.cooldown_seconds:
-                        print(f"COOLDOWN {args.cooldown_seconds}s after accepted capture", flush=True)
-                        time.sleep(args.cooldown_seconds)
                 write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
     except KeyboardInterrupt:
         print("Interrupted; partial results were written.", file=sys.stderr)
