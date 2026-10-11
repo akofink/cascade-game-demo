@@ -2546,27 +2546,16 @@ fn write_chunk(
 ) {
     debug_assert!(bytes.len() >= STAGING_BYTES_PER_CHUNK);
     let exempt_mask = exempt_mask(chunk, exempt);
-    let (width, height) = world.dimensions();
     for y in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            let cell_x = chunk.x * CHUNK_SIZE + x;
-            let cell_y = chunk.y * CHUNK_SIZE + y;
-            if cell_x < width && cell_y < height {
-                let cell = world.cell(cell_x, cell_y);
-                let pending = world.cell_pending(cell_x, cell_y) == Some(true);
-                let exempt_cell = exempt_mask[(y * CHUNK_SIZE + x) as usize];
-                bytes[y as usize * UPLOAD_BYTES_PER_ROW + x as usize] = cell
-                    .map(|cell| {
-                        presented_byte(
-                            cell.material as u8,
-                            cell.burning,
-                            pending,
-                            deferred_overlay,
-                            exempt_cell,
-                        )
-                    })
-                    .unwrap_or(0);
-            }
+        for (x, (cell, pending)) in world.chunk_row(chunk.x, chunk.y, y).enumerate() {
+            let exempt_cell = exempt_mask[(y * CHUNK_SIZE + x as u32) as usize];
+            bytes[y as usize * UPLOAD_BYTES_PER_ROW + x] = presented_byte(
+                cell.material as u8,
+                cell.burning,
+                pending,
+                deferred_overlay,
+                exempt_cell,
+            );
         }
     }
 }
