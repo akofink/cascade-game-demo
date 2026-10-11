@@ -2,9 +2,9 @@
 
 Status: complete; 72/72 accepted captures; 122 rejected attempts.
 
-App source revision: `237aaa373e101182c908c7bc2fcde5b8a5817ae2`  
-Suite runner revision: `237aaa373e101182c908c7bc2fcde5b8a5817ae2`  
-Suite started: 2026-10-11T10:26:50-04:00  
+App source revision: `237aaa373e101182c908c7bc2fcde5b8a5817ae2`
+Suite runner revision: `237aaa373e101182c908c7bc2fcde5b8a5817ae2`
+Suite started: 2026-10-11T10:26:50-04:00
 Reference host: `akmac`, MacBook Air (Mac14,2), Apple M2/8 CPU cores/16 GB RAM/integrated GPU, macOS 27.0.1; Rust `rustc 1.99.0 (b940084d7 2026-09-28)`.
 Capture: release app, 4096² world, 1920×1080, 60 Hz target, profile `m2-16gb-v3`; Cargo.lock SHA-256 `d064050f2b9044bb0eecfb2b7ffee1b18644dd676e192f7b7d0b0008d42db06b`.
 Power mode, thermal state, background activity, and physical display refresh are not controlled.
