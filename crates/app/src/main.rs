@@ -39,11 +39,24 @@ const STAGING_BYTES_PER_CHUNK: usize =
 const STAGING_PADDING_BYTES_PER_CHUNK: usize = STAGING_BYTES_PER_CHUNK - CHUNK_CELLS;
 const UPLOAD_STAGING_CAPACITY_BYTES: usize = MAX_CHUNKS_PER_FRAME * STAGING_BYTES_PER_CHUNK;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CaptureConfig {
     policy: PolicyChoice,
     fixture: FixtureId,
     seconds: u64,
+    frame_breakdown_path: Option<Arc<PathBuf>>,
+}
+
+#[derive(Clone, Copy)]
+struct FrameTiming {
+    frame: u64,
+    interval_ns: u64,
+    simulation_ns: u64,
+    upload_ns: u64,
+    render_encode_ns: u64,
+    submit_ns: u64,
+    present_ns: u64,
+    wait_ns: u64,
 }
 
 struct CliArgs {
@@ -126,6 +139,7 @@ struct PolicySmoke {
     capture_upload_cpu_ns: Vec<u64>,
     capture_submit_cpu_ns: Vec<u64>,
     capture_frame_work_cpu_ns: Vec<u64>,
+    capture_frame_timings: Option<Vec<FrameTiming>>,
     #[cfg(feature = "quantum-diagnostics")]
     capture_focus_evaluation_ns: Vec<u64>,
     #[cfg(feature = "quantum-diagnostics")]
@@ -195,6 +209,11 @@ struct App {
     pre_step_ready: usize,
     upload_cpu_ms: f32,
     submit_cpu_ms: f32,
+    frame_simulation_ns: u64,
+    frame_upload_ns: u64,
+    frame_render_encode_ns: u64,
+    frame_submit_ns: u64,
+    frame_present_ns: u64,
     last_frame_interval_ns: u64,
     last_plan: UploadPlan,
     last_upload_chunks: usize,
@@ -291,6 +310,7 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut capture_policy = None;
     let mut capture_fixture = FixtureId::MixedOverload;
     let mut capture_seconds = 60_u64;
+    let mut frame_breakdown_path = None;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut index = 0;
     while index < args.len() {
@@ -331,6 +351,13 @@ fn parse_args() -> Result<CliArgs, String> {
                     "mixed-overload" => FixtureId::MixedOverload,
                     _ => return Err("unknown fixture; use a section-12 fixture name".into()),
                 };
+                index += 1;
+            }
+            "--frame-breakdown" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing path for --frame-breakdown")?;
+                frame_breakdown_path = Some(PathBuf::from(value));
                 index += 1;
             }
             "--capture-seconds" => {
@@ -374,6 +401,12 @@ fn parse_args() -> Result<CliArgs, String> {
     if offscreen_capture && capture_policy.is_none() {
         return Err("--offscreen-capture requires --capture-policy".to_string());
     }
+    if frame_breakdown_path.is_some() && capture_policy.is_none() {
+        return Err("--frame-breakdown requires --capture-policy".to_string());
+    }
+    if frame_breakdown_path.is_some() && offscreen_capture {
+        return Err("--frame-breakdown is only supported for windowed captures".to_string());
+    }
     if offscreen_capture && screenshot_path.is_some() {
         return Err("--offscreen-capture does not perform readback or screenshots".to_string());
     }
@@ -387,6 +420,7 @@ fn parse_args() -> Result<CliArgs, String> {
         policy,
         fixture: capture_fixture,
         seconds: capture_seconds,
+        frame_breakdown_path: frame_breakdown_path.map(Arc::new),
     });
     Ok(CliArgs {
         smoke: smoke || capture.is_some(),
@@ -398,6 +432,13 @@ fn parse_args() -> Result<CliArgs, String> {
 }
 
 impl App {
+    fn frame_breakdown_enabled(&self) -> bool {
+        self.smoke
+            .as_ref()
+            .and_then(|smoke| smoke.capture.as_ref())
+            .is_some_and(|capture| capture.frame_breakdown_path.is_some())
+    }
+
     fn new(
         smoke: bool,
         world_size: u32,
@@ -411,7 +452,7 @@ impl App {
                 std::process::exit(1);
             }
         };
-        if let Some(capture) = capture {
+        if let Some(capture) = capture.as_ref() {
             demo.set_policy(capture.policy);
             demo.select_fixture(capture.fixture);
         } else if !smoke && focus_linked() {
@@ -449,10 +490,10 @@ impl App {
             traditional_armed: false,
             focus_armed: false,
             failed: None,
-            capture,
+            capture: capture.clone(),
             capture_started: None,
         });
-        if let (Some(config), Some(smoke)) = (capture, smoke_state.as_mut()) {
+        if let (Some(config), Some(smoke)) = (capture.as_ref(), smoke_state.as_mut()) {
             let run = match config.policy {
                 PolicyChoice::BoundedFifo => &mut smoke.bounded,
                 PolicyChoice::BoundedFocus => &mut smoke.focus,
@@ -460,6 +501,10 @@ impl App {
             };
             run.capture_intervals_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
             run.capture_sim_cpu_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
+            run.capture_frame_timings = config
+                .frame_breakdown_path
+                .as_ref()
+                .map(|_| Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY));
             #[cfg(feature = "quantum-diagnostics")]
             {
                 run.capture_focus_evaluation_ns = Vec::with_capacity(CAPTURE_INTERVAL_CAPACITY);
@@ -495,6 +540,11 @@ impl App {
             pre_step_ready: 0,
             upload_cpu_ms: 0.0,
             submit_cpu_ms: 0.0,
+            frame_simulation_ns: 0,
+            frame_upload_ns: 0,
+            frame_render_encode_ns: 0,
+            frame_submit_ns: 0,
+            frame_present_ns: 0,
             last_frame_interval_ns: 0,
             last_plan: UploadPlan::default(),
             last_upload_chunks: 0,
@@ -741,7 +791,11 @@ impl App {
             self.feel.note_uploads(&uploaded[..uploaded_len]);
             self.last_upload_chunks = uploaded_len;
         }
-        self.upload_cpu_ms = started.elapsed().as_secs_f32() * 1000.0;
+        let upload_elapsed = started.elapsed();
+        self.upload_cpu_ms = upload_elapsed.as_secs_f32() * 1000.0;
+        if self.frame_breakdown_enabled() {
+            self.frame_upload_ns = upload_elapsed.as_nanos() as u64;
+        }
         if let Some(smoke) = self.smoke.as_mut() {
             smoke.uploaded += self.last_upload_chunks as u32;
             smoke.saw_stale |= plan.stale;
@@ -850,7 +904,11 @@ impl App {
         self.pre_step_ready = before_step.ready_len;
         let sim_started = Instant::now();
         self.demo.tick();
-        self.sim_cpu_ms = sim_started.elapsed().as_secs_f32() * 1000.0;
+        let sim_elapsed = sim_started.elapsed();
+        self.sim_cpu_ms = sim_elapsed.as_secs_f32() * 1000.0;
+        if self.frame_breakdown_enabled() {
+            self.frame_simulation_ns = sim_elapsed.as_nanos() as u64;
+        }
         self.upload_dirty();
         self.update_focus_regions();
         let viewport = self.viewport().unwrap_or((1.0, 1.0));
@@ -860,6 +918,7 @@ impl App {
             .as_ref()
             .map(|gpu| gpu.surface_reconfigures)
             .unwrap_or(0);
+        let frame_breakdown_enabled = self.frame_breakdown_enabled();
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -979,6 +1038,7 @@ impl App {
         gpu.queue.write_buffer(&gpu.uniform_buf, 0, &uniform);
 
         let submit_started = Instant::now();
+        let render_encode_started = frame_breakdown_enabled.then(Instant::now);
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1099,14 +1159,26 @@ impl App {
                 format: gpu.config.format,
             }
         });
+        let render_encode_ns =
+            render_encode_started.map(|started| started.elapsed().as_nanos() as u64);
+        let queue_submit_started = frame_breakdown_enabled.then(Instant::now);
         gpu.queue.submit(
             user_cmds
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
+        let submit_ns = queue_submit_started.map(|started| started.elapsed().as_nanos() as u64);
         self.submit_cpu_ms = submit_started.elapsed().as_secs_f32() * 1000.0;
+        if let Some(render_encode_ns) = render_encode_ns {
+            self.frame_render_encode_ns = render_encode_ns;
+            self.frame_submit_ns = submit_ns.unwrap_or(0);
+        }
+        let present_started = frame_breakdown_enabled.then(Instant::now);
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        if let Some(started) = present_started {
+            self.frame_present_ns = started.elapsed().as_nanos() as u64;
+        }
         if let Some(readback) = screenshot {
             match save_screenshot(&gpu.device, readback) {
                 Ok(bytes) => {
@@ -1133,7 +1205,8 @@ impl App {
             self.last_frame_interval_ns = interval;
             self.history.record_interval(interval);
             if let Some(smoke) = self.smoke.as_mut()
-                && let (Some(config), Some(_started)) = (smoke.capture, smoke.capture_started)
+                && let (Some(config), Some(_started)) =
+                    (smoke.capture.as_ref(), smoke.capture_started)
             {
                 let run = match config.policy {
                     PolicyChoice::BoundedFifo => &mut smoke.bounded,
@@ -1164,7 +1237,7 @@ impl App {
             "bounded focus" => "bounded-focus",
             _ => "bounded-fifo",
         };
-        if let Some(capture) = smoke.capture {
+        if let Some(capture) = smoke.capture.clone() {
             self.capture_frame(event_loop, &mut smoke, capture, policy_label, sim_metrics);
             self.smoke = Some(smoke);
             return;
@@ -1502,6 +1575,26 @@ impl App {
             PolicyChoice::Traditional => &mut smoke.traditional,
         };
         run.frames = run.frames.saturating_add(1);
+        if let Some(timings) = run.capture_frame_timings.as_mut()
+            && self.last_frame_interval_ns > 0
+        {
+            let phases = self
+                .frame_simulation_ns
+                .saturating_add(self.frame_upload_ns)
+                .saturating_add(self.frame_render_encode_ns)
+                .saturating_add(self.frame_submit_ns)
+                .saturating_add(self.frame_present_ns);
+            timings.push(FrameTiming {
+                frame: u64::from(run.frames),
+                interval_ns: self.last_frame_interval_ns,
+                simulation_ns: self.frame_simulation_ns,
+                upload_ns: self.frame_upload_ns,
+                render_encode_ns: self.frame_render_encode_ns,
+                submit_ns: self.frame_submit_ns,
+                present_ns: self.frame_present_ns,
+                wait_ns: self.last_frame_interval_ns.saturating_sub(phases),
+            });
+        }
         run.capture_sim_cpu_ns
             .push((self.sim_cpu_ms.max(0.0) * 1_000_000.0) as u64);
         #[cfg(feature = "quantum-diagnostics")]
@@ -1594,6 +1687,25 @@ impl App {
             }
             self.demo.set_destroy_held(false);
             print_feel(policy_label, &self.feel);
+            if let Some(path) = &capture.frame_breakdown_path {
+                let Some(timings) = run.capture_frame_timings.as_ref() else {
+                    smoke.failed = Some("frame breakdown storage was not initialized".into());
+                    self.exit_code = 1;
+                    event_loop.exit();
+                    return;
+                };
+                if let Err(error) = write_frame_breakdown(path, timings) {
+                    smoke.failed = Some(format!("write frame breakdown: {error}"));
+                    self.exit_code = 1;
+                    event_loop.exit();
+                    return;
+                }
+                println!(
+                    "SMOKE_FRAME_BREAKDOWN path={} frames={}",
+                    path.display(),
+                    timings.len()
+                );
+            }
             print_capture(policy_label, run);
             println!("SMOKE_RESULT ok");
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -2670,6 +2782,33 @@ fn print_quantum_timing(run: &PolicySmoke, label: &str) {
     );
 }
 
+fn write_frame_breakdown(path: &std::path::Path, samples: &[FrameTiming]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(path)?;
+    use std::io::Write as _;
+    writeln!(
+        file,
+        "frame,interval_ns,simulation_ns,chunk_upload_ns,render_encode_ns,queue_submit_ns,present_ns,wait_residual_ns"
+    )?;
+    for sample in samples {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{}",
+            sample.frame,
+            sample.interval_ns,
+            sample.simulation_ns,
+            sample.upload_ns,
+            sample.render_encode_ns,
+            sample.submit_ns,
+            sample.present_ns,
+            sample.wait_ns,
+        )?;
+    }
+    file.flush()
+}
+
 fn print_capture(label: &str, run: &PolicySmoke) {
     let mut intervals = run.capture_intervals_ns.clone();
     intervals.sort_unstable();
@@ -2784,6 +2923,32 @@ fn print_smoke(smoke: &Smoke, surface_reconfigures: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_breakdown_csv_writes_phase_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "cascade-frame-timing-{}-{}.csv",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let sample = FrameTiming {
+            frame: 7,
+            interval_ns: 20,
+            simulation_ns: 2,
+            upload_ns: 3,
+            render_encode_ns: 4,
+            submit_ns: 5,
+            present_ns: 1,
+            wait_ns: 5,
+        };
+        write_frame_breakdown(&path, &[sample]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            text,
+            "frame,interval_ns,simulation_ns,chunk_upload_ns,render_encode_ns,queue_submit_ns,present_ns,wait_residual_ns\n7,20,2,3,4,5,1,5\n"
+        );
+    }
 
     #[test]
     fn priority_uploads_share_the_frame_copy_cap() {

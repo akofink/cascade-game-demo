@@ -81,6 +81,16 @@ Use windowed `--capture-policy POLICY --capture-seconds 60` captures when making
 
 Before and after each capture, check the one-minute system load; accept results only when it is below 3 at both checks. Run one capture process at a time, reject and retain a note of attempts that miss the gate, and do not suppress long samples from accepted runs.
 
+### Opt-in per-frame phase timing
+
+For diagnostic attribution of windowed capture tails, pass `--frame-breakdown` to the native acceptance runner. It writes one ignored CSV beside each per-attempt log under `benchmarks/tmp/native-acceptance/`; the usual load gate and capture validation are unchanged. For example, the focused two-fixture capture can be run with:
+
+```sh
+./scripts/native_acceptance_suite.py --fixtures sand-release burning-forest --policies bounded-fifo --repetitions 3 --frame-breakdown --cooldown-seconds 180 --output benchmarks/tmp/frame-breakdown-summary.md
+```
+
+The app-level equivalent is `cascade-app --capture-policy bounded-fifo --fixture sand-release --capture-seconds 60 --world-size 4096 --frame-breakdown benchmarks/tmp/sand-release.frames.csv`. `--cooldown-seconds` applies an idle interval after every launched capture attempt when using the suite, including rejected captures. Without this option, no per-frame timing records are allocated or written. The CSV contains each recorded present-to-present interval, simulation slice, chunk upload work, render command encoding, queue submission, CPU-side present call, and a residual `wait_residual_ns`. The residual includes event-loop/input work, surface acquisition, OS scheduling, and pacing not covered by the explicit phase timers; it is not a GPU wait measurement. Queue submission and present-call durations are CPU-side only and do not measure GPU execution, compositor work, or scanout. These opt-in samples are diagnostic and are not acceptance results. Compare default-mode p99s against the versioned matrix for that same fixture/policy before interpreting instrumented captures.
+
 ## Current headless profile and status
 
 See [corrected full-size headless results v4](../benchmarks/results/headless-v4.md), [archived headless results v3](../benchmarks/results/headless-v3.md), and [reference profile v3](../profiles/m2-16gb-v3.toml). The 1,000,000-credit/slice setting remains an empirical candidate. The accepted [finite-burst recovery v6](../benchmarks/results/headless-burst-recovery-v6.md) shows the mixed-overload backlog drains to a stable window in 134,367 slices without changing source or throughput. The v4 follow-up profiles a same-chunk focus-membership cache on 4096² burning-forest and mixed-overload calibration. Pooled p99 improved from 3.906750 to 2.838709 ms on burning forest and 2.077292 to 1.652375 ms on mixed overload, with no reduction in quanta/slice; however, burning-forest still had 8 samples above 4 ms and a 9.767333 ms maximum among 5,400 slices. The 1M profile was retained, not reduced. These finite wall-clock samples include OS preemption and are not deadline guarantees.
