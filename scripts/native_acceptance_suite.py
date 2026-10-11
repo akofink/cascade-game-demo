@@ -156,11 +156,11 @@ def load_report_attempts(
 ) -> tuple[str, str, list[dict], list[str]]:
     text = path.read_text(encoding="utf-8")
     expected_title = (
-        "# Native all-fixture offscreen acceptance suite v1"
+        r"# Native all-fixture offscreen acceptance suite v\d+"
         if mode == "offscreen"
-        else "# Native all-fixture acceptance suite v1"
+        else r"# Native all-fixture acceptance suite v\d+"
     )
-    if expected_title not in text.splitlines():
+    if not any(re.fullmatch(expected_title, line) for line in text.splitlines()):
         raise ValueError(f"cannot resume report in a different capture mode: {path}")
     source = re.search(r"^(?:App )?[Ss]ource revision: `([^`]+)`", text, re.MULTILINE)
     started = re.search(r"^Suite started: (.+?)\s*$", text, re.MULTILINE)
@@ -261,6 +261,13 @@ def write_report(
     mode: str = "windowed",
 ) -> None:
     offscreen = mode == "offscreen"
+    version_match = re.search(r"native-acceptance(?:-offscreen)?-v(\d+)\.md$", path.name)
+    version = version_match.group(1) if version_match else "1"
+    title = (
+        f"# Native all-fixture offscreen acceptance suite v{version}"
+        if offscreen
+        else f"# Native all-fixture acceptance suite v{version}"
+    )
     accepted = [item for item in attempts if item["status"] == "accepted"]
     rejected = [item for item in attempts if item["status"] == "rejected"]
     complete = all(
@@ -275,7 +282,7 @@ def write_report(
         else f"{'complete' if complete else 'incomplete'}; {len(accepted)}/72 accepted captures; {len(rejected)} rejected attempts."
     )
     lines = [
-        "# Native all-fixture offscreen acceptance suite v1" if offscreen else "# Native all-fixture acceptance suite v1",
+        title,
         "",
         f"Status: {status}",
         "",
