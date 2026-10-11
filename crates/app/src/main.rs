@@ -1550,7 +1550,7 @@ impl App {
                 self.feel.clear_latencies();
                 self.history = FrameHistory::default();
                 let capture_start = Instant::now();
-                self.last_present = Some(capture_start);
+                self.last_present = capture.frame_breakdown_path.as_ref().map(|_| capture_start);
                 let run = match capture.policy {
                     PolicyChoice::BoundedFifo => &mut smoke.bounded,
                     PolicyChoice::BoundedFocus => &mut smoke.focus,
