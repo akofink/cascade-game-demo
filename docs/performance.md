@@ -83,7 +83,7 @@ Before and after each capture, check the one-minute system load; accept results 
 
 ### Opt-in per-frame phase timing
 
-For diagnostic attribution of windowed capture tails, pass `--frame-breakdown` to the native acceptance runner. It writes one ignored CSV beside each per-attempt log under `benchmarks/tmp/native-acceptance/`; the usual load gate and capture validation are unchanged. For example, the focused two-fixture capture can be run with:
+For diagnostic attribution of windowed capture tails, pass `--frame-breakdown` to the native acceptance runner. It writes one ignored CSV beside each per-attempt log under `benchmarks/tmp/native-acceptance/`; the usual load gate is unchanged, and the runner verifies a one-to-one CSV row/frame-index match with measured intervals. For example, the focused two-fixture capture can be run with:
 
 ```sh
 ./scripts/native_acceptance_suite.py --fixtures sand-release burning-forest --policies bounded-fifo --repetitions 3 --frame-breakdown --cooldown-seconds 180 --output benchmarks/tmp/frame-breakdown-summary.md

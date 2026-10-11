@@ -1549,7 +1549,8 @@ impl App {
                 self.demo.set_destroy_held(mixed_overload);
                 self.feel.clear_latencies();
                 self.history = FrameHistory::default();
-                self.last_present = None;
+                let capture_start = Instant::now();
+                self.last_present = Some(capture_start);
                 let run = match capture.policy {
                     PolicyChoice::BoundedFifo => &mut smoke.bounded,
                     PolicyChoice::BoundedFocus => &mut smoke.focus,
@@ -1557,7 +1558,7 @@ impl App {
                 };
                 run.first_pending = sim_metrics.slice.pending_cells;
                 run.last_pending = sim_metrics.slice.pending_cells;
-                smoke.capture_started = Some(Instant::now());
+                smoke.capture_started = Some(capture_start);
                 println!(
                     "SMOKE_CAPTURE_STARTED policy={policy_label} fixture={} seconds={} render={}x{} load_gate=external",
                     cascade_sim::fixtures::ScenarioDescriptor::get(capture.fixture).name(),
