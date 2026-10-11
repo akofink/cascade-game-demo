@@ -1,6 +1,6 @@
 # Native all-fixture acceptance suite v2
 
-Status: complete; 72/72 accepted captures; 122 rejected attempts.
+Status: complete; 72/72 accepted captures; 123 rejected attempts.
 
 App source revision: `237aaa373e101182c908c7bc2fcde5b8a5817ae2`
 Suite runner revision: `237aaa373e101182c908c7bc2fcde5b8a5817ae2`
@@ -210,6 +210,7 @@ These CPU-side event/action-to-visible-upload p95 values use the app's documente
 | quiet-world | bounded-fifo | 1 | 8 | 6.58/n/a | pre-run one-minute load not below 3 | `-` |
 | quiet-world | bounded-fifo | 1 | 9 | 6.03/n/a | pre-run one-minute load not below 3 | `-` |
 | quiet-world | bounded-fifo | 1 | 10 | 5.70/n/a | pre-run one-minute load not below 3 | `-` |
+| quiet-world | bounded-fifo | 1 | 11 | 5.49/n/a | pre-run one-minute load not below 3 | `benchmarks/tmp/native-acceptance-suite-runner.log` |
 | sand-release | traditional | 1 | 1 | 2.34/3.21 | one-minute load gate failed | `benchmarks/tmp/native-acceptance/sand-release-traditional-rep1-attempt1.log` |
 | sand-release | traditional | 1 | 2 | 3.21/n/a | pre-run one-minute load not below 3 | `-` |
 | sand-release | traditional | 1 | 3 | 3.12/n/a | pre-run one-minute load not below 3 | `-` |
