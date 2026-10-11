@@ -798,11 +798,19 @@ impl App {
             let action_target_len = action_target_len.min(MAX_ACTION_PRIORITY_UPLOADS);
             let visible_target_len = self.visible_upload_targets(&mut targets[action_target_len..]);
             let target_len = action_target_len + visible_target_len;
-            for &(x, y) in &targets[..target_len] {
+            for (target_index, &(x, y)) in targets[..target_len].iter().enumerate() {
                 if uploaded_len == MAX_CHUNKS_PER_FRAME {
                     break;
                 }
                 let chunk = (x / CHUNK_SIZE, y / CHUNK_SIZE);
+                if target_index >= action_target_len
+                    && !self.uploads.is_queued(ChunkCoord {
+                        x: chunk.0,
+                        y: chunk.1,
+                    })
+                {
+                    continue;
+                }
                 if uploaded[..uploaded_len].contains(&chunk) {
                     continue;
                 }

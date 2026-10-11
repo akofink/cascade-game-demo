@@ -103,6 +103,10 @@ impl UploadScheduler {
         self.order.len()
     }
 
+    pub fn is_queued(&self, chunk: ChunkCoord) -> bool {
+        self.index(chunk).is_some_and(|index| self.queued[index])
+    }
+
     pub fn plan(&mut self, bytes_per_chunk: usize, budget: UploadBudget) -> UploadPlan {
         let mut plan = UploadPlan::default();
         let limit = budget
@@ -203,6 +207,17 @@ mod tests {
                 y: next / 20,
             }
         );
+    }
+
+    #[test]
+    fn queued_status_tracks_dirty_chunks() {
+        let mut scheduler = UploadScheduler::new(2, 1);
+        let chunk = ChunkCoord { x: 1, y: 0 };
+        assert!(!scheduler.is_queued(chunk));
+        assert!(scheduler.mark_dirty(chunk));
+        assert!(scheduler.is_queued(chunk));
+        assert_eq!(scheduler.plan(1024, UploadBudget::default()).count, 1);
+        assert!(!scheduler.is_queued(chunk));
     }
 
     #[test]
