@@ -381,9 +381,11 @@ def main() -> int:
     parser.add_argument("--repetitions", type=int, default=3, help=argparse.SUPPRESS)
     parser.add_argument("--seconds", type=int, default=60, help=argparse.SUPPRESS)
     parser.add_argument("--no-caffeinate", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--frame-breakdown", action="store_true", help="write opt-in per-frame phase timing CSVs for each capture")
+    parser.add_argument("--cooldown-seconds", type=int, default=0, help="idle this long after each accepted capture")
     args = parser.parse_args()
-    if not 1 <= args.seconds <= 60 or args.repetitions < 1:
-        parser.error("seconds must be 1..=60 and repetitions must be positive")
+    if not 1 <= args.seconds <= 60 or args.repetitions < 1 or args.cooldown_seconds < 0:
+        parser.error("seconds must be 1..=60, repetitions must be positive, and cooldown must be non-negative")
 
     if args.binary:
         binary = args.binary.resolve()
@@ -450,6 +452,9 @@ def main() -> int:
                 base["log"] = str(log_path.relative_to(ROOT))
                 command = [str(binary), "--capture-policy", policy, "--fixture", fixture,
                            "--capture-seconds", str(args.seconds), "--world-size", "4096"]
+                breakdown_path = log_path.with_suffix(".frames.csv")
+                if args.frame_breakdown:
+                    command.extend(("--frame-breakdown", str(breakdown_path)))
                 if args.mode == "offscreen":
                     command.insert(1, "--offscreen-capture")
                 if not args.no_caffeinate and shutil.which("caffeinate"):
@@ -481,6 +486,8 @@ def main() -> int:
                     and STARTUP_FAILURE_REASON in item["reason"]
                     for item in attempts
                 )
+                if args.frame_breakdown and not breakdown_path.is_file():
+                    reasons.append("missing per-frame timing CSV")
                 if reasons:
                     base.update(status="rejected", reason="; ".join(reasons))
                     attempts.append(base)
@@ -499,6 +506,10 @@ def main() -> int:
                     base.update(status="accepted", reason="", metrics=metrics, feel=feel)
                     attempts.append(base)
                     print(f"ACCEPT {fixture}/{policy} rep={rep} load={before:.2f}/{after:.2f} p99={metrics['p99_ms']} ms", flush=True)
+                    write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
+                    if args.cooldown_seconds:
+                        print(f"COOLDOWN {args.cooldown_seconds}s after accepted capture", flush=True)
+                        time.sleep(args.cooldown_seconds)
                 write_report(output, revision, attempts, started, runner_revision, resume_notes, args.mode)
     except KeyboardInterrupt:
         print("Interrupted; partial results were written.", file=sys.stderr)
