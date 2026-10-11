@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
 import math
@@ -234,6 +235,28 @@ def load_report_attempts(
                 f"Revalidated {item['fixture']}/{item['policy']} rep {item['rep']} from its retained log after removing the incorrect fixed-3600-frame requirement; no recapture was made."
             )
     return source.group(1), started.group(1), attempts, notes
+
+
+def validate_frame_breakdown(
+    path: pathlib.Path, text: str, metrics: dict[str, str] | None
+) -> list[str]:
+    if metrics is None:
+        return ["cannot validate per-frame timing without capture metrics"]
+    record = parse_record(text, "SMOKE_FRAME_BREAKDOWN ")
+    if record is None or not path.is_file():
+        return ["missing per-frame timing CSV or telemetry"]
+    try:
+        expected = int(metrics["frames"])
+        declared = int(record["frames"])
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        frame_ids = [int(row["frame"]) for row in rows]
+    except (KeyError, OSError, ValueError):
+        return ["invalid per-frame timing CSV or telemetry"]
+    if declared != expected or len(rows) != expected or frame_ids != list(range(1, expected + 1)):
+        return ["per-frame timing CSV does not align one-to-one with measured intervals"]
+    return []
 
 
 def is_occluded_startup_failure(text: str) -> bool:
@@ -489,8 +512,8 @@ def main() -> int:
                     and STARTUP_FAILURE_REASON in item["reason"]
                     for item in attempts
                 )
-                if args.frame_breakdown and not breakdown_path.is_file():
-                    reasons.append("missing per-frame timing CSV")
+                if args.frame_breakdown:
+                    reasons.extend(validate_frame_breakdown(breakdown_path, text, metrics))
                 if reasons:
                     base.update(status="rejected", reason="; ".join(reasons))
                     attempts.append(base)
