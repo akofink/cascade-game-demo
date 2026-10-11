@@ -33,6 +33,8 @@ const FRAME_SAMPLES: usize = 240;
 const SMOKE_POLICY_FRAMES: u32 = 120;
 const CAPTURE_INTERVAL_CAPACITY: usize = 16_384;
 const MAX_PRIORITY_UPLOADS: usize = 16;
+const MAX_ACTION_PRIORITY_UPLOADS: usize = MAX_PRIORITY_UPLOADS / 2;
+const FRAME_UPLOAD_CHUNK_BUDGET: usize = 96;
 const UPLOAD_BYTES_PER_ROW: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
 const STAGING_BYTES_PER_CHUNK: usize =
     (CHUNK_SIZE as usize - 1) * UPLOAD_BYTES_PER_ROW + CHUNK_SIZE as usize;
@@ -582,6 +584,40 @@ impl App {
         u64::try_from(self.clock_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    fn visible_upload_targets(&self, out: &mut [(u32, u32)]) -> usize {
+        let Some(viewport) = self.viewport() else {
+            return 0;
+        };
+        let (world_width, world_height) = self.demo.dimensions();
+        let mut count = 0;
+        for row in 0..2 {
+            for column in 0..4 {
+                if count == out.len() {
+                    return count;
+                }
+                let pixel_x = viewport.0 * (column as f32 + 0.5) / 4.0;
+                let pixel_y = viewport.1 * (row as f32 + 0.5) / 2.0;
+                let (world_x, world_y) = self.camera.world_at_pixel(pixel_x, pixel_y);
+                if world_x < 0.0 || world_y < 0.0 {
+                    continue;
+                }
+                let cell_x = (world_x as u32).min(world_width.saturating_sub(1));
+                let cell_y = (world_y as u32).min(world_height.saturating_sub(1));
+                let chunk = (cell_x, cell_y);
+                let chunk_coord = (cell_x / CHUNK_SIZE, cell_y / CHUNK_SIZE);
+                if out[..count]
+                    .iter()
+                    .any(|&(x, y)| (x / CHUNK_SIZE, y / CHUNK_SIZE) == chunk_coord)
+                {
+                    continue;
+                }
+                out[count] = chunk;
+                count += 1;
+            }
+        }
+        count
+    }
+
     fn viewport(&self) -> Option<(f32, f32)> {
         self.gpu
             .as_ref()
@@ -758,8 +794,11 @@ impl App {
                 uploaded_len += 1;
             }
             let mut targets = [(0_u32, 0_u32); MAX_PRIORITY_UPLOADS];
-            let target_len = self.demo.player_targets(&mut targets);
-            for &(x, y) in &targets[..target_len.min(MAX_PRIORITY_UPLOADS)] {
+            let action_target_len = self.demo.player_targets(&mut targets);
+            let action_target_len = action_target_len.min(MAX_ACTION_PRIORITY_UPLOADS);
+            let visible_target_len = self.visible_upload_targets(&mut targets[action_target_len..]);
+            let target_len = action_target_len + visible_target_len;
+            for &(x, y) in &targets[..target_len] {
                 if uploaded_len == MAX_CHUNKS_PER_FRAME {
                     break;
                 }
@@ -2516,9 +2555,10 @@ fn create_gpu(
 }
 
 fn upload_budget() -> UploadBudget {
+    let scheduled_chunks = FRAME_UPLOAD_CHUNK_BUDGET - MAX_PRIORITY_UPLOADS;
     UploadBudget {
-        max_chunks: MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS,
-        max_copies: MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS,
+        max_chunks: scheduled_chunks,
+        max_copies: scheduled_chunks,
         ..UploadBudget::default()
     }
 }
@@ -2945,13 +2985,13 @@ mod tests {
         let budget = upload_budget();
         assert_eq!(
             budget.max_chunks,
-            MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS
+            FRAME_UPLOAD_CHUNK_BUDGET - MAX_PRIORITY_UPLOADS
         );
         assert_eq!(
             budget.max_copies,
-            MAX_CHUNKS_PER_FRAME - MAX_PRIORITY_UPLOADS
+            FRAME_UPLOAD_CHUNK_BUDGET - MAX_PRIORITY_UPLOADS
         );
-        assert!(budget.max_copies + MAX_PRIORITY_UPLOADS <= MAX_CHUNKS_PER_FRAME);
+        assert!(budget.max_copies + MAX_PRIORITY_UPLOADS <= FRAME_UPLOAD_CHUNK_BUDGET);
         assert_eq!(
             UPLOAD_BYTES_PER_ROW,
             wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
