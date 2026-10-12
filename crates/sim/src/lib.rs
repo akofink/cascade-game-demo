@@ -889,6 +889,44 @@ impl World {
         let pending = self.pending[id.index()];
         Some(pending.has(PendingCell::EVAL_PENDING) || pending.blast > 0)
     }
+    /// Iterate a row of renderer-facing cell data from a chunk, clipped to world bounds.
+    pub fn chunk_row(
+        &self,
+        chunk_x: u32,
+        chunk_y: u32,
+        row: u32,
+    ) -> impl Iterator<Item = (CellView, bool)> + '_ {
+        let start_x = chunk_x.saturating_mul(CHUNK_SIDE);
+        let y = chunk_y.saturating_mul(CHUNK_SIDE).saturating_add(row);
+        let valid = row < CHUNK_SIDE && start_x < self.width && y < self.height;
+        let start = if valid {
+            (y * self.width + start_x) as usize
+        } else {
+            0
+        };
+        let end = if valid {
+            start + (self.width - start_x).min(CHUNK_SIDE) as usize
+        } else {
+            0
+        };
+        self.cells[start..end]
+            .iter()
+            .zip(&self.pending[start..end])
+            .map(|(cell, pending)| {
+                (
+                    CellView {
+                        material: cell.material,
+                        state: pending.blast,
+                        burning: if cell.material == Material::Wood {
+                            cell.burning
+                        } else {
+                            0
+                        },
+                    },
+                    pending.has(PendingCell::EVAL_PENDING) || pending.blast > 0,
+                )
+            })
+    }
     pub fn cell_id(&self, x: u32, y: u32) -> Option<CellId> {
         (x < self.width && y < self.height).then_some(CellId(y * self.width + x))
     }
@@ -2162,6 +2200,18 @@ mod tests {
         assert_eq!(w.resources().cells, 1122);
         assert_eq!(w.resources().ready_capacity, Capacity(8));
         assert_eq!(w.resources().focus_ready_capacity, Capacity(8));
+    }
+    #[test]
+    fn chunk_rows_match_cell_views_and_clip_to_world_edges() {
+        let world = world(33, 34, 64, 4, 2);
+        let row: Vec<_> = world.chunk_row(1, 1, 0).collect();
+        assert_eq!(row.len(), 1);
+        assert_eq!(Some(row[0].0), world.cell(32, 32));
+        assert_eq!(Some(row[0].1), world.cell_pending(32, 32));
+        assert_eq!(world.chunk_row(1, 1, 1).count(), 1);
+        assert!(world.chunk_row(1, 1, 2).next().is_none());
+        assert!(world.chunk_row(2, 0, 0).next().is_none());
+        assert!(world.chunk_row(0, 0, CHUNK_SIDE).next().is_none());
     }
     #[test]
     fn water_settles_after_horizontal_flow_without_bouncing() {
